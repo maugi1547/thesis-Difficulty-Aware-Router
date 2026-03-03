@@ -1,12 +1,12 @@
 names:
-- 1000_angka
-- 1000_pahlawan
-- 100_angka
-- 100_pahlawan
-- 200_angka
-- 200_pahlawan
-- 500_angka
-- 500_pahlawan
+  - 1000_angka
+  - 1000_pahlawan
+  - 100_angka
+  - 100_pahlawan
+  - 200_angka
+  - 200_pahlawan
+  - 500_angka
+  - 500_pahlawan
 nc: 8
 roboflow:
   license: CC BY 4.0
