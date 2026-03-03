@@ -47,6 +47,7 @@ from .block import (
     CBFuse,
     CBLinear,
     ContrastiveHead,
+    DifficultyAwareRouter,
     GhostBottleneck,
     HGBlock,
     HGStem,
@@ -59,7 +60,6 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
-    DifficultyAwareRouter,
 )
 from .conv import (
     CBAM,

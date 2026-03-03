@@ -1588,7 +1588,7 @@ def parse_model(d, ch, verbose=True):
                 else getattr(__import__("torchvision").ops, m[16:])
                 if "torchvision.ops." in m
                 else globals()[m]
-            ) # get module
+            )  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
@@ -1652,12 +1652,12 @@ def parse_model(d, ch, verbose=True):
             args = [*args[1:]]
         # --- TAMBAHAN UNTUK MOE-P2 ROUTER ---
         elif m is DifficultyAwareRouter:
-            c_p3 = ch[f[0]] # Channel P3 (misal 64 pada Nano)
-            c_p2 = ch[f[1]] # Channel P2 (misal 32 pada Nano)
+            c_p3 = ch[f[0]]  # Channel P3 (misal 64 pada Nano)
+            c_p2 = ch[f[1]]  # Channel P2 (misal 32 pada Nano)
             args = [c_p3, c_p2]
-            
+
             # PENTING: Output router adalah Concat (P3 + P2)
-            # Kita harus update variabel c2 agar layer berikutnya (Layer 17) 
+            # Kita harus update variable c2 agar layer berikutnya (Layer 17)
             # tahu dia akan menerima 96 channel, bukan 32.
             c2 = c_p3 + c_p2
         # -------------------------------------
