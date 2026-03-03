@@ -158,11 +158,17 @@ class DetectionTrainer(BaseTrainer):
         model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         if weights:
             model.load(weights)
+        
+        # --- [MODIFIKASI ANDA DI SINI] ---
+        # Kita mendefinisikan nama kolom loss untuk ditampilkan di terminal.
+        # Urutannya harus sama persis dengan urutan return di loss.py
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "router_loss"
+        # ---------------------------------
         return model
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss", "router_loss"
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

@@ -44,6 +44,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DifficultyAwareRouter,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -1575,13 +1576,19 @@ def parse_model(d, ch, verbose=True):
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
+        # --- TAMBAHKAN BARIS INI UNTUK CEK ---
+        print(f"Building Layer {i}: {m}, f={f}, ch_len={len(ch)}")
+        # -------------------------------------
+        m = eval(m) if isinstance(m, str) else m  # eval strings
+        # ... kode asli berlanjut ...
+        if isinstance(m, str):
+            m = (
+                getattr(torch.nn, m[3:])
+                if "nn." in m
+                else getattr(__import__("torchvision").ops, m[16:])
+                if "torchvision.ops." in m
+                else globals()[m]
+            ) # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
@@ -1643,6 +1650,17 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        # --- TAMBAHAN UNTUK MOE-P2 ROUTER ---
+        elif m is DifficultyAwareRouter:
+            c_p3 = ch[f[0]] # Channel P3 (misal 64 pada Nano)
+            c_p2 = ch[f[1]] # Channel P2 (misal 32 pada Nano)
+            args = [c_p3, c_p2]
+            
+            # PENTING: Output router adalah Concat (P3 + P2)
+            # Kita harus update variabel c2 agar layer berikutnya (Layer 17) 
+            # tahu dia akan menerima 96 channel, bukan 32.
+            c2 = c_p3 + c_p2
+        # -------------------------------------
         else:
             c2 = ch[f]
 

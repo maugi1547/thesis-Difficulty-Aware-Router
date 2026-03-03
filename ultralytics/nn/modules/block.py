@@ -52,6 +52,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "DifficultyAwareRouter",
 )
 
 
@@ -1943,3 +1944,115 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+class SpatialAttention(nn.Module):
+    """
+    Modul Atensi Spasial untuk menonjolkan area penting pada fitur P3.
+    Referensi: CBAM (Convolutional Block Attention Module)
+    """
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        # Input channel = 2 (karena concat dari AvgPool dan MaxPool)
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: [Batch, Channel, Height, Width]
+        # AvgPool & MaxPool di sepanjang dimensi channel
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        # Gabungkan -> Conv -> Sigmoid
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        scale = self.act(self.conv1(x_cat))
+        return x * scale  # Fitur yang sudah diberi bobot atensi
+
+class DifficultyAwareRouter(nn.Module):
+    def __init__(self, c_p3, c_p2, hidden_dim=40):
+        super().__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1) 
+        self.c_low = 16
+        self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, 1, 0)
+        
+        self.proxy_cls = nn.Conv2d(c_p3, 1, 1) 
+        self.proxy_reg = nn.Conv2d(c_p3, 4, 1) 
+        
+        self.input_dim = c_p3 + self.c_low + 3
+        self.layer_norm = nn.LayerNorm(self.input_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2)
+        )
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.current_activation_prob = 0.0
+
+        if hasattr(self.mlp[2], 'bias') and self.mlp[2].bias is not None:
+            nn.init.constant_(self.mlp[2].bias[1], 3.0)
+            nn.init.constant_(self.mlp[2].bias[0], -3.0)
+
+    def get_uncertainty_signals(self, x_p3):
+        eps = 1e-9
+        logits_cls = self.proxy_cls(x_p3)
+        prob_cls = torch.sigmoid(logits_cls)
+        
+        B, C, H, W = x_p3.shape
+        K = max(1, int(H * W * 0.05))
+        
+        flat_prob = prob_cls.view(B, 1, -1)
+        topk_conf, _ = torch.topk(flat_prob, k=K, dim=-1)
+        avg_conf = topk_conf.mean(dim=-1)
+        
+        entropy_map = -(prob_cls * torch.log(prob_cls + eps))
+        flat_entropy = entropy_map.view(B, 1, -1)
+        topk_entropy, _ = torch.topk(flat_entropy, k=K, dim=-1)
+        avg_entropy = topk_entropy.mean(dim=-1)
+        
+        regs = self.proxy_reg(x_p3)
+        pixel_variance = torch.var(regs, dim=1, keepdim=True) 
+        flat_var = pixel_variance.view(B, 1, -1)
+        topk_var, _ = torch.topk(flat_var, k=K, dim=-1)
+        dfl_var = topk_var.mean(dim=-1)
+        
+        # PERLINDUNGAN AMP
+        return avg_entropy.to(x_p3.dtype), avg_conf.to(x_p3.dtype), dfl_var.to(x_p3.dtype)
+
+    def forward(self, x):
+        if self.training and self.mlp[2].bias[1] < 0.1:
+            with torch.no_grad():
+                self.mlp[2].weight.fill_(0.0)
+                self.mlp[2].bias[0].fill_(-5.0)
+                self.mlp[2].bias[1].fill_(5.0)
+
+        f_p3, f_p2_back = x[0], x[1]
+        B, C, H, W = f_p3.shape
+        
+        z_visual = self.gap(f_p3).view(B, -1)
+        f_p2_hint = self.conv_hint(f_p2_back)
+        z_low = self.gap(f_p2_hint).view(B, -1)
+        
+        entropy, conf, var = self.get_uncertainty_signals(f_p3)
+        stats = torch.cat([entropy, conf, var], dim=1)
+        
+        z_in = torch.cat([z_visual, z_low, stats], dim=1) 
+        z_norm = self.layer_norm(z_in)
+        logits = self.mlp(z_norm) 
+        
+        if self.training:
+            gate_tensor = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=1)
+            # PERLINDUNGAN AMP
+            gate_value = gate_tensor[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+            self.current_activation_prob = F.softmax(logits, dim=1)[:, 1].mean()
+        else:
+            probs = F.softmax(logits, dim=1)
+            gate_idx = torch.argmax(probs, dim=1)
+            # PERLINDUNGAN AMP
+            gate_value = gate_idx.view(B, 1, 1, 1).to(f_p3.dtype)
+            self.current_activation_prob = gate_value.to(torch.float32).mean()
+
+        f_p3_up = self.upsample(f_p3)
+        f_p2_weighted = f_p2_back * gate_value
+        
+        return torch.cat([f_p3_up, f_p2_weighted], dim=1)

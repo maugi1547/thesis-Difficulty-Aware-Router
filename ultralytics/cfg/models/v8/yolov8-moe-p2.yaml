@@ -1,0 +1,69 @@
+# Ultralytics YOLOv8-MoE-P2 (Nano Version)
+# Tesis: Difficulty-Aware Spatial Router for Tiny Object Detection
+
+# Parameters
+nc: 80  # number of classes
+scales: # model compound scaling constants, i.e. 'n'
+  # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+# --- BACKBONE (Standard YOLOv8) ---
+# Total 10 Layer (0-9)
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 3, C2f, [128, True]]  # 2-P2/4 (Sumber Hint P2)
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 6, C2f, [256, True]]  # 4-P3/8
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 6, C2f, [512, True]]  # 6-P4/16
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 3, C2f, [1024, True]] # 8-P5/32
+  - [-1, 1, SPPF, [1024, 5]]   # 9-P5/32
+
+# --- HEAD (FPN + PANet with MoE Router) ---
+head:
+  # 1. Top-Down Path (Turun Resolusi: P5 -> P4 -> P3)
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 10
+  - [[-1, 6], 1, Concat, [1]] # 11 (Gabung ke P4 Backbone)
+  - [-1, 3, C2f, [512]] # 12 (Fitur P4 Siap)
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 13
+  - [[-1, 4], 1, Concat, [1]] # 14 (Gabung ke P3 Backbone)
+  - [-1, 3, C2f, [256]] # 15 (Fitur P3 Siap) -> INPUT ROUTER (Visual)
+
+  # 2. THE MOE ROUTER INJECTION (P3 -> P2)
+  # Di YOLOv8-P2 biasa, disini ada Upsample(P3) + Concat(P2).
+  # Kita ganti blok itu dengan Router kita.
+  # Input: [-1 (P3 dari layer 15), 2 (P2 dari Backbone layer 2)]
+  - [[-1, 2], 1, DifficultyAwareRouter, []] # 16 (Output Router)
+
+  # Proses fitur P2 hasil Router
+  - [-1, 3, C2f, [128]] # 17 (Fitur P2 Siap Deteksi)
+
+  # 3. Bottom-Up Path (Naik Resolusi Kembali: P2 -> P3 -> P4 -> P5)
+  # Ini yang hilang di versi sebelumnya. Jalur ini penting agar info P2 
+  # juga membantu mendeteksi objek di P3 dan P4.
+
+  # P2 -> P3
+  - [-1, 1, Conv, [256, 3, 2]] # 18 (Downsample P2 jadi P3)
+  - [[-1, 15], 1, Concat, [1]] # 19 (Gabung dengan P3 dari layer 15)
+  - [-1, 3, C2f, [256]] # 20 (Fitur P3 Final)
+
+  # P3 -> P4
+  - [-1, 1, Conv, [512, 3, 2]] # 21 (Downsample P3 jadi P4)
+  - [[-1, 12], 1, Concat, [1]] # 22 (Gabung dengan P4 dari layer 12)
+  - [-1, 3, C2f, [512]] # 23 (Fitur P4 Final)
+
+  # P4 -> P5
+  - [-1, 1, Conv, [1024, 3, 2]] # 24 (Downsample P4 jadi P5)
+  - [[-1, 9], 1, Concat, [1]] # 25 (Gabung dengan P5 dari layer 9)
+  - [-1, 3, C2f, [1024]] # 26 (Fitur P5 Final)
+
+  # 4. DETECT HEAD
+  # Input: P2(17), P3(20), P4(23), P5(26)
+  - [[17, 20, 23, 26], 1, Detect, [nc]] # 27

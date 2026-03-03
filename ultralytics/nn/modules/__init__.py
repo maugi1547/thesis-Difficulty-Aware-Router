@@ -59,6 +59,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    DifficultyAwareRouter,
 )
 from .conv import (
     CBAM,
@@ -147,6 +148,7 @@ __all__ = (
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
+    "DifficultyAwareRouter",
     "Focus",
     "GhostBottleneck",
     "GhostConv",
