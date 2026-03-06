@@ -197,7 +197,7 @@ class v8DetectionLoss:
     def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         # --- TAMBAHKAN BARIS INI ---
-        self.model = model 
+        self.model = model
         # ---------------------------
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -309,23 +309,23 @@ class v8DetectionLoss:
         # Pastikan membaca nilai dengan benar tanpa perlu import os
         target_lambda = 0.05
         try:
-            with open('/content/router_rate.txt', 'r') as f:
+            with open("/content/router_rate.txt") as f:
                 content_file = f.read().strip()
                 if content_file:
                     target_lambda = float(content_file)
         except Exception:
-            pass # Abaikan jika file belum ada, gunakan default 0.05
+            pass  # Abaikan jika file belum ada, gunakan default 0.05
 
         p2_active_prob = 0.0
-        if hasattr(self, 'model'):
-            root_model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(self, "model"):
+            root_model = self.model.model if hasattr(self.model, "model") else self.model
             for m in root_model.modules():
-                if m.__class__.__name__ == 'DifficultyAwareRouter':
-                    if hasattr(m, 'current_activation_prob'):
+                if m.__class__.__name__ == "DifficultyAwareRouter":
+                    if hasattr(m, "current_activation_prob"):
                         val = m.current_activation_prob
-                        p2_active_prob = val.item() if hasattr(val, 'item') else val
+                        p2_active_prob = val.item() if hasattr(val, "item") else val
                     break
-        
+
         if loss.shape[0] < 4:
             new_loss = torch.zeros(4, device=loss.device)
             new_loss[:3] = loss[:3]
@@ -335,9 +335,9 @@ class v8DetectionLoss:
 
         # Debug
         if torch.rand(1).item() < 0.01:
-             print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob:.2%} | Penalty: {loss[3]:.4f}")
+            print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob:.2%} | Penalty: {loss[3]:.4f}")
         # =================================================================
-        
+
         return loss.sum() * batch_size, loss.detach()
         # ---------------------------------------------------------------
 
