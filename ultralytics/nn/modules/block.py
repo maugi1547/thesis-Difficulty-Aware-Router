@@ -41,6 +41,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "DifficultyAwareRouter",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -52,7 +53,6 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
-    "DifficultyAwareRouter",
 )
 
 
@@ -1947,13 +1947,13 @@ class SAVPE(nn.Module):
 
 
 class SpatialAttention(nn.Module):
+    """Modul Atensi Spasial untuk menonjolkan area penting pada fitur P3. Referensi: CBAM (Convolutional Block Attention
+    Module).
     """
-    Modul Atensi Spasial untuk menonjolkan area penting pada fitur P3.
-    Referensi: CBAM (Convolutional Block Attention Module)
-    """
+
     def __init__(self, kernel_size=7):
         super().__init__()
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        assert kernel_size in (3, 7), "kernel size must be 3 or 7"
         padding = 3 if kernel_size == 7 else 1
         # Input channel = 2 (karena concat dari AvgPool dan MaxPool)
         self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
@@ -1969,27 +1969,24 @@ class SpatialAttention(nn.Module):
         scale = self.act(self.conv1(x_cat))
         return x * scale  # Fitur yang sudah diberi bobot atensi
 
+
 class DifficultyAwareRouter(nn.Module):
     def __init__(self, c_p3, c_p2, hidden_dim=40):
         super().__init__()
-        self.gap = nn.AdaptiveAvgPool2d(1) 
+        self.gap = nn.AdaptiveAvgPool2d(1)
         self.c_low = 16
         self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, 1, 0)
-        
-        self.proxy_cls = nn.Conv2d(c_p3, 1, 1) 
-        self.proxy_reg = nn.Conv2d(c_p3, 4, 1) 
-        
+
+        self.proxy_cls = nn.Conv2d(c_p3, 1, 1)
+        self.proxy_reg = nn.Conv2d(c_p3, 4, 1)
+
         self.input_dim = c_p3 + self.c_low + 3
         self.layer_norm = nn.LayerNorm(self.input_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 2)
-        )
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.mlp = nn.Sequential(nn.Linear(self.input_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 2))
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
         self.current_activation_prob = 0.0
 
-        if hasattr(self.mlp[2], 'bias') and self.mlp[2].bias is not None:
+        if hasattr(self.mlp[2], "bias") and self.mlp[2].bias is not None:
             nn.init.constant_(self.mlp[2].bias[1], 3.0)
             nn.init.constant_(self.mlp[2].bias[0], -3.0)
 
@@ -1997,25 +1994,25 @@ class DifficultyAwareRouter(nn.Module):
         eps = 1e-9
         logits_cls = self.proxy_cls(x_p3)
         prob_cls = torch.sigmoid(logits_cls)
-        
-        B, C, H, W = x_p3.shape
+
+        B, _C, H, W = x_p3.shape
         K = max(1, int(H * W * 0.05))
-        
+
         flat_prob = prob_cls.view(B, 1, -1)
         topk_conf, _ = torch.topk(flat_prob, k=K, dim=-1)
         avg_conf = topk_conf.mean(dim=-1)
-        
+
         entropy_map = -(prob_cls * torch.log(prob_cls + eps))
         flat_entropy = entropy_map.view(B, 1, -1)
         topk_entropy, _ = torch.topk(flat_entropy, k=K, dim=-1)
         avg_entropy = topk_entropy.mean(dim=-1)
-        
+
         regs = self.proxy_reg(x_p3)
-        pixel_variance = torch.var(regs, dim=1, keepdim=True) 
+        pixel_variance = torch.var(regs, dim=1, keepdim=True)
         flat_var = pixel_variance.view(B, 1, -1)
         topk_var, _ = torch.topk(flat_var, k=K, dim=-1)
         dfl_var = topk_var.mean(dim=-1)
-        
+
         # PERLINDUNGAN AMP
         return avg_entropy.to(x_p3.dtype), avg_conf.to(x_p3.dtype), dfl_var.to(x_p3.dtype)
 
@@ -2027,19 +2024,19 @@ class DifficultyAwareRouter(nn.Module):
                 self.mlp[2].bias[1].fill_(5.0)
 
         f_p3, f_p2_back = x[0], x[1]
-        B, C, H, W = f_p3.shape
-        
+        B, _C, _H, _W = f_p3.shape
+
         z_visual = self.gap(f_p3).view(B, -1)
         f_p2_hint = self.conv_hint(f_p2_back)
         z_low = self.gap(f_p2_hint).view(B, -1)
-        
+
         entropy, conf, var = self.get_uncertainty_signals(f_p3)
         stats = torch.cat([entropy, conf, var], dim=1)
-        
-        z_in = torch.cat([z_visual, z_low, stats], dim=1) 
+
+        z_in = torch.cat([z_visual, z_low, stats], dim=1)
         z_norm = self.layer_norm(z_in)
-        logits = self.mlp(z_norm) 
-        
+        logits = self.mlp(z_norm)
+
         if self.training:
             gate_tensor = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=1)
             # PERLINDUNGAN AMP
@@ -2054,5 +2051,5 @@ class DifficultyAwareRouter(nn.Module):
 
         f_p3_up = self.upsample(f_p3)
         f_p2_weighted = f_p2_back * gate_value
-        
+
         return torch.cat([f_p3_up, f_p2_weighted], dim=1)
