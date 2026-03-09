@@ -1990,8 +1990,8 @@ class DifficultyAwareRouter(nn.Module):
         self.current_activation_prob = 0.0
 
         if hasattr(self.mlp[2], 'bias') and self.mlp[2].bias is not None:
-            nn.init.constant_(self.mlp[2].bias[1], 3.0)
-            nn.init.constant_(self.mlp[2].bias[0], -3.0)
+            nn.init.constant_(self.mlp[2].bias[1], 0.0)
+            nn.init.constant_(self.mlp[2].bias[0], 0.0)
 
     def get_uncertainty_signals(self, x_p3):
         eps = 1e-9
@@ -2020,12 +2020,7 @@ class DifficultyAwareRouter(nn.Module):
         return avg_entropy.to(x_p3.dtype), avg_conf.to(x_p3.dtype), dfl_var.to(x_p3.dtype)
 
     def forward(self, x):
-        if self.training and self.mlp[2].bias[1] < 0.1:
-            with torch.no_grad():
-                self.mlp[2].weight.fill_(0.0)
-                self.mlp[2].bias[0].fill_(-5.0)
-                self.mlp[2].bias[1].fill_(5.0)
-
+       
         f_p3, f_p2_back = x[0], x[1]
         B, C, H, W = f_p3.shape
         

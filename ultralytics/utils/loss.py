@@ -303,39 +303,38 @@ class v8DetectionLoss:
         loss[2] *= self.hyp.dfl  # dfl gain
 
         # =================================================================
-        # MODIFIKASI TESIS: ROUTER SPARSITY LOSS
+        # MODIFIKASI TESIS: ROUTER SPARSITY LOSS (AUTOGRAD SAFE)
         # =================================================================
-        # Pastikan membaca nilai dengan benar
-        # Pastikan membaca nilai dengan benar tanpa perlu import os
-        target_lambda = 0.05
-        try:
-            with open('/content/router_rate.txt', 'r') as f:
-                content_file = f.read().strip()
-                if content_file:
-                    target_lambda = float(content_file)
-        except Exception:
-            pass # Abaikan jika file belum ada, gunakan default 0.05
-
-        p2_active_prob = 0.0
+        target_lambda = getattr(self.model, 'router_penalty_lambda', 0.05)
+        
+        p2_active_prob = torch.tensor(0.0, device=loss.device) # Default berupa tensor
+        
         if hasattr(self, 'model'):
             root_model = self.model.model if hasattr(self.model, 'model') else self.model
             for m in root_model.modules():
                 if m.__class__.__name__ == 'DifficultyAwareRouter':
                     if hasattr(m, 'current_activation_prob'):
                         val = m.current_activation_prob
-                        p2_active_prob = val.item() if hasattr(val, 'item') else val
+                        # PENTING: JANGAN PAKAI .item() !!
+                        # Pastikan val adalah Tensor dan pindahkan ke device yang sama dengan loss
+                        if torch.is_tensor(val):
+                            p2_active_prob = val.to(loss.device)
+                        else:
+                            p2_active_prob = torch.tensor(val, device=loss.device, requires_grad=True)
                     break
         
+        # Buat slot loss baru jika belum ada
         if loss.shape[0] < 4:
             new_loss = torch.zeros(4, device=loss.device)
             new_loss[:3] = loss[:3]
             loss = new_loss
 
+        # KALKULASI PENALTI (Graph Autograd tetap tersambung!)
         loss[3] = target_lambda * p2_active_prob
 
-        # Debug
+        # Debug (Untuk print, kita BOLEH pakai .item() karena hanya untuk dibaca manusia, bukan untuk di-backward)
         if torch.rand(1).item() < 0.01:
-             print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob:.2%} | Penalty: {loss[3]:.4f}")
+             print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob.item():.2%} | Penalty: {loss[3].item():.4f}")
         # =================================================================
         
         return loss.sum() * batch_size, loss.detach()
