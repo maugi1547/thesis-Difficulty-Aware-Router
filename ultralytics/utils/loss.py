@@ -197,7 +197,7 @@ class v8DetectionLoss:
     def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         # --- TAMBAHKAN BARIS INI ---
-        self.model = model 
+        self.model = model
         # ---------------------------
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -305,15 +305,15 @@ class v8DetectionLoss:
         # =================================================================
         # MODIFIKASI TESIS: ROUTER SPARSITY LOSS (AUTOGRAD SAFE)
         # =================================================================
-        target_lambda = getattr(self.model, 'router_penalty_lambda', 0.05)
-        
-        p2_active_prob = torch.tensor(0.0, device=loss.device) # Default berupa tensor
-        
-        if hasattr(self, 'model'):
-            root_model = self.model.model if hasattr(self.model, 'model') else self.model
+        target_lambda = getattr(self.model, "router_penalty_lambda", 0.05)
+
+        p2_active_prob = torch.tensor(0.0, device=loss.device)  # Default berupa tensor
+
+        if hasattr(self, "model"):
+            root_model = self.model.model if hasattr(self.model, "model") else self.model
             for m in root_model.modules():
-                if m.__class__.__name__ == 'DifficultyAwareRouter':
-                    if hasattr(m, 'current_activation_prob'):
+                if m.__class__.__name__ == "DifficultyAwareRouter":
+                    if hasattr(m, "current_activation_prob"):
                         val = m.current_activation_prob
                         # PENTING: JANGAN PAKAI .item() !!
                         # Pastikan val adalah Tensor dan pindahkan ke device yang sama dengan loss
@@ -322,7 +322,7 @@ class v8DetectionLoss:
                         else:
                             p2_active_prob = torch.tensor(val, device=loss.device, requires_grad=True)
                     break
-        
+
         # Buat slot loss baru jika belum ada
         if loss.shape[0] < 4:
             new_loss = torch.zeros(4, device=loss.device)
@@ -334,9 +334,9 @@ class v8DetectionLoss:
 
         # Debug (Untuk print, kita BOLEH pakai .item() karena hanya untuk dibaca manusia, bukan untuk di-backward)
         if torch.rand(1).item() < 0.01:
-             print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob.item():.2%} | Penalty: {loss[3].item():.4f}")
+            print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob.item():.2%} | Penalty: {loss[3].item():.4f}")
         # =================================================================
-        
+
         return loss.sum() * batch_size, loss.detach()
         # ---------------------------------------------------------------
 
