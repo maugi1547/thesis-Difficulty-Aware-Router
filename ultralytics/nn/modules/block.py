@@ -1988,10 +1988,13 @@ class DifficultyAwareRouter(nn.Module):
         )
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
         self.current_activation_prob = 0.0
+        self.tau = 2.0
+        self.tau_min = 0.5
+        self.tau_decay = 0.999
 
         if hasattr(self.mlp[2], 'bias') and self.mlp[2].bias is not None:
-            nn.init.constant_(self.mlp[2].bias[1], 0.0)
-            nn.init.constant_(self.mlp[2].bias[0], 0.0)
+            nn.init.constant_(self.mlp[2].bias[1], 1.0)
+            nn.init.constant_(self.mlp[2].bias[0], -1.0)
 
     def get_uncertainty_signals(self, x_p3):
         eps = 1e-9
@@ -1999,25 +2002,58 @@ class DifficultyAwareRouter(nn.Module):
         prob_cls = torch.sigmoid(logits_cls)
         
         B, C, H, W = x_p3.shape
-        K = max(1, int(H * W * 0.05))
-        
-        flat_prob = prob_cls.view(B, 1, -1)
-        topk_conf, _ = torch.topk(flat_prob, k=K, dim=-1)
-        avg_conf = topk_conf.mean(dim=-1)
-        
-        entropy_map = -(prob_cls * torch.log(prob_cls + eps))
+        K = max(1, int(H * W * 0.02))  # 2% Top-K (balanced untuk multi-dataset)
+
+        # =========================================================
+        # 1. CONFIDENCE
+        # =========================================================
+        uncertainty_conf = 1 - prob_cls
+        flat_unc = uncertainty_conf.view(B, 1, -1)
+        topk_unc, _ = torch.topk(flat_unc, k=K, dim=-1)
+        mean_unc = flat_unc.mean(dim=-1)
+        avg_conf = 0.7 * topk_unc.mean(dim=-1) + 0.3 * mean_unc
+
+        # =========================================================
+        # 2. ENTROPY 
+        # =========================================================
+        entropy_map = -(
+            prob_cls * torch.log(prob_cls + eps) +
+            (1 - prob_cls) * torch.log(1 - prob_cls + eps)
+        )
         flat_entropy = entropy_map.view(B, 1, -1)
         topk_entropy, _ = torch.topk(flat_entropy, k=K, dim=-1)
-        avg_entropy = topk_entropy.mean(dim=-1)
-        
+        mean_entropy = flat_entropy.mean(dim=-1)
+        avg_entropy = 0.7 * topk_entropy.mean(dim=-1) + 0.3 * mean_entropy
+
+        # =========================================================
+        # 3. DFL VARIANCE (STABILIZED)
+        # =========================================================
         regs = self.proxy_reg(x_p3)
-        pixel_variance = torch.var(regs, dim=1, keepdim=True) 
+        pixel_variance = torch.var(regs, dim=1, keepdim=True)
         flat_var = pixel_variance.view(B, 1, -1)
         topk_var, _ = torch.topk(flat_var, k=K, dim=-1)
-        dfl_var = topk_var.mean(dim=-1)
+        mean_var = flat_var.mean(dim=-1)
+        dfl_var = 0.7 * topk_var.mean(dim=-1) + 0.3 * mean_var
+
+        # =========================================================
+        # 4. NORMALIZATION (AGAR STABIL & GENERAL)
+        # =========================================================
+        def normalize(x, eps=1e-6):
+            return (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + eps)
         
-        # PERLINDUNGAN AMP
-        return avg_entropy.to(x_p3.dtype), avg_conf.to(x_p3.dtype), dfl_var.to(x_p3.dtype)
+        avg_entropy = normalize(avg_entropy)
+        avg_conf = normalize(avg_conf)
+        dfl_var = normalize(dfl_var)
+
+
+        # =========================================================
+        # 5. AMP SAFE
+        # =========================================================
+        return (
+            avg_entropy.to(x_p3.dtype),
+            avg_conf.to(x_p3.dtype),
+            dfl_var.to(x_p3.dtype)
+        )
 
     def forward(self, x):
        
@@ -2030,16 +2066,32 @@ class DifficultyAwareRouter(nn.Module):
         
         entropy, conf, var = self.get_uncertainty_signals(f_p3)
         stats = torch.cat([entropy, conf, var], dim=1)
+        stats = stats * (z_visual.std(dim=1, keepdim=True).detach() + 1e-6)
         
         z_in = torch.cat([z_visual, z_low, stats], dim=1) 
         z_norm = self.layer_norm(z_in)
         logits = self.mlp(z_norm) 
+        logits = torch.clamp(logits, -5, 5)
         
         if self.training:
-            gate_tensor = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=1)
-            # PERLINDUNGAN AMP
+            #tau annealing
+            self.tau = max(self.tau * self.tau_decay, self.tau_min)
+            tau = self.tau
+
+            # straight-through gumbel
+            gate_soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
+            gate_hard = torch.zeros_like(gate_soft)
+            gate_hard.scatter_(1, gate_soft.argmax(dim=1, keepdim=True), 1.0)
+            gate_tensor = (gate_hard - gate_soft).detach() + gate_soft
+
             gate_value = gate_tensor[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-            self.current_activation_prob = F.softmax(logits, dim=1)[:, 1].mean()
+            probs = F.softmax(logits, dim=1)
+
+            # 🔥 EMA smoothing
+            momentum = 0.9
+            current = probs[:,1].mean().detach()
+            self.current_activation_prob = (momentum * self.current_activation_prob + (1 - momentum) * current)
+
         else:
             probs = F.softmax(logits, dim=1)
             gate_idx = torch.argmax(probs, dim=1)
