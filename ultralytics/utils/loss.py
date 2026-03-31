@@ -303,7 +303,7 @@ class v8DetectionLoss:
         loss[2] *= self.hyp.dfl  # dfl gain
 
         # =================================================================
-        # MODIFIKASI TESIS: ROUTER SPARSITY LOSS (AUTOGRAD SAFE)
+        # MODIFIKASI TESIS: ROUTER SPARSITY LOSS (AUTOGRAD SAFE & ADAPTIVE)
         # =================================================================
         target_lambda = getattr(self.model, 'router_penalty_lambda', 0.05)
         
@@ -329,12 +329,61 @@ class v8DetectionLoss:
             new_loss[:3] = loss[:3]
             loss = new_loss
 
-        # KALKULASI PENALTI (Graph Autograd tetap tersambung!)
-        loss[3] = target_lambda * p2_active_prob
+        # ---------------------------------------------------------------
+        # [MODUL BARU] DIFFICULTY-CALIBRATED ROUTER PENALTY
+        # ---------------------------------------------------------------
+        # Asumsi: variabel 'pred_scores' (logits dari prediksi kelas) tersedia di atas kode ini.
+        # Pada arsitektur YOLOv8 standar, ukurannya biasanya (Batch, Num_Classes, Anchors)
+        
+        try:
+            # 1. Konversi logits menjadi probabilitas
+            pred_probs = pred_scores.sigmoid()
+            
+            # 2. Hitung Metrik Kesulitan (Asumsi dimensi kelas ada di dim=1)
+            # Jika error dimensi, ganti dim=1 menjadi dim=2
+            conf, _ = pred_probs.max(dim=1) 
+            entropy = - (pred_probs * torch.log(pred_probs + 1e-7)).sum(dim=1)
+            var = pred_probs.var(dim=1)
+            
+            # 3. Hitung Skor Kesulitan & Normalisasi Z-Score
+            # Menggunakan .detach() agar tidak merusak graf autograd YOLO
+            difficulty_score = (entropy + var - conf).detach()
+            diff_mean = difficulty_score.mean()
+            diff_std = difficulty_score.std()
+            difficulty_score = (difficulty_score - diff_mean) / (diff_std + 1e-6)
+            
+            # 4. Inversi Eksponensial dan Batas Ekstrem (Clamping)
+            weight = torch.exp(-difficulty_score)
+            weight = torch.clamp(weight, min=0.1, max=2.0)
+            
+            # 5. Rata-ratakan bobot untuk batch ini
+            batch_dynamic_weight = weight.mean().detach()
+        except Exception as e:
+            # Fallback (Cadangan) jika pred_scores tidak ditemukan atau error dimensi
+            # Kembali menggunakan loss lama (statis = 1.0) agar training tidak terhenti
+            batch_dynamic_weight = torch.tensor(1.0, device=loss.device)
+            # print(f" [WARNING] Adaptive Loss gagal, fallback ke statis. Error: {e}")
 
-        # Debug (Untuk print, kita BOLEH pakai .item() karena hanya untuk dibaca manusia, bukan untuk di-backward)
-        if torch.rand(1).item() < 0.01:
-             print(f" [INFO] Lambda: {target_lambda} | P2: {p2_active_prob.item():.2%} | Penalty: {loss[3].item():.4f}")
+        # ---------------------------------------------------------------
+        # KALKULASI PENALTI (Graph Autograd tetap tersambung!)
+        # ---------------------------------------------------------------
+        # Denda dasar (target_lambda) dikalikan dengan bobot dinamis gambar
+        loss[3] = target_lambda * p2_active_prob * batch_dynamic_weight
+
+        # =================================================================
+        # MODIFIKASI DEBUG LOG (TIDAK SPAM)
+        # =================================================================
+        # Buat penghitung (counter) mandiri di dalam class loss
+        if not hasattr(self, 'debug_counter'):
+            self.debug_counter = 0
+        
+        self.debug_counter += 1
+
+        # Cetak log hanya setiap 100 batch (Silakan ganti angka 100 sesuai selera)
+        # Jika batch size Anda 16 dan data train 6000, 1 epoch = ~375 batch.
+        # Maka log ini akan muncul sekitar 3-4 kali saja per epoch.
+        if self.debug_counter % 100 == 0:
+             print(f" [INFO Router] Iter: {self.debug_counter} | Lambda: {target_lambda:.4f} | P2 Aktif: {p2_active_prob.item():.2%} | Dyn_Weight: {batch_dynamic_weight.item():.3f} | Penalti: {loss[3].item():.4f}")
         # =================================================================
         
         return loss.sum() * batch_size, loss.detach()

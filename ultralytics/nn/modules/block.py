@@ -2039,7 +2039,15 @@ class DifficultyAwareRouter(nn.Module):
         # 4. NORMALIZATION (AGAR STABIL & GENERAL)
         # =========================================================
         def normalize(x, eps=1e-6):
-            return (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + eps)
+            # Normalisasi menyilang antar gambar di dalam Batch (dim=0)
+            # x shape: (B, 1)
+            # Jika batch size hanya 1, fallback ke nilai 0 agar tidak error
+            if x.shape[0] == 1:
+                return torch.zeros_like(x)
+                
+            mean = x.mean(dim=0, keepdim=True)
+            std = x.std(dim=0, keepdim=True, unbiased=False)
+            return (x - mean) / (std + eps)
         
         avg_entropy = normalize(avg_entropy)
         avg_conf = normalize(avg_conf)
