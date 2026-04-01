@@ -2099,6 +2099,7 @@ class DifficultyAwareRouter(nn.Module):
             momentum = 0.9
             current = probs[:,1].mean().detach()
             self.current_activation_prob = (momentum * self.current_activation_prob + (1 - momentum) * current)
+            self.loss_prob = probs[:, 1].mean()
 
         else:
             probs = F.softmax(logits, dim=1)
