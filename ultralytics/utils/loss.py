@@ -313,14 +313,18 @@ class v8DetectionLoss:
             root_model = self.model.model if hasattr(self.model, 'model') else self.model
             for m in root_model.modules():
                 if m.__class__.__name__ == 'DifficultyAwareRouter':
-                    if hasattr(m, 'loss_prob'):
-                        val = m.loss_prob
-                        # PENTING: JANGAN PAKAI .item() !!
-                        # Pastikan val adalah Tensor dan pindahkan ke device yang sama dengan loss
-                        if torch.is_tensor(val):
-                            p2_active_prob = val.to(loss.device)
-                        else:
-                            p2_active_prob = torch.tensor(val, device=loss.device, requires_grad=True)
+                    # Cek apakah sedang Training atau Validation
+                    if m.training:
+                        # Saat training: Ambil loss_prob agar gradien mengalir
+                        val = m.loss_prob if hasattr(m, 'loss_prob') else torch.tensor(0.0)
+                    else:
+                        # Saat validasi: Ambil current_activation_prob untuk laporan asli
+                        val = m.current_activation_prob if hasattr(m, 'current_activation_prob') else torch.tensor(0.0)
+                        
+                    if torch.is_tensor(val):
+                        p2_active_prob = val.to(loss.device)
+                    else:
+                        p2_active_prob = torch.tensor(val, device=loss.device, requires_grad=True)
                     break
         
         # Buat slot loss baru jika belum ada
