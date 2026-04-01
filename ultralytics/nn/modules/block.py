@@ -2107,6 +2107,7 @@ class DifficultyAwareRouter(nn.Module):
             # PERLINDUNGAN AMP
             gate_value = gate_idx.view(B, 1, 1, 1).to(f_p3.dtype)
             self.current_activation_prob = gate_value.to(torch.float32).mean()
+            self.loss_prob = torch.tensor(0.0, device=x[0].device)
 
         f_p3_up = self.upsample(f_p3)
         f_p2_weighted = f_p2_back * gate_value
