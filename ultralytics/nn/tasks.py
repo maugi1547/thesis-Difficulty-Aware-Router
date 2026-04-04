@@ -94,6 +94,139 @@ from ultralytics.utils.torch_utils import (
     time_sync,
 )
 
+# Di tasks.py — hook_router_to_head (versi final)
+
+def hook_router_to_head(model):
+    """
+    Hook menyimpan STATISTIK AGREGAT dari Head P3,
+    bukan tensor penuh.
+
+    Keuntungan dibanding menyimpan tensor penuh:
+    1. Tidak ada shape mismatch — scalar tidak punya dimensi batch
+    2. Lebih stabil sebagai sinyal lintas-batch (agregasi noise)
+    3. Memory footprint sangat kecil
+    4. Komputasi stats terjadi sekali di hook, bukan di router
+
+    Yang disimpan per forward pass Head P3:
+        _cached_entropy : scalar float — rata-rata entropy batch
+        _cached_conf    : scalar float — rata-rata uncertainty conf
+        _cached_dfl_var : scalar float — rata-rata DFL variance
+    """
+    router_module = None
+    detect_head   = None
+
+    for m in model.modules():
+        if m.__class__.__name__ == 'DifficultyAwareRouter':
+            router_module = m
+        elif m.__class__.__name__ == 'Detect':
+            detect_head = m
+
+    if router_module is None or detect_head is None:
+        print("[WARNING] Router atau Detect head tidak ditemukan.")
+        return
+
+    if not (hasattr(detect_head, 'cv3')
+            and len(detect_head.cv3) > 1):
+        print("[WARNING] cv3 tidak cukup panjang di Detect head.")
+        return
+
+    reg_max = detect_head.reg_max
+    nc      = detect_head.nc
+    eps     = 1e-9
+
+    # ----------------------------------------------------------
+    # HOOK cls: hitung entropy dan confidence langsung di hook
+    # ----------------------------------------------------------
+    def hook_cls(module, input, output):
+        # output: (B, nc, H, W)
+        with torch.no_grad():
+            B, C, H, W = output.shape
+            K = max(1, int(H * W * 0.02))
+
+            if C == 1:
+                prob = torch.sigmoid(output)
+                entropy_map = -(
+                    prob * torch.log(prob + eps) +
+                    (1 - prob) * torch.log(1 - prob + eps)
+                )
+                unc_conf = 1 - prob
+            else:
+                prob = torch.softmax(output, dim=1)
+                entropy_map = -(
+                    prob * torch.log(prob + eps)
+                ).sum(dim=1, keepdim=True)
+                unc_conf = 1 - prob.max(dim=1, keepdim=True).values
+
+            # Top-K mean per sampel → rata-rata batch → scalar
+            def topk_batch_mean(t):
+                flat = t.view(B, 1, -1)
+                topk, _ = torch.topk(flat, k=K, dim=-1)
+                per_sample = (0.7 * topk.mean(dim=-1)
+                              + 0.3 * flat.mean(dim=-1))  # (B,1)
+                return per_sample.mean().item()  # scalar float
+
+            # Simpan sebagai scalar — tidak ada dimensi batch
+            router_module._cached_entropy = topk_batch_mean(entropy_map)
+            router_module._cached_conf    = topk_batch_mean(unc_conf)
+
+    # ----------------------------------------------------------
+    # HOOK reg: hitung DFL variance langsung di hook
+    # ----------------------------------------------------------
+    def hook_reg(module, input, output):
+        # output: (B, 4*reg_max, H, W)
+        with torch.no_grad():
+            B, _, H, W = output.shape
+            K = max(1, int(H * W * 0.02))
+
+            # Ambil 1 koordinat saja untuk efisiensi
+            reg_one   = output[:, :reg_max, :, :]
+            dist_prob = torch.softmax(reg_one, dim=1)
+            bins      = torch.arange(
+                reg_max, device=output.device,
+                dtype=output.dtype
+            ).view(1, reg_max, 1, 1)
+
+            y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
+            var_map = (
+                dist_prob * (bins - y_hat) ** 2
+            ).sum(dim=1, keepdim=True)
+
+            flat    = var_map.view(B, 1, -1)
+            topk, _ = torch.topk(flat, k=K, dim=-1)
+            per_sample = (0.7 * topk.mean(dim=-1)
+                          + 0.3 * flat.mean(dim=-1))
+            router_module._cached_dfl_var = per_sample.mean().item()
+
+    # Pasang hook
+    handle_cls = detect_head.cv3[1].register_forward_hook(hook_cls)
+    handle_reg = detect_head.cv2[1].register_forward_hook(hook_reg)
+
+    router_module._hook_handles  = [handle_cls, handle_reg]
+
+    # Inisialisasi cache sebagai scalar None
+    router_module._cached_entropy = None
+    router_module._cached_conf    = None
+    router_module._cached_dfl_var = None
+    router_module.use_hook_cache  = True
+    router_module.nc              = nc
+    router_module.reg_max         = reg_max
+
+    print(
+        f"[INFO] Hook terpasang — menyimpan statistik agregat "
+        f"(scalar, bukan tensor). nc={nc}, reg_max={reg_max}."
+    )
+
+def remove_router_hooks(model):
+    """
+    Lepas semua hook sebelum export/ONNX agar tidak ada
+    referensi ke router di dalam graph export.
+    """
+    for m in model.modules():
+        if m.__class__.__name__ == 'DifficultyAwareRouter':
+            for handle in getattr(m, '_hook_handles', []):
+                handle.remove()
+            m._hook_handles = []
+            print("[INFO] Router hooks dilepas.")
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -415,6 +548,8 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
+        
+        hook_router_to_head(self)
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference and train outputs.
@@ -1652,14 +1787,20 @@ def parse_model(d, ch, verbose=True):
             args = [*args[1:]]
         # --- TAMBAHAN UNTUK MOE-P2 ROUTER ---
         elif m is DifficultyAwareRouter:
-            c_p3 = ch[f[0]] # Channel P3 (misal 64 pada Nano)
-            c_p2 = ch[f[1]] # Channel P2 (misal 32 pada Nano)
-            args = [c_p3, c_p2]
+            c_p3 = ch[f[0]] # Ambil channel P3 dari layer sebelumnya
+            c_p2 = ch[f[1]] # Ambil channel P2 dari layer sebelumnya
             
-            # PENTING: Output router adalah Concat (P3 + P2)
-            # Kita harus update variabel c2 agar layer berikutnya (Layer 17) 
-            # tahu dia akan menerima 96 channel, bukan 32.
-            c2 = c_p3 + c_p2
+            # 1. PENSKALAAN CHANNEL (WIDTH)
+            c2f_out_scaled = make_divisible(args[0] * width, 8)
+            
+            # 2. PENSKALAAN BOTTLENECK (DEPTH)
+            n_bottleneck_scaled = max(round(args[1] * depth), 1) if len(args) > 1 else 1
+            
+            # 3. RAKIT KEMBALI ARGUMEN 
+            args = [c_p3, c_p2, c2f_out_scaled, n_bottleneck_scaled, *args[2:]]
+            
+            # 4. Set ukuran channel akhir (c2)
+            c2 = args[2]
         # -------------------------------------
         else:
             c2 = ch[f]

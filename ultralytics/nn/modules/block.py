@@ -1946,39 +1946,188 @@ class SAVPE(nn.Module):
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
 
 
+# ============================================================
+# FILE: ultralytics/nn/modules/difficulty_aware_router.py
+# ============================================================
+#
+# Modul DifficultyAwareRouter untuk arsitektur YOLOv8-P2
+# dengan mekanisme Difficulty-Aware Spatial Router.
+#
+# Referensi proposal:
+#   - Persamaan (5)  : Feature fusion dengan gate biner
+#   - Persamaan (6)  : Z_in = LayerNorm(Concat(Z_visual, Z_low, S))
+#   - Persamaan (7)  : Z_visual = GAP(F_P3 ⊗ A_spatial)
+#   - Persamaan (8)  : Z_low = GAP(Conv1x1(F_P2_backbone))
+#   - Persamaan (9)  : S = [μTopK(H), μTopK(C), μTopK(σ²_DFL)]
+#   - Persamaan (10) : Gate training via Gumbel-Softmax + STE
+#   - Persamaan (11) : Gate inferensi via Hard Routing
+#
+# Referensi literatur:
+#   - Jang et al. (2017)  : Gumbel-Softmax
+#   - Woo et al. (2018)   : CBAM / Spatial Attention Module
+#   - Lin et al. (2023)   : DynamicDet (justifikasi lag t-1)
+# ============================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# SPATIAL ATTENTION MODULE (SAM)
+# Referensi: CBAM — Woo et al. (2018)
+# Digunakan untuk Z_visual = GAP(F_P3 ⊗ A_spatial)
+# ============================================================
 class SpatialAttention(nn.Module):
     """
-    Modul Atensi Spasial untuk menonjolkan area penting pada fitur P3.
-    Referensi: CBAM (Convolutional Block Attention Module)
+    Spatial Attention Module (SAM) dari CBAM.
+    Menghasilkan attention map 2D berdasarkan statistik
+    channel-wise (average + max pooling).
     """
-    def __init__(self, kernel_size=7):
+
+    def __init__(self, kernel_size: int = 7):
         super().__init__()
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
-        # Input channel = 2 (karena concat dari AvgPool dan MaxPool)
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.act = nn.Sigmoid()
+        self.conv = nn.Conv2d(
+            2, 1, kernel_size,
+            padding=kernel_size // 2,
+            bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        # x: [Batch, Channel, Height, Width]
-        # AvgPool & MaxPool di sepanjang dimensi channel
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        # Gabungkan -> Conv -> Sigmoid
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-        scale = self.act(self.conv1(x_cat))
-        return x * scale  # Fitur yang sudah diberi bobot atensi
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        avg = torch.mean(x, dim=1, keepdim=True)   # (B, 1, H, W)
+        mx, _ = torch.max(x, dim=1, keepdim=True)  # (B, 1, H, W)
+        attn = self.sigmoid(
+            self.conv(torch.cat([avg, mx], dim=1))
+        )                                           # (B, 1, H, W)
+        return x * attn                             # (B, C, H, W)
 
+
+# ============================================================
+# DIFFICULTY-AWARE SPATIAL ROUTER
+# ============================================================
 class DifficultyAwareRouter(nn.Module):
-    def __init__(self, c_p3, c_p2, hidden_dim=40):
+    """
+    Router dinamis yang mengontrol aktivasi jalur P2 secara
+    kondisional berdasarkan tingkat kesulitan visual input.
+
+    Arsitektur internal:
+        1. Z_visual : SAM(F_P3) → GAP → (B, c_p3)
+        2. Z_low    : Conv1x1(F_P2) → GAP → (B, 16)
+        3. S        : statistik agregat dari hook Head P3
+                      [entropy, conf, dfl_var] → (B, 3)
+        4. Z_in     : Concat + LayerNorm → (B, c_p3+16+3)
+        5. MLP      : Z_in → 40 → 2 (logits gate)
+        6. Gate     : STE Gumbel-Softmax (train) / Hard (infer)
+        7. C2f P2   : di dalam router → true skip saat gate=0
+
+    Sumber sinyal uncertainty (prioritas):
+        Prioritas 1 — Hook cache (statistik agregat scalar):
+            Nilai entropy/conf/var dari Head P3 batch sebelumnya.
+            Tidak ada shape mismatch, overhead nol.
+        Prioritas 2 — Proxy fallback:
+            Dipakai saat cache belum terisi (batch pertama)
+            atau selama warmup epochs.
+
+    Warmup strategy:
+        Epoch 0 s/d (warmup_epochs-1):
+            Gate dipaksa = 1 (P2 selalu aktif).
+            Tujuan: C2f P2 terlatih sebelum router memutuskan.
+            Sparsity loss = 0 selama periode ini.
+        Epoch >= warmup_epochs:
+            Gate bebas berdasarkan sinyal router.
+            Sparsity loss aktif.
+
+    True skip (inferensi):
+        Jika gate = 0, C2f P2 tidak dipanggil sama sekali.
+        Output = tensor nol dengan dimensi (B, c2f_out, H2, W2).
+        GFLOPs benar-benar berkurang, bukan hanya di-mask.
+    """
+
+    def __init__(
+        self,
+        c_p3: int,
+        c_p2: int,
+        c2f_out: int,
+        n_bottleneck: int = 1,
+        shortcut: bool = False,
+        hidden_dim: int = 40,
+        num_classes: int = 1,
+        reg_max: int = 16,
+        warmup_epochs: int = 5,
+    ):
+        """
+        Args:
+            c_p3          : channel P3 dari Neck
+            c_p2          : channel P2 dari Backbone
+            c2f_out       : channel output C2f P2 (sudah di dalam router)
+            n_bottleneck  : jumlah bottleneck C2f (ikuti depth scaling)
+            shortcut      : shortcut pada bottleneck C2f
+            hidden_dim    : hidden dim MLP router (default 40,
+                            sesuai proposal: input_dim → 40 → 2)
+            num_classes   : jumlah kelas untuk proxy fallback
+            reg_max       : jumlah bin DFL untuk proxy fallback
+            warmup_epochs : jumlah epoch paksa gate=1 (default 5)
+        """
         super().__init__()
-        self.gap = nn.AdaptiveAvgPool2d(1) 
+
+        self.c_p3         = c_p3
+        self.c_p2         = c_p2
+        self.c2f_out      = c2f_out
+        self.num_classes  = num_classes
+        self.reg_max      = reg_max
+        self.warmup_epochs = warmup_epochs
+
+        # =====================================================
+        # 1. KOMPONEN Z_VISUAL
+        #    Z_visual = GAP(SAM(F_P3))  — Persamaan (7)
+        # =====================================================
+        self.sam = SpatialAttention(kernel_size=7)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        # =====================================================
+        # 2. KOMPONEN Z_LOW
+        #    Z_low = GAP(Conv1x1(F_P2_backbone))  — Persamaan (8)
+        # =====================================================
         self.c_low = 16
-        self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, 1, 0)
-        
-        self.proxy_cls = nn.Conv2d(c_p3, 1, 1) 
-        self.proxy_reg = nn.Conv2d(c_p3, 4, 1) 
-        
+        self.conv_hint = nn.Conv2d(
+            c_p2, self.c_low, 1, bias=False
+        )
+
+        # =====================================================
+        # 3. PROXY FALLBACK
+        #    Dipakai saat hook cache belum tersedia.
+        #    Lebih dalam dari Conv2d tunggal agar lebih ekspresif.
+        # =====================================================
+        self.proxy_cls = nn.Sequential(
+            nn.Conv2d(
+                c_p3, max(c_p3 // 2, 32), 3,
+                padding=1, bias=False
+            ),
+            nn.SiLU(),
+            nn.Conv2d(max(c_p3 // 2, 32), num_classes, 1)
+        )
+        self.proxy_reg_dist = nn.Conv2d(c_p3, reg_max, 1)
+
+        # =====================================================
+        # 4. C2F P2 — DI DALAM ROUTER
+        #    Memungkinkan true skip saat inferensi gate=0.
+        #    Input channel = c_p3 + c_p2 (setelah Concat+Upsample)
+        # =====================================================
+        from ultralytics.nn.modules import C2f
+        self.c2f_p2 = C2f(
+            c_p3 + c_p2, c2f_out,
+            n=n_bottleneck,
+            shortcut=shortcut
+        )
+
+        # =====================================================
+        # 5. MLP ROUTER
+        #    input_dim = c_p3 + 16 (low) + 3 (stats)
+        #    Arsitektur: input_dim → hidden_dim → 2
+        #    Sesuai proposal: 275 → 40 → 2
+        # =====================================================
         self.input_dim = c_p3 + self.c_low + 3
         self.layer_norm = nn.LayerNorm(self.input_dim)
         self.mlp = nn.Sequential(
@@ -1986,130 +2135,394 @@ class DifficultyAwareRouter(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 2)
         )
+
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+        # =====================================================
+        # 6. STATE TRAINING
+        # =====================================================
+        self.current_epoch = 0
+        self._is_warmup    = True
+        self.force_active  = True   # True selama warmup
+
+        # Output untuk loss.py
         self.current_activation_prob = 0.0
-        self.tau = 2.0
-        self.tau_min = 0.5
-        self.tau_decay = 0.999
+        self.loss_prob    = None
+        self.last_entropy = None
+        self.last_conf    = None
+        self.last_var     = None
 
-        if hasattr(self.mlp[2], 'bias') and self.mlp[2].bias is not None:
-            nn.init.constant_(self.mlp[2].bias[1], 1.0)
-            nn.init.constant_(self.mlp[2].bias[0], -1.0)
+        # =====================================================
+        # 7. HOOK CACHE (diisi oleh hook_router_to_head)
+        #    Menyimpan statistik AGREGAT (scalar float),
+        #    bukan tensor penuh — menghindari shape mismatch
+        #    di akhir epoch dan overhead memory.
+        # =====================================================
+        self.use_hook_cache   = False
+        self._cached_entropy  = None  # scalar float
+        self._cached_conf     = None  # scalar float
+        self._cached_dfl_var  = None  # scalar float
+        self._hook_handles    = []
 
-    def get_uncertainty_signals(self, x_p3):
+        # =====================================================
+        # 8. RUNNING STATS untuk normalisasi stabil
+        #    Menggantikan batch-wise std yang bisa = 0
+        #    saat batch size = 1 atau fitur seragam.
+        # =====================================================
+        self._running_mean      = None  # (3,) EMA mean
+        self._running_std       = None  # (3,) EMA std
+        self._ema_momentum      = 0.99
+        self._stats_initialized = False
+
+        # Init bias MLP: mulai balanced (50/50)
+        nn.init.constant_(self.mlp[2].bias[0], 0.0)
+        nn.init.constant_(self.mlp[2].bias[1], 0.0)
+
+    # =========================================================
+    # API PUBLIK
+    # =========================================================
+
+    def set_epoch(self, epoch: int):
+        """
+        Dipanggil di awal setiap epoch dari training loop.
+        Mengontrol transisi warmup → normal.
+        """
+        self.current_epoch = epoch
+        self._is_warmup   = (epoch < self.warmup_epochs)
+        self.force_active = self._is_warmup
+
+    def remove_hooks(self):
+        """Lepas semua hook — dipanggil sebelum ONNX export."""
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles = []
+
+    # =========================================================
+    # NORMALISASI STABIL (EMA running stats)
+    # =========================================================
+
+    def _safe_normalize(
+        self, stats: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Z-score normalisasi menggunakan EMA running stats.
+
+        Lebih stabil dibanding batch-wise std karena:
+        (a) tidak div-by-zero saat batch size = 1
+        (b) tidak bergantung pada satu batch saja
+        (c) bekerja sejak batch pertama (inisialisasi lazy)
+
+        Args:
+            stats : (B, 3) — [entropy, conf, dfl_var] raw
+
+        Returns:
+            (B, 3) — ternormalisasi, di-clamp ke [-3, 3]
+        """
+        with torch.no_grad():
+            batch_mean = stats.mean(dim=0)  # (3,)
+            batch_std  = stats.std(
+                dim=0, unbiased=False
+            ).clamp(min=1e-6)               # (3,)
+
+            if not self._stats_initialized:
+                self._running_mean = batch_mean.clone()
+                self._running_std  = batch_std.clone()
+                self._stats_initialized = True
+            else:
+                m = self._ema_momentum
+                self._running_mean = (
+                    m * self._running_mean
+                    + (1 - m) * batch_mean
+                )
+                self._running_std = (
+                    m * self._running_std
+                    + (1 - m) * batch_std
+                )
+
+        stats_norm = (
+            (stats - self._running_mean.to(stats.device))
+            / self._running_std.to(stats.device).clamp(min=1e-6)
+        )
+        return stats_norm.clamp(-3.0, 3.0)
+
+    # =========================================================
+    # HITUNG STATS DARI LOGITS (dipakai proxy fallback)
+    # =========================================================
+
+    def _compute_stats(
+        self,
+        cls_logits: torch.Tensor,
+        reg_logits: torch.Tensor
+    ):
+        """
+        Hitung entropy, confidence, dan DFL variance dari logits.
+
+        Args:
+            cls_logits : (B, nc, H, W)
+            reg_logits : (B, reg_max, H, W)
+
+        Returns:
+            avg_entropy, avg_conf, dfl_var — masing-masing (B, 1)
+        """
         eps = 1e-9
-        logits_cls = self.proxy_cls(x_p3)
-        prob_cls = torch.sigmoid(logits_cls)
-        
-        B, C, H, W = x_p3.shape
-        K = max(1, int(H * W * 0.02))  # 2% Top-K (balanced untuk multi-dataset)
+        B, nc, H, W = cls_logits.shape
+        K = max(1, int(H * W * 0.02))  # Top-2% lokasi
 
-        # =========================================================
-        # 1. CONFIDENCE
-        # =========================================================
-        uncertainty_conf = 1 - prob_cls
-        flat_unc = uncertainty_conf.view(B, 1, -1)
-        topk_unc, _ = torch.topk(flat_unc, k=K, dim=-1)
-        mean_unc = flat_unc.mean(dim=-1)
-        avg_conf = 0.7 * topk_unc.mean(dim=-1) + 0.3 * mean_unc
+        # --- Entropy & Confidence ---
+        if nc == 1:
+            prob = torch.sigmoid(cls_logits)
+            entropy_map = -(
+                prob * torch.log(prob + eps)
+                + (1 - prob) * torch.log(1 - prob + eps)
+            )
+            unc_conf = 1 - prob
+        else:
+            prob = torch.softmax(cls_logits, dim=1)
+            entropy_map = -(
+                prob * torch.log(prob + eps)
+            ).sum(dim=1, keepdim=True)
+            unc_conf = 1 - prob.max(
+                dim=1, keepdim=True
+            ).values
 
-        # =========================================================
-        # 2. ENTROPY 
-        # =========================================================
-        entropy_map = -(
-            prob_cls * torch.log(prob_cls + eps) +
-            (1 - prob_cls) * torch.log(1 - prob_cls + eps)
+        def topk_mean(t4d):
+            flat = t4d.view(B, 1, -1)
+            topk, _ = torch.topk(flat, k=K, dim=-1)
+            return (
+                0.7 * topk.mean(dim=-1)
+                + 0.3 * flat.mean(dim=-1)
+            )  # (B, 1)
+
+        avg_entropy = topk_mean(entropy_map)
+        avg_conf    = topk_mean(unc_conf)
+
+        # --- DFL Variance — Persamaan (3) & (4) ---
+        dist_prob = F.softmax(reg_logits, dim=1)
+        bins = torch.arange(
+            self.reg_max,
+            device=cls_logits.device,
+            dtype=cls_logits.dtype
+        ).view(1, self.reg_max, 1, 1)
+        y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
+        var_map = (
+            dist_prob * (bins - y_hat) ** 2
+        ).sum(dim=1, keepdim=True)
+        dfl_var = topk_mean(var_map)
+
+        return avg_entropy, avg_conf, dfl_var
+
+    # =========================================================
+    # PILIH SUMBER SINYAL UNCERTAINTY
+    # =========================================================
+
+    def _get_uncertainty_signals(
+        self, f_p3: torch.Tensor
+    ):
+        """
+        Baca sinyal uncertainty dari sumber terbaik.
+
+        Prioritas 1 — Hook cache (scalar agregat):
+            Nilai dari Head P3 batch sebelumnya (lag t-1).
+            Di-broadcast ke (B, 1) agar kompatibel pipeline.
+            Tidak ada shape mismatch karena scalar.
+
+        Prioritas 2 — Proxy fallback:
+            Dipakai saat cache belum ada (batch pertama)
+            atau selama warmup epochs.
+
+        Justifikasi lag t-1:
+            Router belajar dari DISTRIBUSI statistik, bukan
+            nilai per-gambar. Distribusi ini cukup stabil
+            antar-batch untuk memberikan sinyal yang berguna,
+            konsisten dengan pendekatan DynamicDet (Lin et al.,
+            2023) yang juga menggunakan sinyal iterasi sebelumnya.
+        """
+        B      = f_p3.shape[0]
+        device = f_p3.device
+        dtype  = f_p3.dtype
+
+        e_cache = getattr(self, '_cached_entropy', None)
+        c_cache = getattr(self, '_cached_conf',    None)
+        v_cache = getattr(self, '_cached_dfl_var', None)
+
+        cache_ready = (
+            self.use_hook_cache
+            and e_cache is not None
+            and c_cache is not None
+            and v_cache is not None
         )
-        flat_entropy = entropy_map.view(B, 1, -1)
-        topk_entropy, _ = torch.topk(flat_entropy, k=K, dim=-1)
-        mean_entropy = flat_entropy.mean(dim=-1)
-        avg_entropy = 0.7 * topk_entropy.mean(dim=-1) + 0.3 * mean_entropy
 
-        # =========================================================
-        # 3. DFL VARIANCE (STABILIZED)
-        # =========================================================
-        regs = self.proxy_reg(x_p3)
-        pixel_variance = torch.var(regs, dim=1, keepdim=True)
-        flat_var = pixel_variance.view(B, 1, -1)
-        topk_var, _ = torch.topk(flat_var, k=K, dim=-1)
-        mean_var = flat_var.mean(dim=-1)
-        dfl_var = 0.7 * topk_var.mean(dim=-1) + 0.3 * mean_var
+        if cache_ready:
+            # Broadcast scalar → (B, 1)
+            avg_entropy = torch.full(
+                (B, 1), e_cache, device=device, dtype=dtype
+            )
+            avg_conf = torch.full(
+                (B, 1), c_cache, device=device, dtype=dtype
+            )
+            dfl_var = torch.full(
+                (B, 1), v_cache, device=device, dtype=dtype
+            )
+        else:
+            # Proxy fallback
+            cls_logits = self.proxy_cls(f_p3)
+            reg_logits = self.proxy_reg_dist(f_p3)
+            avg_entropy, avg_conf, dfl_var = self._compute_stats(
+                cls_logits, reg_logits
+            )
 
-        # =========================================================
-        # 4. NORMALIZATION (AGAR STABIL & GENERAL)
-        # =========================================================
-        def normalize(x, eps=1e-6):
-            # Normalisasi menyilang antar gambar di dalam Batch (dim=0)
-            # x shape: (B, 1)
-            # Jika batch size hanya 1, fallback ke nilai 0 agar tidak error
-            if x.shape[0] == 1:
-                return torch.zeros_like(x)
-                
-            mean = x.mean(dim=0, keepdim=True)
-            std = x.std(dim=0, keepdim=True, unbiased=False)
-            return (x - mean) / (std + eps)
-        
-        avg_entropy = normalize(avg_entropy)
-        avg_conf = normalize(avg_conf)
-        dfl_var = normalize(dfl_var)
+        return avg_entropy, avg_conf, dfl_var
 
-
-        # =========================================================
-        # 5. AMP SAFE
-        # =========================================================
-        return (
-            avg_entropy.to(x_p3.dtype),
-            avg_conf.to(x_p3.dtype),
-            dfl_var.to(x_p3.dtype)
-        )
+    # =========================================================
+    # FORWARD
+    # =========================================================
 
     def forward(self, x):
-       
+        """
+        Args:
+            x : [f_p3, f_p2_back]
+                f_p3      : (B, c_p3, H, W)   — P3 dari Neck
+                f_p2_back : (B, c_p2, H*2, W*2) — P2 dari Backbone
+
+        Returns:
+            Tensor (B, c2f_out, H*2, W*2)
+            Training  : C2f selalu dieksekusi, di-scale gate (STE)
+            Inferensi : C2f di-skip jika gate=0 (true skip)
+        """
         f_p3, f_p2_back = x[0], x[1]
-        B, C, H, W = f_p3.shape
-        
-        z_visual = self.gap(f_p3).view(B, -1)
-        f_p2_hint = self.conv_hint(f_p2_back)
-        z_low = self.gap(f_p2_hint).view(B, -1)
-        
-        entropy, conf, var = self.get_uncertainty_signals(f_p3)
-        stats = torch.cat([entropy, conf, var], dim=1)
-        stats = stats * (z_visual.std(dim=1, keepdim=True).detach() + 1e-6)
-        
-        z_in = torch.cat([z_visual, z_low, stats], dim=1) 
+        B = f_p3.shape[0]
+        _, _, H2, W2 = f_p2_back.shape
+
+        # =================================================
+        # LANGKAH 1: BENTUK Z_IN — Persamaan (6)
+        # =================================================
+
+        # Z_visual = GAP(SAM(F_P3))
+        z_visual = self.gap(
+            self.sam(f_p3)
+        ).view(B, -1)                          # (B, c_p3)
+
+        # Z_low = GAP(Conv1x1(F_P2_backbone))
+        z_low = self.gap(
+            self.conv_hint(f_p2_back)
+        ).view(B, -1)                          # (B, 16)
+
+        # S = statistik uncertainty
+        entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3)
+
+        # Simpan untuk loss.py
+        self.last_entropy = entropy.detach()
+        self.last_conf    = conf.detach()
+        self.last_var     = dfl_var.detach()
+
+        # Gabungkan stats: (B, 3)
+        stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
+
+        # Normalisasi stabil via EMA running stats
+        stats_norm = self._safe_normalize(stats_raw)
+
+        # Skalakan ke magnitude z_visual agar seimbang
+        scale = z_visual.std(
+            dim=1, keepdim=True
+        ).detach().clamp(min=1e-6)
+        stats_scaled = stats_norm * scale      # (B, 3)
+
+        # Gabungkan semua sinyal
+        z_in   = torch.cat(
+            [z_visual, z_low, stats_scaled], dim=1
+        )                                      # (B, input_dim)
         z_norm = self.layer_norm(z_in)
-        logits = self.mlp(z_norm) 
-        logits = torch.clamp(logits, -5, 5)
-        
+
+        # =================================================
+        # LANGKAH 2: MLP → LOGITS
+        # =================================================
+        logits = self.mlp(z_norm)              # (B, 2)
+
+        # =================================================
+        # LANGKAH 3: KEPUTUSAN GATE
+        # =================================================
+        tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
+
         if self.training:
-            #tau annealing
-            self.tau = max(self.tau * self.tau_decay, self.tau_min)
-            tau = self.tau
 
-            # straight-through gumbel
-            gate_soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
-            gate_hard = torch.zeros_like(gate_soft)
-            gate_hard.scatter_(1, gate_soft.argmax(dim=1, keepdim=True), 1.0)
-            gate_tensor = (gate_hard - gate_soft).detach() + gate_soft
+            if self._is_warmup:
+                # =========================================
+                # WARMUP: gate dipaksa = 1
+                # MLP tetap menerima gradient (belajar
+                # representasi) tapi outputnya di-override.
+                # Sparsity loss = 0 (dikontrol loss.py).
+                # =========================================
+                soft = F.gumbel_softmax(
+                    logits, tau=tau, hard=False, dim=1
+                )
+                # STE tetap dihitung agar gradient mengalir
+                hard = torch.zeros_like(soft).scatter_(
+                    1, soft.argmax(dim=1, keepdim=True), 1.0
+                )
+                _ = hard - soft.detach() + soft  # STE (tidak dipakai)
 
-            gate_value = gate_tensor[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-            probs = F.softmax(logits, dim=1)
+                # Override: paksa gate = 1
+                gate_scalar = torch.ones(
+                    B, 1, 1, 1,
+                    device=f_p3.device, dtype=f_p3.dtype
+                )
 
-            # 🔥 EMA smoothing
-            momentum = 0.9
-            current = probs[:,1].mean().detach()
-            self.current_activation_prob = (momentum * self.current_activation_prob + (1 - momentum) * current)
-            self.loss_prob = probs[:, 1].mean()
+                probs = F.softmax(logits, dim=1)
+                self.current_activation_prob = 1.0
+                # loss_prob = 1.0 agar loss.py bisa deteksi warmup
+                self.loss_prob = probs[:, 1].mean()
+
+            else:
+                # =========================================
+                # NORMAL: Straight-Through Gumbel-Softmax
+                # Persamaan (10)
+                # =========================================
+                soft = F.gumbel_softmax(
+                    logits, tau=tau, hard=False, dim=1
+                )
+                hard = torch.zeros_like(soft).scatter_(
+                    1, soft.argmax(dim=1, keepdim=True), 1.0
+                )
+                # STE: hard di forward, gradient dari soft
+                gate_onehot = hard - soft.detach() + soft
+                gate_scalar = gate_onehot[:, 1].view(
+                    B, 1, 1, 1
+                ).to(f_p3.dtype)
+
+                probs = F.softmax(logits, dim=1)
+                self.current_activation_prob = (
+                    probs[:, 1].mean().item()
+                )
+                self.loss_prob = probs[:, 1].mean()
+
+            # C2f SELALU dieksekusi saat training
+            # agar gradient mengalir ke seluruh parameter P2
+            f_p3_up = self.upsample(f_p3)
+            f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
+            f_c2f   = self.c2f_p2(f_fused)
+            output  = f_c2f * gate_scalar.to(f_c2f.dtype)
 
         else:
-            probs = F.softmax(logits, dim=1)
-            gate_idx = torch.argmax(probs, dim=1)
-            # PERLINDUNGAN AMP
-            gate_value = gate_idx.view(B, 1, 1, 1).to(f_p3.dtype)
-            self.current_activation_prob = gate_value.to(torch.float32).mean()
-            self.loss_prob = torch.tensor(0.0, device=x[0].device)
+            # =============================================
+            # INFERENSI: TRUE SKIP — Persamaan (11)
+            # if-else pada Python scalar → C2f benar-benar
+            # tidak dipanggil saat gate = 0.
+            # =============================================
+            probs    = F.softmax(logits, dim=1)
+            activate = probs[:, 1].mean().item() > 0.5
 
-        f_p3_up = self.upsample(f_p3)
-        f_p2_weighted = f_p2_back * gate_value
-        
-        return torch.cat([f_p3_up, f_p2_weighted], dim=1)
+            self.current_activation_prob = float(activate)
+
+            if activate:
+                f_p3_up = self.upsample(f_p3)
+                f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
+                output  = self.c2f_p2(f_fused)
+            else:
+                # TRUE SKIP: C2f tidak dipanggil
+                output = torch.zeros(
+                    B, self.c2f_out, H2, W2,
+                    device=f_p3.device,
+                    dtype=f_p3.dtype
+                )
+
+        return output
