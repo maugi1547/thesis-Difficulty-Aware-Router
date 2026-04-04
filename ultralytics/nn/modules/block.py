@@ -2196,7 +2196,52 @@ class DifficultyAwareRouter(nn.Module):
         for h in self._hook_handles:
             h.remove()
         self._hook_handles = []
+        
+    # =========================================================
+    # HOOK METHODS (PICKLE-SAFE)
+    # =========================================================
+    def _hook_cls(self, module, input, output):
+        with torch.no_grad():
+            B, C, H, W = output.shape
+            K = max(1, int(H * W * 0.02))
+            eps = 1e-9
 
+            if C == 1:
+                prob = torch.sigmoid(output)
+                entropy_map = -(prob * torch.log(prob + eps) + (1 - prob) * torch.log(1 - prob + eps))
+                unc_conf = 1 - prob
+            else:
+                prob = torch.softmax(output, dim=1)
+                entropy_map = -(prob * torch.log(prob + eps)).sum(dim=1, keepdim=True)
+                unc_conf = 1 - prob.max(dim=1, keepdim=True).values
+
+            # Inlining fungsi agar 100% aman dari pickle error
+            flat_e = entropy_map.view(B, 1, -1)
+            topk_e, _ = torch.topk(flat_e, k=K, dim=-1)
+            per_sample_e = (0.7 * topk_e.mean(dim=-1) + 0.3 * flat_e.mean(dim=-1))
+            self._cached_entropy = per_sample_e.mean().item()
+
+            flat_c = unc_conf.view(B, 1, -1)
+            topk_c, _ = torch.topk(flat_c, k=K, dim=-1)
+            per_sample_c = (0.7 * topk_c.mean(dim=-1) + 0.3 * flat_c.mean(dim=-1))
+            self._cached_conf = per_sample_c.mean().item()
+
+    def _hook_reg(self, module, input, output):
+        with torch.no_grad():
+            B, _, H, W = output.shape
+            K = max(1, int(H * W * 0.02))
+
+            reg_one   = output[:, :self.reg_max, :, :]
+            dist_prob = torch.softmax(reg_one, dim=1)
+            bins      = torch.arange(self.reg_max, device=output.device, dtype=output.dtype).view(1, self.reg_max, 1, 1)
+
+            y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
+            var_map = (dist_prob * (bins - y_hat) ** 2).sum(dim=1, keepdim=True)
+
+            flat    = var_map.view(B, 1, -1)
+            topk, _ = torch.topk(flat, k=K, dim=-1)
+            per_sample = (0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1))
+            self._cached_dfl_var = per_sample.mean().item()
     # =========================================================
     # NORMALISASI STABIL (EMA running stats)
     # =========================================================
