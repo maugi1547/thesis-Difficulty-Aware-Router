@@ -2219,10 +2219,8 @@ class DifficultyAwareRouter(nn.Module):
             (B, 3) — ternormalisasi, di-clamp ke [-3, 3]
         """
         with torch.no_grad():
-            batch_mean = stats.mean(dim=0)  # (3,)
-            batch_std  = stats.std(
-                dim=0, unbiased=False
-            ).clamp(min=1e-6)               # (3,)
+            batch_mean = stats.mean(dim=0)
+            batch_std  = stats.std(dim=0, unbiased=False).clamp(min=1e-6)
 
             if not self._stats_initialized:
                 self._running_mean = batch_mean.clone()
@@ -2230,25 +2228,18 @@ class DifficultyAwareRouter(nn.Module):
                 self._stats_initialized = True
             else:
                 m = self._ema_momentum
+                # FIX 1: Paksa ke device DAN dtype yang sama
+                curr_mean = self._running_mean.to(device=stats.device, dtype=stats.dtype)
+                curr_std  = self._running_std.to(device=stats.device, dtype=stats.dtype)
                 
-                # --- FIX: PENYELARASAN DEVICE OTOMATIS ---
-                # Tarik variabel memori ke device yang sama dengan batch saat ini (cuda:0)
-                curr_mean = self._running_mean.to(stats.device)
-                curr_std  = self._running_std.to(stats.device)
-                
-                self._running_mean = (
-                    m * curr_mean
-                    + (1 - m) * batch_mean
-                )
-                self._running_std = (
-                    m * curr_std
-                    + (1 - m) * batch_std
-                )
+                self._running_mean = (m * curr_mean + (1 - m) * batch_mean)
+                self._running_std = (m * curr_std + (1 - m) * batch_std)
 
-        stats_norm = (
-            (stats - self._running_mean.to(stats.device))
-            / self._running_std.to(stats.device).clamp(min=1e-6)
-        )
+        # FIX 2: Paksa pembagian dan pengurangan dengan dtype yang sama
+        curr_mean_stable = self._running_mean.to(device=stats.device, dtype=stats.dtype)
+        curr_std_stable  = self._running_std.to(device=stats.device, dtype=stats.dtype).clamp(min=1e-6)
+        
+        stats_norm = (stats - curr_mean_stable) / curr_std_stable
         return stats_norm.clamp(-3.0, 3.0)
 
     # =========================================================
@@ -2437,7 +2428,7 @@ class DifficultyAwareRouter(nn.Module):
         z_in   = torch.cat(
             [z_visual, z_low, stats_scaled], dim=1
         )                                      # (B, input_dim)
-        z_norm = self.layer_norm(z_in)
+        z_norm = self.layer_norm(z_in).to(f_p3.dtype)
 
         # =================================================
         # LANGKAH 2: MLP → LOGITS
