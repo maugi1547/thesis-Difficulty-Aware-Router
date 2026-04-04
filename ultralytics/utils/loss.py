@@ -435,7 +435,7 @@ class v8DetectionLoss:
         relative_penalty = torch.relu(relative_diff) ** 2
 
         # ----------------------------------------------------------
-        # 2. DIFFICULTY WEIGHT (local intelligence)
+        # 2. DIFFICULTY WEIGHT (local intelligence) - FIXED EMA
         #    Sampel sulit (entropy+var tinggi, conf rendah):
         #        score tinggi → exp(-score) kecil → penalty kecil
         #        → biarkan P2 aktif (benar secara semantik)
@@ -452,15 +452,37 @@ class v8DetectionLoss:
                     entropy + var - conf
                 ).detach()
 
-                d_mean = difficulty_score.mean()
-                d_std  = difficulty_score.std(
-                    unbiased=False
-                ).clamp(min=1e-6)
-                difficulty_score_norm = (
-                    (difficulty_score - d_mean) / d_std
+                batch_d_mean = difficulty_score.mean()
+
+                # Inisialisasi EMA Tracker untuk Difficulty
+                if not hasattr(self, 'diff_run_mean'):
+                    self.diff_run_mean = batch_d_mean.clone()
+                    # Inisialisasi varians historis dengan 1.0
+                    self.diff_run_var = torch.tensor(1.0, device=loss.device) 
+
+                # Gunakan momentum yang sama dengan relative penalty
+                m_diff = getattr(self, 'momentum', 0.9)
+
+                # Update EMA Mean & Variance Lintas-Batch
+                self.diff_run_mean = (
+                    m_diff * self.diff_run_mean 
+                    + (1 - m_diff) * batch_d_mean
+                )
+                
+                curr_var = (batch_d_mean - self.diff_run_mean) ** 2
+                self.diff_run_var = (
+                    m_diff * self.diff_run_var 
+                    + (1 - m_diff) * curr_var
                 )
 
-                # exp(-score): sulit → weight kecil → penalty kecil
+                # Normalisasi menggunakan Standar Deviasi Lintas-Batch
+                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-5)
+                
+                difficulty_score_norm = (
+                    (difficulty_score - self.diff_run_mean) / d_std_global
+                )
+
+                # exp(-score): sulit → norm positif → exp negatif → penalty kecil
                 difficulty_weight = torch.exp(
                     -difficulty_score_norm
                 ).clamp(0.1, 2.0).mean()
