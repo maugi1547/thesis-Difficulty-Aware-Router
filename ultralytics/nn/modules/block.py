@@ -2230,12 +2230,18 @@ class DifficultyAwareRouter(nn.Module):
                 self._stats_initialized = True
             else:
                 m = self._ema_momentum
+                
+                # --- FIX: PENYELARASAN DEVICE OTOMATIS ---
+                # Tarik variabel memori ke device yang sama dengan batch saat ini (cuda:0)
+                curr_mean = self._running_mean.to(stats.device)
+                curr_std  = self._running_std.to(stats.device)
+                
                 self._running_mean = (
-                    m * self._running_mean
+                    m * curr_mean
                     + (1 - m) * batch_mean
                 )
                 self._running_std = (
-                    m * self._running_std
+                    m * curr_std
                     + (1 - m) * batch_std
                 )
 
