@@ -2494,24 +2494,20 @@ class DifficultyAwareRouter(nn.Module):
                 # representasi) tapi outputnya di-override.
                 # Sparsity loss = 0 (dikontrol loss.py).
                 # =========================================
-                soft = F.gumbel_softmax(
-                    logits, tau=tau, hard=False, dim=1
-                )
-                # STE tetap dihitung agar gradient mengalir
-                hard = torch.zeros_like(soft).scatter_(
-                    1, soft.argmax(dim=1, keepdim=True), 1.0
-                )
-                _ = hard - soft.detach() + soft  # STE (tidak dipakai)
+                soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
+                
+                # Kita buat tensor 'hard' yang selalu memilih indeks 1 (Active)
+                hard_warmup = torch.zeros_like(soft)
+                hard_warmup[:, 1] = 1.0 
+                
+                # STE: Forward-nya 1.0 (P2 Aktif), tapi Gradient-nya mengalir ke 'soft'
+                # Ini membuat MLP belajar "mengapa" P2 harus bernilai 1.0
+                gate_onehot = hard_warmup - soft.detach() + soft
+                gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1)
 
-                # Override: paksa gate = 1
-                gate_scalar = torch.ones(
-                    B, 1, 1, 1,
-                    device=f_p3.device, dtype=f_p3.dtype
-                )
-
+                # Probabilitas asli untuk monitoring dan loss calculation
                 probs = F.softmax(logits, dim=1)
-                self.current_activation_prob = 1.0
-                # loss_prob = 1.0 agar loss.py bisa deteksi warmup
+                self.current_activation_prob = 1.0 # Status di log tetap 100%
                 self.loss_prob = probs[:, 1].mean()
 
             else:
@@ -2519,26 +2515,25 @@ class DifficultyAwareRouter(nn.Module):
                 # NORMAL: Straight-Through Gumbel-Softmax
                 # Persamaan (10)
                 # =========================================
-                soft = F.gumbel_softmax(
-                    logits, tau=tau, hard=False, dim=1
-                )
+                soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
+                
+                # Keputusan biner (0 atau 1) berdasarkan probabilitas tertinggi
                 hard = torch.zeros_like(soft).scatter_(
                     1, soft.argmax(dim=1, keepdim=True), 1.0
                 )
-                # STE: hard di forward, gradient dari soft
+                
+                # STE: 'hard' untuk forward pass, 'soft' untuk backward pass
                 gate_onehot = hard - soft.detach() + soft
-                gate_scalar = gate_onehot[:, 1].view(
-                    B, 1, 1, 1
-                ).to(f_p3.dtype)
+                gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
 
                 probs = F.softmax(logits, dim=1)
-                self.current_activation_prob = (
-                    probs[:, 1].mean().item()
-                )
+                # Gunakan .item() hanya untuk logging scalar
+                self.current_activation_prob = probs[:, 1].mean().item()
                 self.loss_prob = probs[:, 1].mean()
 
-            # C2f SELALU dieksekusi saat training
-            # agar gradient mengalir ke seluruh parameter P2
+            # Eksekusi Jalur P2 (C2f)
+            # Karena gate_scalar terhubung via STE, gradien akan mengalir ke
+            # seluruh parameter Backbone P2 DAN MLP Router secara sinkron.
             f_p3_up = self.upsample(f_p3)
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
