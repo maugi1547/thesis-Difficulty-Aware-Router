@@ -336,202 +336,153 @@ class v8DetectionLoss:
     # ============================================================
     def compute_router_loss(self, loss: torch.Tensor) -> torch.Tensor:
         """
-        Hitung router penalty dan tambahkan ke loss[3].
+        Hitung router penalty dan tambahkan ke index [3] dari tensor loss.
+        Fungsi ini memperluas tensor loss YOLOv8 dari ukuran (3,) menjadi (4,).
 
-        Formulasi:
-            L_total = L_det + λ_cost · L_sparsity   — Persamaan (12)
-
-        L_sparsity terdiri dari dua komponen hybrid:
-            1. Relative penalty  : mendorong aktivasi di bawah
-                                running average (global control)
-            2. Difficulty weight : mengurangi penalty untuk sampel
-                                sulit (local intelligence)
-
-        Sparsity loss = 0 selama warmup agar C2f P2 sempat terlatih
-        sebelum router dipaksa untuk menghemat komputasi.
-
-        Args:
-            loss : torch.Tensor shape (3,) — [box, cls, dfl]
-                Akan di-extend menjadi (4,) dengan slot router.
-
-        Returns:
-            loss : torch.Tensor shape (4,) — [box, cls, dfl, router]
+        Formulasi Utama:
+            L_total = L_det + (λ_cost * P2_prob * L_hybrid) 
+        
+        L_hybrid terdiri dari dua komponen:
+            1. L_rel  (Relative Penalty)  : Mendorong aktivasi di bawah rata-rata historis (EMA).
+            2. W_diff (Difficulty Weight) : Diskon denda untuk sampel sulit (Local Intelligence).
         """
-
-        # ----------------------------------------------------------
-        # CARI ROUTER DI DALAM MODEL
-        # ----------------------------------------------------------
+        # ==========================================================
+        # 1. PENCARIAN ROUTER (DEEP SEARCH - ANTI WRAPPER ERROR)
+        # ==========================================================
         router = None
-        if hasattr(self, 'model'):
-            root = (
-                self.model.model
-                if hasattr(self.model, 'model')
-                else self.model
-            )
-            for m in root.modules():
-                if m.__class__.__name__ == 'DifficultyAwareRouter':
-                    router = m
-                    break
+        for m in self.model.modules():
+            if 'DifficultyAwareRouter' in m.__class__.__name__:
+                router = m
+                break
 
-        # Tidak ada router → kembalikan loss tanpa perubahan
         if router is None:
+            if not hasattr(self, '_router_warned'):
+                print("\n[WARNING] compute_router_loss: DifficultyAwareRouter TIDAK DITEMUKAN di model!\n")
+                self._router_warned = True
             return loss
 
-        # ----------------------------------------------------------
-        # EXTEND LOSS KE SLOT [3] DENGAN torch.cat
-        # (bukan assignment ke index baru — jaga computation graph)
-        # ----------------------------------------------------------
-        router_slot = torch.zeros(1, device=loss.device)
-        loss = torch.cat([loss, router_slot])              # (4,)
+        # ==========================================================
+        # 2. EXTEND TENSOR LOSS SECARA AMAN (DARI 3 KE 4 DIMENSI)
+        # ==========================================================
+        if loss.shape[0] == 3:
+            router_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
+            loss = torch.cat([loss, router_slot])
 
-        # ----------------------------------------------------------
-        # AMBIL SINYAL DARI ROUTER
-        # ----------------------------------------------------------
-        target_lambda = getattr(
-            self.model, 'router_penalty_lambda', 0.05
-        )
+        # ==========================================================
+        # 3. AMBIL PARAMETER KONTROL
+        # ==========================================================
+        target_lambda = getattr(self.model, 'router_penalty_lambda', 0.0)
+        if target_lambda == 0.0:
+            target_lambda = getattr(self, 'router_penalty_lambda', 0.75) 
 
-        # Ambil loss_prob (ada gradient)
         val = getattr(router, 'loss_prob', None)
         if val is None:
-            return loss  # router belum forward, skip
+            return loss 
 
-        if torch.is_tensor(val):
-            p2_active_prob = val.to(loss.device)
-        else:
-            p2_active_prob = torch.tensor(
-                float(val), device=loss.device
-            )
+        # Variabel 'p' mewakili Probabilitas P2 Aktif saat ini
+        p2_active_prob = val if torch.is_tensor(val) else torch.tensor(float(val), device=loss.device)
 
-        # Ambil sinyal difficulty (sudah detach — hanya untuk weighting)
-        entropy = getattr(router, 'last_entropy', None)
-        conf    = getattr(router, 'last_conf',    None)
-        var     = getattr(router, 'last_var',     None)
-
-        # ----------------------------------------------------------
-        # CEK WARMUP: jika masih warmup, sparsity loss = 0
-        # ----------------------------------------------------------
-        is_warmup = getattr(router, 'force_active', False)
+        # ==========================================================
+        # 4. CEK FASE WARMUP
+        # ==========================================================
+        is_warmup = getattr(router, '_is_warmup', False)
         if is_warmup:
-            # Slot router tetap 0 — tidak paksa sparsity
-            # sebelum C2f P2 sempat terlatih
-            loss[3] = torch.tensor(0.0, device=loss.device)
+            loss[3] = torch.tensor(0.0, device=loss.device, requires_grad=True)
             return loss
 
-        # ----------------------------------------------------------
-        # 1. RELATIVE PENALTY (global control)
-        #    Mendorong aktivasi P2 di bawah rata-rata historis.
-        #    Smooth karena menggunakan EMA, bukan threshold kaku.
-        # ----------------------------------------------------------
+        # ==========================================================
+        # 5. HITUNG RELATIVE PENALTY (GLOBAL SPARSITY)
+        # Rumus: 
+        #   EMA_t = (β * EMA_{t-1}) + ((1 - β) * p_t)
+        #   L_rel = max(0, p_t - EMA_t)^2
+        # ==========================================================
         if not hasattr(self, 'p2_running_avg'):
             self.p2_running_avg = p2_active_prob.detach().clone()
 
-        self.p2_running_avg = (
-            self.momentum * self.p2_running_avg
-            + (1 - self.momentum) * p2_active_prob.detach()
-        )
-
-        relative_diff    = p2_active_prob - self.p2_running_avg
+        momentum = getattr(self, 'momentum', 0.9) # β = 0.9
+        
+        # Matematika: Update Exponential Moving Average (EMA)
+        self.p2_running_avg = (momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach())
+        
+        # Matematika: Selisih probabilitas saat ini dengan rata-rata. 
+        # ReLU memotong nilai negatif (hanya didenda jika melampaui rata-rata historis).
+        # Dikuadratkan (MSE style) agar penalti tumbuh eksponensial jika pelanggaran besar.
+        relative_diff = p2_active_prob - self.p2_running_avg
         relative_penalty = torch.relu(relative_diff) ** 2
 
-        # ----------------------------------------------------------
-        # 2. DIFFICULTY WEIGHT (local intelligence) - FIXED EMA
-        #    Sampel sulit (entropy+var tinggi, conf rendah):
-        #        score tinggi → exp(-score) kecil → penalty kecil
-        #        → biarkan P2 aktif (benar secara semantik)
-        #    Sampel mudah:
-        #        score rendah → exp(-score) besar → penalty besar
-        #        → dorong P2 non-aktif (hemat komputasi)
-        # ----------------------------------------------------------
+        # ==========================================================
+        # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE)
+        # Tujuan: Mendapatkan nilai bobot W_diff ∈ [0.1, 2.0]
+        # ==========================================================
+        difficulty_weight = torch.tensor(1.0, device=loss.device)
         try:
-            if (entropy is not None
-                    and conf is not None
-                    and var is not None):
+            entropy = getattr(router, 'last_entropy', None) # H
+            conf    = getattr(router, 'last_conf', None)    # C
+            var     = getattr(router, 'last_var', None)     # V
 
-                difficulty_score = (
-                    entropy + var - conf
-                ).detach()
+            if all(v is not None for v in [entropy, conf, var]):
+                # Matematika: Skor Kesulitan (D)
+                # D = H + V - C
+                # Logika: Gambar sulit = Entropi tinggi, Varians spasial tinggi, Confidence Head rendah.
+                diff_score = (entropy + var - conf).detach()
+                batch_d_mean = diff_score.mean() # μ_batch
 
-                batch_d_mean = difficulty_score.mean()
-
-                # Inisialisasi EMA Tracker untuk Difficulty
+                # Inisialisasi EMA untuk Mean (μ) dan Variance (σ^2)
                 if not hasattr(self, 'diff_run_mean'):
                     self.diff_run_mean = batch_d_mean.clone()
-                    # Inisialisasi varians historis dengan 1.0
                     self.diff_run_var = torch.tensor(1.0, device=loss.device) 
 
-                # Gunakan momentum yang sama dengan relative penalty
-                m_diff = getattr(self, 'momentum', 0.9)
-
-                # Update EMA Mean & Variance Lintas-Batch
-                self.diff_run_mean = (
-                    m_diff * self.diff_run_mean 
-                    + (1 - m_diff) * batch_d_mean
-                )
+                # Matematika: Update Welford's EMA untuk Mean dan Variance
+                # μ_t = (β * μ_{t-1}) + ((1 - β) * μ_batch)
+                self.diff_run_mean = (momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean)
                 
+                # σ^2_t = (β * σ^2_{t-1}) + ((1 - β) * (μ_batch - μ_t)^2)
                 curr_var = (batch_d_mean - self.diff_run_mean) ** 2
-                self.diff_run_var = (
-                    m_diff * self.diff_run_var 
-                    + (1 - m_diff) * curr_var
-                )
+                self.diff_run_var = (momentum * self.diff_run_var + (1 - momentum) * curr_var)
 
-                # Normalisasi menggunakan Standar Deviasi Lintas-Batch
-                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-5)
-                
-                difficulty_score_norm = (
-                    (difficulty_score - self.diff_run_mean) / d_std_global
-                )
+                # Matematika: Normalisasi Z-Score
+                # Z = (D - μ_t) / sqrt(σ^2_t)
+                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-5) # Mencegah pembagian dengan 0
+                diff_score_norm = (diff_score - self.diff_run_mean) / d_std_global
 
-                # exp(-score): sulit → norm positif → exp negatif → penalty kecil
-                difficulty_weight = torch.exp(
-                    -difficulty_score_norm
-                ).clamp(0.1, 2.0).mean()
-
-            else:
-                difficulty_weight = torch.tensor(
-                    1.0, device=loss.device
-                )
+                # Matematika: Fungsi Pemetaan Eksponensial Terbalik
+                # W_diff = exp(-Z)
+                # Jika Z positif (gambar lebih sulit dari rata-rata), exp(-Z) < 1 -> Denda diringankan (Diskon).
+                # Jika Z negatif (gambar lebih mudah dari rata-rata), exp(-Z) > 1 -> Denda diperberat.
+                # Clamp [0.1, 2.0] agar diskon/hukuman tidak meledak tak terhingga.
+                difficulty_weight = torch.exp(-diff_score_norm).clamp(0.1, 2.0).mean()
 
         except Exception as e:
-            print(f"[WARNING] difficulty_weight fallback: {e}")
-            difficulty_weight = torch.tensor(1.0, device=loss.device)
+            # Silently fallback ke bobot netral 1.0 jika perhitungan gagal
+            pass 
 
-        # ----------------------------------------------------------
-        # 3. HYBRID COMBINATION — Persamaan (12) & (13)
-        #    L_sparsity = α·relative_penalty + (1-α)·difficulty_weight
-        # ----------------------------------------------------------
-        alpha        = getattr(self, 'alpha', 0.5)
-        hybrid_weight = (
-            alpha * relative_penalty
-            + (1 - alpha) * difficulty_weight
-        )
-
-        # ----------------------------------------------------------
-        # 4. FINAL ROUTER LOSS
-        #    loss[3] = λ_cost · p2_active_prob · hybrid_weight
-        # ----------------------------------------------------------
+        # ==========================================================
+        # 7. HITUNG TOTAL HYBRID ROUTER LOSS
+        # Rumus: 
+        #   L_hybrid = (α * L_rel) + ((1 - α) * W_diff)
+        #   Loss_router = λ * p * L_hybrid
+        # ==========================================================
+        alpha = getattr(self, 'alpha', 0.5) # Pembobot keseimbangan (default 50-50)
+        
+        hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
+        
+        # PERHITUNGAN FINAL:
         loss[3] = target_lambda * p2_active_prob * hybrid_weight
 
-        # =================================================================
-        # MODIFIKASI DEBUG LOG (TIDAK SPAM)
-        # =================================================================
+        # ==========================================================
+        # 8. DEBUGGING LOG (Cetak setiap 50 iterasi untuk memantau)
+        # ==========================================================
         if not hasattr(self, 'debug_counter'):
             self.debug_counter = 0
-        
+            
         self.debug_counter += 1
 
-        if self.debug_counter % 100 == 0 and p2_active_prob is not None:
-            print(
-                f"[ROUTER LOSS] "
-                f"epoch={getattr(router, 'current_epoch', '?')} | "
-                f"P2_prob={p2_active_prob.item():.3f} | "
-                f"rel={relative_penalty.item():.4f} | "
-                f"diff_w={difficulty_weight.item():.3f} | "
-                f"loss[3]={loss[3].item():.5f} | "
-                f"warmup={is_warmup}"
-            )
+        if self.debug_counter % 50 == 0:
+            print(f"\n   [LOSS DEBUG] Lmbda: {target_lambda:.2f} | P2_Prob: {p2_active_prob.item():.4f} | "
+                  f"Rel: {relative_penalty.item():.4f} | Diff_W: {difficulty_weight.item():.4f} | "
+                  f"Final_L3: {loss[3].item():.4f}")
 
-        return loss    
+        return loss   
 
 
 class v8SegmentationLoss(v8DetectionLoss):
