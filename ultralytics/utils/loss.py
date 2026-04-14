@@ -371,9 +371,9 @@ class v8DetectionLoss:
         # ==========================================================
         # 3. AMBIL PARAMETER KONTROL
         # ==========================================================
+        # Ambil nilai lambda dari model utama yang di-update oleh scheduler.
+        # Jika atribut sama sekali tidak ditemukan di memori, default-nya adalah 0.0.
         target_lambda = getattr(self.model, 'router_penalty_lambda', 0.0)
-        if target_lambda == 0.0:
-            target_lambda = getattr(self, 'router_penalty_lambda', 0.75) 
 
         val = getattr(router, 'loss_prob', None)
         if val is None:
