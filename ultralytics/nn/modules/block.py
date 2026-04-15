@@ -2486,7 +2486,7 @@ class DifficultyAwareRouter(nn.Module):
         logits = self.mlp(z_norm)              # (B, 2)
         
         # 🚨 TAMBAHKAN MODIFIKASI ANTI-NAN DI SINI 🚨
-        logits = torch.clamp(logits, min=-10.0, max=10.0)
+        logits = torch.clamp(logits, min=-1000.0, max=1000.0)
 
         # =================================================
         # LANGKAH 3: KEPUTUSAN GATE
