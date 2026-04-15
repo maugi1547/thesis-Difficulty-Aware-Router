@@ -2446,51 +2446,53 @@ class DifficultyAwareRouter(nn.Module):
         B = f_p3.shape[0]
         _, _, H2, W2 = f_p2_back.shape
 
+        #=================================================
+        # LANGKAH 1: BENTUK Z_IN (DENGAN DETACH ANTI-PARASIT)
         # =================================================
-        # LANGKAH 1: BENTUK Z_IN — Persamaan (6)
-        # =================================================
+        
+        # 🚨 PERBAIKAN 1: Detach input agar denda Router tidak mengalir ke Backbone
+        f_p3_detached = f_p3.detach()
+        f_p2_back_detached = f_p2_back.detach()
 
-        z_visual = self.gap(
-            self.sam(f_p3)
-        ).view(B, -1)                          # (B, c_p3)
+        # Gunakan tensor yang sudah di-detach untuk input visual Router
+        z_visual = self.gap(self.sam(f_p3_detached)).view(B, -1)
+        z_low = self.gap(self.conv_hint(f_p2_back_detached)).view(B, -1)
 
-        z_low = self.gap(
-            self.conv_hint(f_p2_back)
-        ).view(B, -1)                          # (B, 16)
-
+        # Sinyal statistik tetap menggunakan f_p3 asli karena sudah ada detach() di dalamnya
         entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3)
-
         self.last_entropy = entropy.detach()
         self.last_conf    = conf.detach()
         self.last_var     = dfl_var.detach()
 
-        # Gabungkan stats: (B, 3)
         stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
-
-        # Normalisasi stabil via EMA running stats
         stats_norm = self._safe_normalize(stats_raw)
-
-        # 🚨 REVISI: Hitung std dan scale di ranah Float32
-        scale = z_visual.float().std(
-            dim=1, keepdim=True
-        ).detach().clamp(min=1e-4)
-        
-        # 🚨 IMPLEMENTASI FIX : Penskalaan dengan Parameter Learnable
         stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
 
-        # Gabungkan semua sinyal
-        z_in   = torch.cat(
-            [z_visual, z_low, stats_scaled], dim=1
-        )                                      # (B, input_dim)
-        z_norm = self.layer_norm(z_in).to(f_p3.dtype)
+        z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
         # =================================================
-        # LANGKAH 2: MLP → LOGITS
+        # LANGKAH 2: MLP → LOGITS (PURE FP32 EXECUTION)
         # =================================================
-        logits = self.mlp(z_norm)              # (B, 2)
         
-        # 🚨 TAMBAHKAN MODIFIKASI ANTI-NAN DI SINI 🚨
-        logits = torch.clamp(logits, min=-1000.0, max=1000.0)
+        # 🚨 PERBAIKAN 2: Paksa seluruh eksekusi LayerNorm & MLP ke Float32
+        z_in_fp32 = z_in.float()
+        
+        # Eksekusi LayerNorm di FP32 menggunakan fungsi bawaan PyTorch (Aman)
+        z_norm_fp32 = F.layer_norm(
+            z_in_fp32, 
+            self.layer_norm.normalized_shape, 
+            self.layer_norm.weight.float(), 
+            self.layer_norm.bias.float(), 
+            self.layer_norm.eps
+        )
+
+        # Eksekusi manual 3-lapis MLP (Linear -> SiLU -> Linear) murni di FP32
+        h = F.linear(z_norm_fp32, self.mlp[0].weight.float(), self.mlp[0].bias.float())
+        h = F.silu(h)
+        logits_fp32 = F.linear(h, self.mlp[2].weight.float(), self.mlp[2].bias.float())
+        
+        # Kembalikan ke format asal dan pasang sabuk pengaman
+        logits = torch.clamp(logits_fp32, min=-1000.0, max=1000.0).to(f_p3.dtype)
 
         # =================================================
         # LANGKAH 3: KEPUTUSAN GATE
