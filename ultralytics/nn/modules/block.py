@@ -2489,81 +2489,60 @@ class DifficultyAwareRouter(nn.Module):
         logits = torch.clamp(logits, min=-1000.0, max=1000.0)
 
         # =================================================
-        # LANGKAH 3: KEPUTUSAN GATE
+        # LANGKAH 3: KEPUTUSAN GATE (PERBAIKAN)
         # =================================================
         tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
 
         if self.training:
-
+            # Tetap gunakan logika Gumbel-Softmax Anda yang sudah bagus
+            soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
+            
             if self._is_warmup:
-                # =========================================
-                # WARMUP: gate dipaksa = 1
-                # MLP tetap menerima gradient (belajar
-                # representasi) tapi outputnya di-override.
-                # Sparsity loss = 0 (dikontrol loss.py).
-                # =========================================
-                soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
-                
-                # Kita buat tensor 'hard' yang selalu memilih indeks 1 (Active)
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
-                
-                # STE: Forward-nya 1.0 (P2 Aktif), tapi Gradient-nya mengalir ke 'soft'
-                # Ini membuat MLP belajar "mengapa" P2 harus bernilai 1.0
                 gate_onehot = hard_warmup - soft.detach() + soft
-                gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1)
-
-                # Probabilitas asli untuk monitoring dan loss calculation
-                probs = F.softmax(logits, dim=1)
-                self.current_activation_prob = 1.0 # Status di log tetap 100%
-                self.loss_prob = probs[:, 1].mean()
-
+                self.current_activation_prob = 1.0
             else:
-                # =========================================
-                # NORMAL: Straight-Through Gumbel-Softmax
-                # Persamaan (10)
-                # =========================================
-                soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
-                
-                # Keputusan biner (0 atau 1) berdasarkan probabilitas tertinggi
+                # Menggunakan argmax untuk 'hard' secara biner
                 hard = torch.zeros_like(soft).scatter_(
                     1, soft.argmax(dim=1, keepdim=True), 1.0
                 )
-                
-                # STE: 'hard' untuk forward pass, 'soft' untuk backward pass
                 gate_onehot = hard - soft.detach() + soft
-                gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                # Monitoring probabilitas aktif (untuk log)
+                self.current_activation_prob = F.softmax(logits.float(), dim=1)[:, 1].mean().item()
 
-                probs = F.softmax(logits, dim=1)
-                # Gunakan .item() hanya untuk logging scalar
-                self.current_activation_prob = probs[:, 1].mean().item()
-                self.loss_prob = probs[:, 1].mean()
-
+            gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+            
             # Eksekusi Jalur P2 (C2f)
-            # Karena gate_scalar terhubung via STE, gradien akan mengalir ke
-            # seluruh parameter Backbone P2 DAN MLP Router secara sinkron.
             f_p3_up = self.upsample(f_p3)
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
-            output  = f_c2f * gate_scalar.to(f_c2f.dtype)
+            output  = f_c2f * gate_scalar # Perkalian elemen-wise (B, C, H, W)
 
         else:
             # =============================================
-            # INFERENSI: TRUE SKIP — Persamaan (11)
-            # if-else pada Python scalar → C2f benar-benar
-            # tidak dipanggil saat gate = 0.
+            # INFERENSI: PER-IMAGE DECISION (Bukan Batch Mean!)
             # =============================================
-            probs    = F.softmax(logits, dim=1)
-            activate = probs[:, 1].mean().item() > 0.5
+            # 1. Gunakan float() untuk kestabilan numerik
+            probs = F.softmax(logits.float(), dim=1) 
+            
+            # 2. Tentukan keputusan per-gambar (B, 1)
+            # Menghasilkan tensor 1.0 (Aktif) atau 0.0 (Skip)
+            gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
+            
+            self.current_activation_prob = gate_mask.mean().item()
 
-            self.current_activation_prob = float(activate)
-
-            if activate:
+            # 3. Optimasi Komputasi: Hanya panggil C2f jika ada gambar yang butuh P2
+            if gate_mask.sum() > 0:
                 f_p3_up = self.upsample(f_p3)
                 f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
-                output  = self.c2f_p2(f_fused)
+                
+                # Kita tetap jalankan c2f untuk batch tersebut, 
+                # tapi kita "matikan" outputnya untuk gambar yang gate=0
+                f_c2f = self.c2f_p2(f_fused)
+                output = f_c2f * gate_mask.to(f_c2f.dtype)
             else:
-                # TRUE SKIP: C2f tidak dipanggil
+                # TRUE SKIP: Seluruh batch tidak butuh P2
                 output = torch.zeros(
                     B, self.c2f_out, H2, W2,
                     device=f_p3.device,
