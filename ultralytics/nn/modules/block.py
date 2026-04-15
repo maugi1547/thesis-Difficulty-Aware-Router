@@ -2263,9 +2263,13 @@ class DifficultyAwareRouter(nn.Module):
         Returns:
             (B, 3) — ternormalisasi, di-clamp ke [-3, 3]
         """
+       # 🚨 REVISI: Paksa input stats menjadi Float32 di awal operasi
+        stats_fp32 = stats.float()
+
         with torch.no_grad():
-            batch_mean = stats.mean(dim=0)
-            batch_std  = stats.std(dim=0, unbiased=False).clamp(min=1e-6)
+            batch_mean = stats_fp32.mean(dim=0)
+            # 🚨 REVISI: eps naikkan ke 1e-4 agar aman dari div-by-zero
+            batch_std  = stats_fp32.std(dim=0, unbiased=False).clamp(min=1e-4)
 
             if not self._stats_initialized:
                 self._running_mean = batch_mean.clone()
@@ -2273,19 +2277,18 @@ class DifficultyAwareRouter(nn.Module):
                 self._stats_initialized = True
             else:
                 m = self._ema_momentum
-                # FIX 1: Paksa ke device DAN dtype yang sama
-                curr_mean = self._running_mean.to(device=stats.device, dtype=stats.dtype)
-                curr_std  = self._running_std.to(device=stats.device, dtype=stats.dtype)
+                curr_mean = self._running_mean.to(device=stats.device, dtype=torch.float32)
+                curr_std  = self._running_std.to(device=stats.device, dtype=torch.float32)
                 
                 self._running_mean = (m * curr_mean + (1 - m) * batch_mean)
                 self._running_std = (m * curr_std + (1 - m) * batch_std)
 
-        # FIX 2: Paksa pembagian dan pengurangan dengan dtype yang sama
-        curr_mean_stable = self._running_mean.to(device=stats.device, dtype=stats.dtype)
-        curr_std_stable  = self._running_std.to(device=stats.device, dtype=stats.dtype).clamp(min=1e-6)
+        curr_mean_stable = self._running_mean.to(device=stats.device, dtype=torch.float32)
+        curr_std_stable  = self._running_std.to(device=stats.device, dtype=torch.float32).clamp(min=1e-4)
         
-        stats_norm = (stats - curr_mean_stable) / curr_std_stable
-        return stats_norm.clamp(-3.0, 3.0)
+        # 🚨 REVISI: Hitung norm di FP32, lalu kembalikan ke tipe asal stats (FP16)
+        stats_norm = (stats_fp32 - curr_mean_stable) / curr_std_stable
+        return stats_norm.clamp(-3.0, 3.0).to(stats.dtype)
 
     # =========================================================
     # HITUNG STATS DARI LOGITS (dipakai proxy fallback)
@@ -2306,22 +2309,26 @@ class DifficultyAwareRouter(nn.Module):
         Returns:
             avg_entropy, avg_conf, dfl_var — masing-masing (B, 1)
         """
-        eps = 1e-9
+        eps = 1e-5 # 🚨 REVISI: eps 1e-9 terlalu kecil untuk FP16. Ubah ke 1e-5
         B, nc, H, W = cls_logits.shape
         K = max(1, int(H * W * 0.02))  # Top-2% lokasi
 
         # --- Entropy & Confidence ---
         if nc == 1:
             prob = torch.sigmoid(cls_logits)
+            # 🚨 REVISI: Gunakan clamp untuk memastikan tidak ada log(0)
+            prob_safe = prob.clamp(min=eps, max=1.0 - eps)
             entropy_map = -(
-                prob * torch.log(prob + eps)
-                + (1 - prob) * torch.log(1 - prob + eps)
+                prob_safe * torch.log(prob_safe)
+                + (1 - prob_safe) * torch.log(1 - prob_safe)
             )
             unc_conf = 1 - prob
         else:
             prob = torch.softmax(cls_logits, dim=1)
+            # 🚨 REVISI: Gunakan clamp
+            prob_safe = prob.clamp(min=eps, max=1.0)
             entropy_map = -(
-                prob * torch.log(prob + eps)
+                prob_safe * torch.log(prob_safe)
             ).sum(dim=1, keepdim=True)
             unc_conf = 1 - prob.max(
                 dim=1, keepdim=True
@@ -2439,20 +2446,16 @@ class DifficultyAwareRouter(nn.Module):
         # LANGKAH 1: BENTUK Z_IN — Persamaan (6)
         # =================================================
 
-        # Z_visual = GAP(SAM(F_P3))
         z_visual = self.gap(
             self.sam(f_p3)
         ).view(B, -1)                          # (B, c_p3)
 
-        # Z_low = GAP(Conv1x1(F_P2_backbone))
         z_low = self.gap(
             self.conv_hint(f_p2_back)
         ).view(B, -1)                          # (B, 16)
 
-        # S = statistik uncertainty
         entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3)
 
-        # Simpan untuk loss.py
         self.last_entropy = entropy.detach()
         self.last_conf    = conf.detach()
         self.last_var     = dfl_var.detach()
@@ -2463,11 +2466,13 @@ class DifficultyAwareRouter(nn.Module):
         # Normalisasi stabil via EMA running stats
         stats_norm = self._safe_normalize(stats_raw)
 
-        # Skalakan ke magnitude z_visual agar seimbang
-        scale = z_visual.std(
+        # 🚨 REVISI: Hitung std dan scale di ranah Float32
+        scale = z_visual.float().std(
             dim=1, keepdim=True
-        ).detach().clamp(min=1e-6)
-        stats_scaled = stats_norm * scale      # (B, 3)
+        ).detach().clamp(min=1e-4)
+        
+        # Kalikan lalu kembalikan ke tipe asli f_p3 (FP16/FP32)
+        stats_scaled = (stats_norm.float() * scale).to(f_p3.dtype)
 
         # Gabungkan semua sinyal
         z_in   = torch.cat(
@@ -2481,7 +2486,6 @@ class DifficultyAwareRouter(nn.Module):
         logits = self.mlp(z_norm)              # (B, 2)
         
         # 🚨 TAMBAHKAN MODIFIKASI ANTI-NAN DI SINI 🚨
-        # Jepit nilai logits agar aman dari FP16 Overflow saat Validasi
         logits = torch.clamp(logits, min=-10.0, max=10.0)
 
         # =================================================
