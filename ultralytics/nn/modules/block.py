@@ -2499,32 +2499,51 @@ class DifficultyAwareRouter(nn.Module):
         # =================================================
         tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
 
+        # =================================================
+        # LANGKAH 3: KEPUTUSAN GATE
+        # =================================================
+        tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
+
         if self.training:
             soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
             
             if self._is_warmup:
+                # ... (Warmup logic remains the same) ...
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
                 gate_onehot = hard_warmup - soft.detach() + soft
-                
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
-                self.current_activation_prob = torch.tensor(1.0, device=f_p3.device) # Log Detached
-            else:
-                hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
-                gate_onehot = hard - soft.detach() + soft
+                self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
                 
-                # 🚨 FIX 5: Pisahkan Sinyal Loss (Soft) dan Log Monitor (Hard)
-                # Loss tetap menuntut gradient (untuk denda lambda)
+                # Use standard gate_scalar for warmup
+                gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+            else:
+                # 1. Hard Decision (Argmax)
+                hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
+                
+                # 2. Track Probabilities
                 self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
-                # Log adalah kenyataan hard-gate (per-gambar)
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
-            gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-            
+                # 🚨 CRITICAL FIX: Decoupled STE
+                # Instead of gate_onehot = hard - soft.detach() + soft
+                # We use the hard value directly for the forward pass, 
+                # but we DO NOT multiply the feature maps by the soft gradients.
+                # The Router learns solely from the penalty loss.
+                
+                # We extract the hard binary mask (0.0 or 1.0)
+                gate_mask_hard = hard[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                
+                # We use the hard mask directly. No soft gradients attached to the output.
+                gate_scalar = gate_mask_hard
+
+            # Execute P2 Pathway
             f_p3_up = self.upsample(f_p3)
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
-            output  = f_c2f * gate_scalar 
+            
+            # The output is multiplied by 0.0 or 1.0 (No soft gradient squeezing)
+            output  = f_c2f * gate_scalar
 
         else:
             # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
