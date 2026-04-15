@@ -2479,6 +2479,10 @@ class DifficultyAwareRouter(nn.Module):
         # LANGKAH 2: MLP → LOGITS
         # =================================================
         logits = self.mlp(z_norm)              # (B, 2)
+        
+        # 🚨 TAMBAHKAN MODIFIKASI ANTI-NAN DI SINI 🚨
+        # Jepit nilai logits agar aman dari FP16 Overflow saat Validasi
+        logits = torch.clamp(logits, min=-10.0, max=10.0)
 
         # =================================================
         # LANGKAH 3: KEPUTUSAN GATE
