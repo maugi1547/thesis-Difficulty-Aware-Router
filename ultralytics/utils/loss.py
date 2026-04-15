@@ -371,16 +371,23 @@ class v8DetectionLoss:
         # ==========================================================
         # 3. AMBIL PARAMETER KONTROL
         # ==========================================================
-        # Ambil nilai lambda dari model utama yang di-update oleh scheduler.
-        # Jika atribut sama sekali tidak ditemukan di memori, default-nya adalah 0.0.
         target_lambda = getattr(self.model, 'router_penalty_lambda', 0.0)
 
-        val = getattr(router, 'loss_prob', None)
-        if val is None:
+        # Ambil probabilitas SOFT (untuk backprop)
+        val_for_loss = getattr(router, 'loss_prob', None)
+        
+        # Ambil probabilitas HARD (untuk dicetak jujur di terminal)
+        # Fallback ke val_for_loss jika current_activation_prob tidak ditemukan
+        val_for_log = getattr(router, 'current_activation_prob', val_for_loss)
+
+        if val_for_loss is None:
             return loss 
 
-        # Variabel 'p' mewakili Probabilitas P2 Aktif saat ini
-        p2_active_prob = val if torch.is_tensor(val) else torch.tensor(float(val), device=loss.device)
+        # Variabel p2_active_prob digunakan MUTLAK untuk hitungan matematika Loss
+        p2_active_prob = val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
+        
+        # Variabel p2_log_prob HANYA untuk fungsi print()
+        p2_log_prob = val_for_log.item() if torch.is_tensor(val_for_log) else float(val_for_log)
 
         # ==========================================================
         # 4. CEK FASE WARMUP
@@ -478,7 +485,8 @@ class v8DetectionLoss:
         self.debug_counter += 1
 
         if self.debug_counter % 50 == 0:
-            print(f"\n   [LOSS DEBUG] Lmbda: {target_lambda:.2f} | P2_Prob: {p2_active_prob.item():.4f} | "
+            # 🚨 PERHATIKAN: P2_Prob sekarang menggunakan p2_log_prob (Hasil Hard-Gate Nyata)
+            print(f"\n   [LOSS DEBUG] Lmbda: {target_lambda:.2f} | P2_Prob(Real): {p2_log_prob:.4f} | "
                   f"Rel: {relative_penalty.item():.4f} | Diff_W: {difficulty_weight.item():.4f} | "
                   f"Final_L3: {loss[3].item():.4f}")
 

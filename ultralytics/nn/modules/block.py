@@ -2178,6 +2178,10 @@ class DifficultyAwareRouter(nn.Module):
         nn.init.constant_(self.mlp[2].bias[0], 0.0)
         nn.init.constant_(self.mlp[2].bias[1], 0.0)
 
+        # 🚨 FIX 1: Impedance Matching (Parameter Learnable)
+        # Menggantikan z_visual.std() manual untuk menghindari FP16 Zero-Division
+        self.stats_weight = nn.Parameter(torch.ones(1, 3))
+
     # =========================================================
     # API PUBLIK
     # =========================================================
@@ -2471,8 +2475,8 @@ class DifficultyAwareRouter(nn.Module):
             dim=1, keepdim=True
         ).detach().clamp(min=1e-4)
         
-        # Kalikan lalu kembalikan ke tipe asli f_p3 (FP16/FP32)
-        stats_scaled = (stats_norm.float() * scale).to(f_p3.dtype)
+        # 🚨 IMPLEMENTASI FIX : Penskalaan dengan Parameter Learnable
+        stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
 
         # Gabungkan semua sinyal
         z_in   = torch.cat(
@@ -2489,60 +2493,52 @@ class DifficultyAwareRouter(nn.Module):
         logits = torch.clamp(logits, min=-1000.0, max=1000.0)
 
         # =================================================
-        # LANGKAH 3: KEPUTUSAN GATE (PERBAIKAN)
+        # LANGKAH 3: KEPUTUSAN GATE
         # =================================================
         tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
 
         if self.training:
-            # Tetap gunakan logika Gumbel-Softmax Anda yang sudah bagus
             soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
             
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
                 gate_onehot = hard_warmup - soft.detach() + soft
-                self.current_activation_prob = 1.0
+                
+                self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
+                self.current_activation_prob = torch.tensor(1.0, device=f_p3.device) # Log Detached
             else:
-                # Menggunakan argmax untuk 'hard' secara biner
-                hard = torch.zeros_like(soft).scatter_(
-                    1, soft.argmax(dim=1, keepdim=True), 1.0
-                )
+                hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
                 gate_onehot = hard - soft.detach() + soft
-                # Monitoring probabilitas aktif (untuk log)
-                self.current_activation_prob = F.softmax(logits.float(), dim=1)[:, 1].mean().item()
+                
+                # 🚨 FIX 5: Pisahkan Sinyal Loss (Soft) dan Log Monitor (Hard)
+                # Loss tetap menuntut gradient (untuk denda lambda)
+                self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
+                # Log adalah kenyataan hard-gate (per-gambar)
+                self.current_activation_prob = hard[:, 1].mean().detach()
 
             gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
             
-            # Eksekusi Jalur P2 (C2f)
             f_p3_up = self.upsample(f_p3)
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
-            output  = f_c2f * gate_scalar # Perkalian elemen-wise (B, C, H, W)
+            output  = f_c2f * gate_scalar 
 
         else:
-            # =============================================
-            # INFERENSI: PER-IMAGE DECISION (Bukan Batch Mean!)
-            # =============================================
-            # 1. Gunakan float() untuk kestabilan numerik
+            # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
             probs = F.softmax(logits.float(), dim=1) 
-            
-            # 2. Tentukan keputusan per-gambar (B, 1)
-            # Menghasilkan tensor 1.0 (Aktif) atau 0.0 (Skip)
             gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
             
-            self.current_activation_prob = gate_mask.mean().item()
+            self.current_activation_prob = gate_mask.mean().detach() # Log Detached
 
-            # 3. Optimasi Komputasi: Hanya panggil C2f jika ada gambar yang butuh P2
+            # 🚨 FIX 7: TRUE SKIP DINAMIS (Efisiensi Maksimal jika batch mudah)
             if gate_mask.sum() > 0:
                 f_p3_up = self.upsample(f_p3)
                 f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
                 
-                # Kita tetap jalankan c2f untuk batch tersebut, 
-                # tapi kita "matikan" outputnya untuk gambar yang gate=0
                 f_c2f = self.c2f_p2(f_fused)
                 output = f_c2f * gate_mask.to(f_c2f.dtype)
             else:
-                # TRUE SKIP: Seluruh batch tidak butuh P2
                 output = torch.zeros(
                     B, self.c2f_out, H2, W2,
                     device=f_p3.device,
