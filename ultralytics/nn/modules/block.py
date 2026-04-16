@@ -2206,20 +2206,34 @@ class DifficultyAwareRouter(nn.Module):
     # =========================================================
     def _hook_cls(self, module, input, output):
         with torch.no_grad():
-            B, C, H, W = output.shape
+            # 🚨 FIX 1: HOOK SANITIZER (Mencegah ilusi eval mode)
+            tensor_aman = output.detach().float()
+            
+            # Jika mode eval dan tensor sudah berbentuk probabilitas (0.0 - 1.0)
+            if not self.training:
+                if tensor_aman.max() <= 1.0 and tensor_aman.min() >= 0.0:
+                    # Kembalikan ke ruang logit (Inverse Sigmoid)
+                    tensor_aman = tensor_aman.clamp(min=1e-5, max=1.0 - 1e-5)
+                    tensor_aman = torch.log(tensor_aman / (1.0 - tensor_aman))
+            
+            # Batasi nilai ekstrem agar tidak menghasilkan NaN
+            tensor_aman = tensor_aman.clamp(min=-20.0, max=20.0)
+
+            B, C, H, W = tensor_aman.shape
             K = max(1, int(H * W * 0.02))
-            eps = 1e-9
+            eps = 1e-5 # Gunakan 1e-5 untuk FP16 safe
 
             if C == 1:
-                prob = torch.sigmoid(output)
-                entropy_map = -(prob * torch.log(prob + eps) + (1 - prob) * torch.log(1 - prob + eps))
+                prob = torch.sigmoid(tensor_aman)
+                prob_safe = prob.clamp(min=eps, max=1.0 - eps)
+                entropy_map = -(prob_safe * torch.log(prob_safe) + (1 - prob_safe) * torch.log(1 - prob_safe))
                 unc_conf = 1 - prob
             else:
-                prob = torch.softmax(output, dim=1)
-                entropy_map = -(prob * torch.log(prob + eps)).sum(dim=1, keepdim=True)
+                prob = torch.softmax(tensor_aman, dim=1)
+                prob_safe = prob.clamp(min=eps, max=1.0)
+                entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
                 unc_conf = 1 - prob.max(dim=1, keepdim=True).values
 
-            # Inlining fungsi agar 100% aman dari pickle error
             flat_e = entropy_map.view(B, 1, -1)
             topk_e, _ = torch.topk(flat_e, k=K, dim=-1)
             per_sample_e = (0.7 * topk_e.mean(dim=-1) + 0.3 * flat_e.mean(dim=-1))
@@ -2465,6 +2479,11 @@ class DifficultyAwareRouter(nn.Module):
         self.last_var     = dfl_var.detach()
 
         stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
+        
+        # 🚨 FIX 2: SABUK PENGAMAN STATISTIK EKSTREM
+        # Mengganti NaN jadi 0.0, dan Inf menjadi 10.0
+        stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
+        
         stats_norm = self._safe_normalize(stats_raw)
         stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
 
@@ -2505,29 +2524,38 @@ class DifficultyAwareRouter(nn.Module):
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
-                gate_onehot = hard_warmup - soft.detach() + soft # STE Warmup
+                
+                # 🚨 FIX 3: DUAL GATING WARMUP
+                gate_onehot = hard_warmup - soft.detach() + soft # Membawa STE
+                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                # Gate fitur murni Hard tanpa STE
+                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
                 
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
                 self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
             else:
                 hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
                 
-                # 🚨 WAJIB: KEMBALIKAN STE INI!
-                gate_onehot = hard - soft.detach() + soft
+                # 🚨 FIX 3: DUAL GATING NORMAL
+                gate_onehot = hard - soft.detach() + soft # Membawa STE
+                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                # Gate fitur murni Hard tanpa STE
+                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
                 
                 self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
-
-            # Gunakan hasil STE (gate_onehot) untuk forward pass
-            gate_scalar = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
 
             # Execute P2 Pathway
             f_p3_up = self.upsample(f_p3)
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
             
-            # The output is multiplied by 0.0 or 1.0 (No soft gradient squeezing)
-            output  = f_c2f * gate_scalar
+            # 🚨 FIX 3: PEMISAHAN ALIRAN GRADIEN (DUMMY ADDITION)
+            # 1. Fitur murni dikalikan gate HARD (memblokir gradien merusak ke Backbone)
+            output_feature = f_c2f * gate_scalar_feature
+            
+            # 2. Dummy Addition (memaksa gradien STE mengalir ke Router MLP saja)
+            output = output_feature + (gate_scalar_router * 0.0)
 
         else:
             # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
