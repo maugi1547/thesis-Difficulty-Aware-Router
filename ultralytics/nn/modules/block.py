@@ -2525,22 +2525,16 @@ class DifficultyAwareRouter(nn.Module):
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
                 
-                # 🚨 FIX 3: DUAL GATING WARMUP
-                gate_onehot = hard_warmup - soft.detach() + soft # Membawa STE
-                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-                # Gate fitur murni Hard tanpa STE
-                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                # STE Warmup
+                gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
                 
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
                 self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
             else:
                 hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
                 
-                # 🚨 FIX 3: DUAL GATING NORMAL
-                gate_onehot = hard - soft.detach() + soft # Membawa STE
-                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-                # Gate fitur murni Hard tanpa STE
-                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                # STE Normal
+                gate_scalar_router = (hard - soft.detach() + soft)[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
                 
                 self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
@@ -2550,12 +2544,25 @@ class DifficultyAwareRouter(nn.Module):
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
             
-            # 🚨 FIX 3: PEMISAHAN ALIRAN GRADIEN (DUMMY ADDITION)
-            # 1. Fitur murni dikalikan gate HARD (memblokir gradien merusak ke Backbone)
-            output_feature = f_c2f * gate_scalar_feature
+            # 🚨 FIX 3 FINAL: GRADIENT DETOUR
+            # Kita tidak lagi menggunakan dua gate terpisah dan dummy addition.
+            # Kita memasukkan gate_scalar_router LANGSUNG ke dalam fitur, 
+            # TAPI kita bungkus f_c2f dengan .detach() AGAR gradien tidak bocor ke Backbone!
             
-            # 2. Dummy Addition (memaksa gradien STE mengalir ke Router MLP saja)
-            output = output_feature + (gate_scalar_router * 0.0)
+            # Rumus Emas:
+            # output = (f_c2f.detach() * gate_scalar_router) + (f_c2f - f_c2f.detach())
+            
+            # Secara Nilai (Forward):
+            # output = (Fitur * Saklar) + (Fitur - Fitur)
+            # Jika saklar ON (1.0): output = Fitur + 0 = Fitur
+            # Jika saklar OFF (0.0): output = 0 + 0 = 0
+            
+            # Secara Gradien (Backward):
+            # Gradien mengalir ke gate_scalar_router dengan lancar (karena dikalikan f_c2f.detach(), BUKAN 0.0)
+            # Gradien ke Backbone (f_c2f) dijamin AMAN dari racun Router, karena f_c2f murni 
+            # hanya menerima gradien dari suku kedua: (f_c2f - f_c2f.detach()), yang turunan parsialnya adalah 1.0.
+            
+            output = (f_c2f.detach() * gate_scalar_router) + (f_c2f - f_c2f.detach())
 
         else:
             # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
