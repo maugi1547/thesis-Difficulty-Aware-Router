@@ -2510,8 +2510,9 @@ class DifficultyAwareRouter(nn.Module):
         h = F.silu(h)
         logits_fp32 = F.linear(h, self.mlp[2].weight.float(), self.mlp[2].bias.float())
         
-        # Kembalikan ke format asal dan pasang sabuk pengaman
-        logits = torch.clamp(logits_fp32, min=-3.0, max=3.0).to(f_p3.dtype)
+        # 🚨 FIX FINAL 1: Tanh Soft-Clipping (Anti-Deadlock, Batas [-3, 3]
+        # Menggantikan torch.clamp agar gradien penalti selalu bisa masuk
+        logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
 
         # =================================================
         # LANGKAH 3: KEPUTUSAN GATE
@@ -2522,48 +2523,41 @@ class DifficultyAwareRouter(nn.Module):
             soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
             
             if self._is_warmup:
+                # --- FASE WARMUP: P2 Selalu Aktif ---
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
                 
-                # STE Warmup
                 gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
                 
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
                 self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
             else:
+                # --- FASE NORMAL: Keputusan Dinamis ---
                 hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
                 
-                # STE Normal
-                gate_scalar_router = (hard - soft.detach() + soft)[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                # Gate untuk Router (STE Aktif)
+                gate_onehot = hard - soft.detach() + soft
+                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                
+                # Gate untuk Fitur (Hard Murni)
+                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
                 
                 self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
-            # Execute P2 Pathway
+            # Eksekusi Jalur P2
             f_p3_up = self.upsample(f_p3)
             f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
             f_c2f   = self.c2f_p2(f_fused)
             
-            # 🚨 FIX 3 FINAL: GRADIENT DETOUR
-            # Kita tidak lagi menggunakan dua gate terpisah dan dummy addition.
-            # Kita memasukkan gate_scalar_router LANGSUNG ke dalam fitur, 
-            # TAPI kita bungkus f_c2f dengan .detach() AGAR gradien tidak bocor ke Backbone!
+            # 🚨 FIX FINAL 2: The Perfect Dual Gating Formula
+            # 1. (f_c2f * gate_scalar_feature): Backbone hanya belajar jika gate ON.
+            # 2. (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature)): 
+            #    Router tetap mendapat sinyal visual akurasi meski Backbone OFF.
+            output = (f_c2f * gate_scalar_feature) + \
+                     (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
             
-            # Rumus Emas:
-            # output = (f_c2f.detach() * gate_scalar_router) + (f_c2f - f_c2f.detach())
-            
-            # Secara Nilai (Forward):
-            # output = (Fitur * Saklar) + (Fitur - Fitur)
-            # Jika saklar ON (1.0): output = Fitur + 0 = Fitur
-            # Jika saklar OFF (0.0): output = 0 + 0 = 0
-            
-            # Secara Gradien (Backward):
-            # Gradien mengalir ke gate_scalar_router dengan lancar (karena dikalikan f_c2f.detach(), BUKAN 0.0)
-            # Gradien ke Backbone (f_c2f) dijamin AMAN dari racun Router, karena f_c2f murni 
-            # hanya menerima gradien dari suku kedua: (f_c2f - f_c2f.detach()), yang turunan parsialnya adalah 1.0.
-            
-            output = (f_c2f.detach() * gate_scalar_router) + (f_c2f - f_c2f.detach())
-
         else:
             # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
             probs = F.softmax(logits.float(), dim=1) 
