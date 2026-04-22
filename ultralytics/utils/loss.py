@@ -493,8 +493,8 @@ class v8DetectionLoss:
         val_diff = float(difficulty_weight.item() if isinstance(difficulty_weight, torch.Tensor) else difficulty_weight)
         val_final_l3 = float(loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3])
 
-        # 2. Cetak ke terminal setiap 50 iterasi agar terminal tidak banjir
-        if self.debug_counter % 50 == 0:
+        # 2. Cetak ke terminal setiap 100 iterasi agar terminal tidak banjir
+        if self.debug_counter % 100 == 0:
             print(f"\n   [LOSS DEBUG] Lmbda: {val_lambda:.2f} | P2_Prob(Real): {val_p2_prob:.4f} | "
                 f"Rel: {val_rel:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
 
