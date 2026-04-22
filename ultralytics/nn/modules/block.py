@@ -2562,9 +2562,6 @@ class DifficultyAwareRouter(nn.Module):
             # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
             probs = F.softmax(logits.float(), dim=1) 
 
-            # 👇 TAMBAHKAN BARIS INI UNTUK MELIHAT ISI KEPALA ROUTER 👇
-            print(f"\n[DEBUG EVAL] Raw Logits: {logits.detach().cpu().numpy().flatten()} | Soft Prob P2: {probs[:, 1].detach().cpu().numpy()[0]:.4f}")
-
             gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
             
             self.current_activation_prob = gate_mask.mean().detach() # Log Detached
