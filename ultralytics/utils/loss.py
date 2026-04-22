@@ -478,10 +478,6 @@ class v8DetectionLoss:
         # PERHITUNGAN FINAL:
         loss[3] = target_lambda * p2_active_prob * hybrid_weight
 
-        import csv
-        import os
-        import torch
-
         # ==========================================================
         # 8. DEBUGGING LOG & CSV RECORDER
         # ==========================================================
