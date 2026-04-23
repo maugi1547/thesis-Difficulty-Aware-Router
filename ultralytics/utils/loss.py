@@ -486,46 +486,43 @@ class v8DetectionLoss:
             
         self.debug_counter += 1
 
-        # 1. Ekstrak nilai dari Tensor ke angka biasa
+        # --- MATEMATIKA ABSOLUT UNTUK EPOCH & BATCH ---
+        
+        # Ambil total batch yang disuntikkan dari Kaggle
+        TOTAL_BATCHES = getattr(self.model, 'total_batches') 
+        
+        current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 1
+        current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
+        # --- EKSTRAK NILAI ---
         val_lambda = float(target_lambda)
-        val_p2_prob = float(p2_log_prob.item() if isinstance(p2_log_prob, torch.Tensor) else p2_log_prob)
-        val_rel = float(relative_penalty.item() if isinstance(relative_penalty, torch.Tensor) else relative_penalty)
-        val_diff = float(difficulty_weight.item() if isinstance(difficulty_weight, torch.Tensor) else difficulty_weight)
-        val_final_l3 = float(loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3])
+        val_p2_prob = p2_log_prob.item() if isinstance(p2_log_prob, torch.Tensor) else p2_log_prob
+        val_rel = relative_penalty.item() if isinstance(relative_penalty, torch.Tensor) else relative_penalty
+        val_diff = difficulty_weight.item() if isinstance(difficulty_weight, torch.Tensor) else difficulty_weight
+        val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
-        # ----------------------------------------------------------
-        # FITUR A: TAMPILAN TERMINAL (Langsung, tapi dibatasi)
-        # ----------------------------------------------------------
-        # Tampil di layar setiap 100 iterasi agar terminal Kaggle tidak banjir teks
+        # --- TAMPILAN TERMINAL ---
         if self.debug_counter % 100 == 0:
-            print(f"\n   [LOSS DEBUG] Lmbda: {val_lambda:.2f} | P2_Prob(Real): {val_p2_prob:.4f} | "
-                  f"Rel: {val_rel:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
+            print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
+                  f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
 
-        # ----------------------------------------------------------
-        # FITUR B: PEREKAMAN DATA KE CSV (Disimpan ke RAM dulu)
-        # ----------------------------------------------------------
+        # --- BUFFER RAM UNTUK CSV ---
         if not hasattr(self.model, 'router_buffer'):
             self.model.router_buffer = []
 
-        # Ambil nilai epoch yang sudah disuntikkan dari Trainer Callback
-        current_epoch = int(getattr(self.model, 'current_epoch', 1))
-
-        # Bungkus data menjadi satu baris list
+        # Data bersih, format standar (desimal titik)
         val_data = [
             current_epoch, 
-            self.debug_counter, 
-            val_lambda, 
-            val_p2_prob, 
-            val_rel, 
-            val_diff, 
-            val_final_l3
+            current_batch, 
+            f"{val_lambda:.4f}", 
+            f"{val_p2_prob:.6f}", 
+            f"{val_rel:.6f}", 
+            f"{val_diff:.6f}", 
+            f"{val_final_l3:.6f}"
         ]
 
-        # Simpan ke RAM (Sangat cepat, tidak membebani Disk I/O)
         self.model.router_buffer.append(val_data)
-
-        return loss 
-
+        
+        return loss
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
