@@ -479,47 +479,52 @@ class v8DetectionLoss:
         loss[3] = target_lambda * p2_active_prob * hybrid_weight
 
         # ==========================================================
-        # 8. DEBUGGING LOG & CSV RECORDER
+        # 8. DEBUGGING LOG (TERMINAL) & MEMORY BUFFERING (CSV)
         # ==========================================================
         if not hasattr(self, 'debug_counter'):
             self.debug_counter = 0
             
         self.debug_counter += 1
 
-        # 1. Ekstrak nilai dari Tensor ke angka biasa (Wajib untuk CSV agar rapi)
+        # 1. Ekstrak nilai dari Tensor ke angka biasa
         val_lambda = float(target_lambda)
         val_p2_prob = float(p2_log_prob.item() if isinstance(p2_log_prob, torch.Tensor) else p2_log_prob)
         val_rel = float(relative_penalty.item() if isinstance(relative_penalty, torch.Tensor) else relative_penalty)
         val_diff = float(difficulty_weight.item() if isinstance(difficulty_weight, torch.Tensor) else difficulty_weight)
         val_final_l3 = float(loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3])
 
-        # 2. Cetak ke terminal setiap 100 iterasi agar terminal tidak banjir
+        # ----------------------------------------------------------
+        # FITUR A: TAMPILAN TERMINAL (Langsung, tapi dibatasi)
+        # ----------------------------------------------------------
+        # Tampil di layar setiap 100 iterasi agar terminal Kaggle tidak banjir teks
         if self.debug_counter % 100 == 0:
             print(f"\n   [LOSS DEBUG] Lmbda: {val_lambda:.2f} | P2_Prob(Real): {val_p2_prob:.4f} | "
-                f"Rel: {val_rel:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
+                  f"Rel: {val_rel:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
 
-        # 3. Perekaman ke CSV (Dilakukan SETIAP iterasi/batch)
-        csv_file = "router_loss_components.csv"
-        file_exists = os.path.isfile(csv_file)
+        # ----------------------------------------------------------
+        # FITUR B: PEREKAMAN DATA KE CSV (Disimpan ke RAM dulu)
+        # ----------------------------------------------------------
+        if not hasattr(self.model, 'router_buffer'):
+            self.model.router_buffer = []
 
-        # Ambil nilai epoch (ubah '0' jika Anda berhasil mem-passing variabel epoch dari trainer)
-        # Kita gunakan self.debug_counter sebagai pengganti nomor urut batch
-        current_epoch = 0 # Ganti dengan variabel epoch asli jika ada di dalam scope
-        current_batch = self.debug_counter 
+        # Ambil nilai epoch yang sudah disuntikkan dari Trainer Callback
+        current_epoch = int(getattr(self.model, 'current_epoch', 1))
 
-        # Buka file CSV dalam mode 'append'
-        with open(csv_file, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            
-            # Buat Header jika file baru pertama kali dibuat
-            if not file_exists:
-                writer.writerow(["Epoch", "Batch", "Lambda", "P2_Prob_Real", "Rel", "Diff_W", "Final_L3"])
-            
-            # Simpan nilai-nilai yang sudah diekstrak ke angka bersih
-            writer.writerow([current_epoch, current_batch, val_lambda, val_p2_prob, val_rel, val_diff, val_final_l3])
-        
-        
-        return loss   
+        # Bungkus data menjadi satu baris list
+        val_data = [
+            current_epoch, 
+            self.debug_counter, 
+            val_lambda, 
+            val_p2_prob, 
+            val_rel, 
+            val_diff, 
+            val_final_l3
+        ]
+
+        # Simpan ke RAM (Sangat cepat, tidak membebani Disk I/O)
+        self.model.router_buffer.append(val_data)
+
+        return loss 
 
 
 class v8SegmentationLoss(v8DetectionLoss):
