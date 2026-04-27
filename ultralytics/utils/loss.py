@@ -491,7 +491,7 @@ class v8DetectionLoss:
         # Ambil total batch yang disuntikkan dari Kaggle
         TOTAL_BATCHES = getattr(self.model, 'total_batches') 
         
-        current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 3
+        current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 4
         current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
         # --- EKSTRAK NILAI ---
         val_lambda = float(target_lambda)
