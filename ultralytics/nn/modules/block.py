@@ -2440,6 +2440,69 @@ class DifficultyAwareRouter(nn.Module):
 
         return avg_entropy, avg_conf, dfl_var
 
+
+    # =========================================================
+    # FUNGSI UNTUK TENSORRT (DECOUPLED ENGINE)
+    # =========================================================
+
+    def compute_gate(self, f_p3, f_p2_back):
+        """
+        Diisolasi untuk Engine A (Front-End).
+        Hanya menjalankan Proxy Fallback dan MLP untuk menghasilkan Gate.
+        """
+        B = f_p3.shape[0]
+
+        # 1. Z_Visual & Z_Low
+        z_visual = self.gap(self.sam(f_p3)).view(B, -1)
+        z_low = self.gap(self.conv_hint(f_p2_back)).view(B, -1)
+
+        # 2. Uncertainty Signals (Memaksa Proxy Fallback untuk TRT)
+        cls_logits = self.proxy_cls(f_p3)
+        reg_logits = self.proxy_reg_dist(f_p3)
+        entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
+
+        stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
+        stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Asumsi running stats sudah terbentuk dari fase training
+        stats_norm = self._safe_normalize(stats_raw)
+        stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
+
+        z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
+
+        # 3. Eksekusi MLP
+        z_in_fp32 = z_in.float()
+        z_norm_fp32 = F.layer_norm(
+            z_in_fp32, 
+            self.layer_norm.normalized_shape, 
+            self.layer_norm.weight.float(), 
+            self.layer_norm.bias.float(), 
+            self.layer_norm.eps
+        )
+
+        h = F.linear(z_norm_fp32, self.mlp[0].weight.float(), self.mlp[0].bias.float())
+        h = F.silu(h)
+        logits_fp32 = F.linear(h, self.mlp[2].weight.float(), self.mlp[2].bias.float())
+        
+        logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
+
+        # 4. Inferensi Keputusan Gate
+        probs = F.softmax(logits.float(), dim=1) 
+        gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
+
+        return gate_mask # Output: (B, 1, 1, 1)
+
+    def compute_expert(self, f_p3, f_p2_back):
+        """
+        Diisolasi untuk Engine B (P2 Expert).
+        Hanya menjalankan konvolusi berat jika dipanggil.
+        """
+        f_p3_up = self.upsample(f_p3)
+        f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
+        f_c2f = self.c2f_p2(f_fused)
+        
+        return f_c2f
+    
     # =========================================================
     # FORWARD
     # =========================================================
@@ -2558,20 +2621,13 @@ class DifficultyAwareRouter(nn.Module):
             output = (f_c2f * gate_scalar_feature) + \
                      (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
             
-        else:
-            # 🚨 FIX 6: KEPUTUSAN INFERENSI PER-GAMBAR (Bukan Batch Mean!)
-            probs = F.softmax(logits.float(), dim=1) 
+        else: # FASE INFERENSI PYTORCH
+            # Gunakan fungsi yang sudah dipecah agar konsisten
+            gate_mask = self.compute_gate(f_p3, f_p2_back)
+            self.current_activation_prob = gate_mask.mean().detach()
 
-            gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
-            
-            self.current_activation_prob = gate_mask.mean().detach() # Log Detached
-
-            # 🚨 FIX 7: TRUE SKIP DINAMIS (Efisiensi Maksimal jika batch mudah)
             if gate_mask.sum() > 0:
-                f_p3_up = self.upsample(f_p3)
-                f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
-                
-                f_c2f = self.c2f_p2(f_fused)
+                f_c2f = self.compute_expert(f_p3, f_p2_back)
                 output = f_c2f * gate_mask.to(f_c2f.dtype)
             else:
                 output = torch.zeros(
