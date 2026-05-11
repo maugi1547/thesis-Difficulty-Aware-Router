@@ -2495,13 +2495,35 @@ class DifficultyAwareRouter(nn.Module):
     def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
         """
         Diisolasi untuk Engine B (P2 Expert).
-        Hanya menjalankan konvolusi berat jika dipanggil.
+        Ditulis ulang untuk MENGHINDARI ONNX 'Sequence' Nodes agar kompatibel dengan TRT IIfConditional.
+        Asumsi: n_bottleneck = 1.
         """
+        # 1. Penggabungan Input
         f_p3_up = self.upsample(f_p3)
         f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
-        f_c2f = self.c2f_p2(f_fused)
         
-        return f_c2f
+        # 2. EKSEKUSI C2f MANUAL (Datar / Flattened)
+        # c2f_p2 terdiri dari cv1, list of bottleneck (m), dan cv2
+        
+        # a. Lewati Conv pertama
+        cv1_out = self.c2f_p2.cv1(f_fused)
+        
+        # b. Chunk menjadi 2 bagian secara spesifik (jangan masuk list)
+        chunk1, chunk2 = torch.chunk(cv1_out, 2, dim=1)
+        
+        # c. Lewati Bottleneck (karena n=1, kita hanya panggil self.c2f_p2.m[0])
+        # Panggil forward dari bottleneck pertama
+        m_out = self.c2f_p2.m[0](chunk2)
+        
+        # d. Gabungkan semuanya (TANPA MENGGUNAKAN LIST DINAMIS/SEQUENCE)
+        # Penggunaan torch.cat dengan parameter tuple eksplisit akan menghasilkan node 'Concat' biasa
+        # alih-alih 'ConcatFromSequence'.
+        concat_out = torch.cat((chunk1, chunk2, m_out), dim=1)
+        
+        # e. Lewati Conv terakhir
+        f_c2f_final = self.c2f_p2.cv2(concat_out)
+        
+        return f_c2f_final
     
     # =========================================================
     # FORWARD
