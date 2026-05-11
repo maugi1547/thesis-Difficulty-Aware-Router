@@ -11,6 +11,8 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
+from typing import List, Tuple, Optional
+
 
 __all__ = (
     "C1",
@@ -2130,11 +2132,14 @@ class DifficultyAwareRouter(nn.Module):
         # =====================================================
         self.input_dim = c_p3 + self.c_low + 3
         self.layer_norm = nn.LayerNorm(self.input_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 2)
-        )
+        
+        # 🚨 MODIFIKASI: Pecah Sequential menjadi variabel eksplisit
+        # HAPUS self.mlp = nn.Sequential(...) dan ganti dengan:
+        self.mlp_fc1 = nn.Linear(self.input_dim, hidden_dim)
+        self.mlp_fc2 = nn.Linear(hidden_dim, 2)
+        # 🚨 MODIFIKASI: Inisialisasi bias pada fc2
+        nn.init.constant_(self.mlp_fc2.bias[0], 0.0)
+        nn.init.constant_(self.mlp_fc2.bias[1], 0.0)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
 
@@ -2158,10 +2163,11 @@ class DifficultyAwareRouter(nn.Module):
         #    bukan tensor penuh — menghindari shape mismatch
         #    di akhir epoch dan overhead memory.
         # =====================================================
-        self.use_hook_cache   = False
-        self._cached_entropy  = None  # scalar float
-        self._cached_conf     = None  # scalar float
-        self._cached_dfl_var  = None  # scalar float
+        self.use_hook_cache = False
+        # 🚨 MODIFIKASI: Gunakan type hinting Optional[float]
+        self._cached_entropy: Optional[float] = None  
+        self._cached_conf: Optional[float] = None  
+        self._cached_dfl_var: Optional[float] = None
         self._hook_handles    = []
 
         # =====================================================
@@ -2174,9 +2180,6 @@ class DifficultyAwareRouter(nn.Module):
         self._ema_momentum      = 0.99
         self._stats_initialized = False
 
-        # Init bias MLP: mulai balanced (50/50)
-        nn.init.constant_(self.mlp[2].bias[0], 0.0)
-        nn.init.constant_(self.mlp[2].bias[1], 0.0)
 
         # 🚨 FIX 1: Impedance Matching (Parameter Learnable)
         # Menggantikan z_visual.std() manual untuk menghindari FP16 Zero-Division
@@ -2384,7 +2387,7 @@ class DifficultyAwareRouter(nn.Module):
 
     def _get_uncertainty_signals(
         self, f_p3: torch.Tensor
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Baca sinyal uncertainty dari sumber terbaik.
 
@@ -2408,9 +2411,10 @@ class DifficultyAwareRouter(nn.Module):
         device = f_p3.device
         dtype  = f_p3.dtype
 
-        e_cache = getattr(self, '_cached_entropy', None)
-        c_cache = getattr(self, '_cached_conf',    None)
-        v_cache = getattr(self, '_cached_dfl_var', None)
+        # 🚨 MODIFIKASI: Akses langsung atribut tanpa getattr
+        e_cache = self._cached_entropy
+        c_cache = self._cached_conf
+        v_cache = self._cached_dfl_var
 
         cache_ready = (
             self.use_hook_cache
@@ -2445,7 +2449,7 @@ class DifficultyAwareRouter(nn.Module):
     # FUNGSI UNTUK TENSORRT (DECOUPLED ENGINE)
     # =========================================================
 
-    def compute_gate(self, f_p3, f_p2_back):
+    def compute_gate(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
         """
         Diisolasi untuk Engine A (Front-End).
         Hanya menjalankan Proxy Fallback dan MLP untuk menghasilkan Gate.
@@ -2456,7 +2460,7 @@ class DifficultyAwareRouter(nn.Module):
         z_visual = self.gap(self.sam(f_p3)).view(B, -1)
         z_low = self.gap(self.conv_hint(f_p2_back)).view(B, -1)
 
-        # 2. Uncertainty Signals (Memaksa Proxy Fallback untuk TRT)
+        # 2. Uncertainty Signals
         cls_logits = self.proxy_cls(f_p3)
         reg_logits = self.proxy_reg_dist(f_p3)
         entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
@@ -2464,7 +2468,6 @@ class DifficultyAwareRouter(nn.Module):
         stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
         stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
         
-        # Asumsi running stats sudah terbentuk dari fase training
         stats_norm = self._safe_normalize(stats_raw)
         stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
 
@@ -2472,17 +2475,22 @@ class DifficultyAwareRouter(nn.Module):
 
         # 3. Eksekusi MLP
         z_in_fp32 = z_in.float()
+        
+        # 🚨 MODIFIKASI: Paksa normalized_shape menjadi List[int] agar JIT tidak error
+        ln_shape: List[int] = [self.input_dim] 
+        
         z_norm_fp32 = F.layer_norm(
             z_in_fp32, 
-            self.layer_norm.normalized_shape, 
+            ln_shape, # Gunakan variabel List ini
             self.layer_norm.weight.float(), 
             self.layer_norm.bias.float(), 
             self.layer_norm.eps
         )
 
-        h = F.linear(z_norm_fp32, self.mlp[0].weight.float(), self.mlp[0].bias.float())
+        # 🚨 MODIFIKASI: Gunakan variabel FC eksplisit yang sudah kita buat di init
+        h = F.linear(z_norm_fp32, self.mlp_fc1.weight.float(), self.mlp_fc1.bias.float())
         h = F.silu(h)
-        logits_fp32 = F.linear(h, self.mlp[2].weight.float(), self.mlp[2].bias.float())
+        logits_fp32 = F.linear(h, self.mlp_fc2.weight.float(), self.mlp_fc2.bias.float())
         
         logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
 
@@ -2490,9 +2498,10 @@ class DifficultyAwareRouter(nn.Module):
         probs = F.softmax(logits.float(), dim=1) 
         gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
 
-        return gate_mask # Output: (B, 1, 1, 1)
+        return gate_mask
 
-    def compute_expert(self, f_p3, f_p2_back):
+    @torch.jit.export
+    def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
         """
         Diisolasi untuk Engine B (P2 Expert).
         Hanya menjalankan konvolusi berat jika dipanggil.
@@ -2507,7 +2516,7 @@ class DifficultyAwareRouter(nn.Module):
     # FORWARD
     # =========================================================
 
-    def forward(self, x):
+    def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
         """
         Args:
             x : [f_p3, f_p2_back]
@@ -2519,9 +2528,12 @@ class DifficultyAwareRouter(nn.Module):
             Training  : C2f selalu dieksekusi, di-scale gate (STE)
             Inferensi : C2f di-skip jika gate=0 (true skip)
         """
-        f_p3, f_p2_back = x[0], x[1]
+        f_p3 = x[0]
+        f_p2_back = x[1]
         B = f_p3.shape[0]
-        _, _, H2, W2 = f_p2_back.shape
+        dim_shape = f_p2_back.shape # Ekstrak shape dengan aman
+        H2 = dim_shape[2]
+        W2 = dim_shape[3]
 
         #=================================================
         # LANGKAH 1: BENTUK Z_IN (DENGAN DETACH ANTI-PARASIT)
@@ -2621,17 +2633,28 @@ class DifficultyAwareRouter(nn.Module):
             output = (f_c2f * gate_scalar_feature) + \
                      (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
             
-        else: # FASE INFERENSI PYTORCH
-            # Gunakan fungsi yang sudah dipecah agar konsisten
+        else: # FASE INFERENSI PYTORCH / TENSORRT
             gate_mask = self.compute_gate(f_p3, f_p2_back)
-            self.current_activation_prob = gate_mask.mean().detach()
+            
+            # 🚨 MODIFIKASI: Hindari mutasi state saat sedang di-tracing/scripting oleh TensorRT
+            if not torch.jit.is_tracing():
+                self.current_activation_prob = gate_mask.mean().detach()
 
-            if gate_mask.sum() > 0:
+            # 🚨 MODIFIKASI KRUSIAL UNTUK TENSORRT:
+            # Ambil elemen mentah sebagai 0D Boolean Tensor, BUKAN menggunakan .sum() > 0
+            # TensorRT IIfConditional mewajibkan condition adalah skalar.
+            condition = gate_mask[0, 0, 0, 0] > 0.5
+
+            if condition:
+                # Cabang TRUE: Eksekusi komputasi P2
                 f_c2f = self.compute_expert(f_p3, f_p2_back)
-                output = f_c2f * gate_mask.to(f_c2f.dtype)
+                # Pastikan output dikalikan mask agar nilainya konsisten
+                output = f_c2f * gate_mask[0, 0, 0, 0] 
             else:
+                # Cabang FALSE: Lewati P2
+                # Dimensi HARUS sama persis dengan kembalian compute_expert
                 output = torch.zeros(
-                    B, self.c2f_out, H2, W2,
+                    (B, self.c2f_out, H2, W2), # Gunakan tuple untuk dimensi
                     device=f_p3.device,
                     dtype=f_p3.dtype
                 )
