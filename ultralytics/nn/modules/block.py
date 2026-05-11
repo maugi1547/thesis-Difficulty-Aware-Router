@@ -2150,12 +2150,12 @@ class DifficultyAwareRouter(nn.Module):
         self._is_warmup    = True
         self.force_active  = True   # True selama warmup
 
-        # Output untuk loss.py
-        self.current_activation_prob = 0.0
-        self.loss_prob    = None
-        self.last_entropy = None
-        self.last_conf    = None
-        self.last_var     = None
+        # 🚨 FIX JIT: Inisialisasi semuanya sebagai Tensor (Bukan Float/None)
+        self.current_activation_prob = torch.tensor(0.0)
+        self.loss_prob    = torch.tensor(0.0)
+        self.last_entropy = torch.tensor(0.0)
+        self.last_conf    = torch.tensor(0.0)
+        self.last_var     = torch.tensor(0.0)
 
         # =====================================================
         # 7. HOOK CACHE (diisi oleh hook_router_to_head)
@@ -2164,19 +2164,21 @@ class DifficultyAwareRouter(nn.Module):
         #    di akhir epoch dan overhead memory.
         # =====================================================
         self.use_hook_cache = False
-        # 🚨 MODIFIKASI: Gunakan type hinting Optional[float]
-        self._cached_entropy: Optional[float] = None  
-        self._cached_conf: Optional[float] = None  
-        self._cached_dfl_var: Optional[float] = None
-        self._hook_handles    = []
+        
+        # 🚨 FIX JIT: Gunakan nilai default -1.0 alih-alih None
+        self._cached_entropy = -1.0 
+        self._cached_conf    = -1.0 
+        self._cached_dfl_var = -1.0 
+        self._hook_handles   = []
 
         # =====================================================
         # 8. RUNNING STATS untuk normalisasi stabil
         #    Menggantikan batch-wise std yang bisa = 0
         #    saat batch size = 1 atau fitur seragam.
         # =====================================================
-        self._running_mean      = None  # (3,) EMA mean
-        self._running_std       = None  # (3,) EMA std
+        # 🚨 FIX JIT: Inisialisasi dengan Tensor sejak awal (Bukan None)
+        self._running_mean      = torch.zeros(3)  
+        self._running_std       = torch.ones(3)   
         self._ema_momentum      = 0.99
         self._stats_initialized = False
 
@@ -2408,36 +2410,28 @@ class DifficultyAwareRouter(nn.Module):
         device = f_p3.device
         dtype  = f_p3.dtype
 
-        # 🚨 MODIFIKASI: Akses langsung atribut tanpa getattr
         e_cache = self._cached_entropy
         c_cache = self._cached_conf
         v_cache = self._cached_dfl_var
 
+        # 🚨 FIX JIT: Cek apakah nilai cache >= 0.0 (menggantikan is not None)
         cache_ready = (
             self.use_hook_cache
-            and e_cache is not None
-            and c_cache is not None
-            and v_cache is not None
+            and e_cache >= 0.0
+            and c_cache >= 0.0
+            and v_cache >= 0.0
         )
-
+        
         if cache_ready:
             # Broadcast scalar → (B, 1)
-            avg_entropy = torch.full(
-                (B, 1), e_cache, device=device, dtype=dtype
-            )
-            avg_conf = torch.full(
-                (B, 1), c_cache, device=device, dtype=dtype
-            )
-            dfl_var = torch.full(
-                (B, 1), v_cache, device=device, dtype=dtype
-            )
+            avg_entropy = torch.full((B, 1), e_cache, device=device, dtype=dtype)
+            avg_conf    = torch.full((B, 1), c_cache, device=device, dtype=dtype)
+            dfl_var     = torch.full((B, 1), v_cache, device=device, dtype=dtype)
         else:
             # Proxy fallback
             cls_logits = self.proxy_cls(f_p3)
             reg_logits = self.proxy_reg_dist(f_p3)
-            avg_entropy, avg_conf, dfl_var = self._compute_stats(
-                cls_logits, reg_logits
-            )
+            avg_entropy, avg_conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
 
         return avg_entropy, avg_conf, dfl_var
 
