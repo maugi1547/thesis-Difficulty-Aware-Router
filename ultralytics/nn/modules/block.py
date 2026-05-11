@@ -2314,30 +2314,32 @@ class DifficultyAwareRouter(nn.Module):
     # =========================================================
     # HITUNG STATS DARI LOGITS (dipakai proxy fallback)
     # =========================================================
-
+    # 🚨 TAMBAHAN: Ekstrak fungsi nested menjadi class method dengan Type Hinting
+    def _topk_mean(self, t4d: torch.Tensor, B: int, K: int) -> torch.Tensor:
+        flat = t4d.view(B, 1, -1)
+        topk, _ = torch.topk(flat, k=K, dim=-1)
+        return 0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1)
+    
     def _compute_stats(
         self,
         cls_logits: torch.Tensor,
         reg_logits: torch.Tensor
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # 🚨 WAJIB Type Hint!
         """
         Hitung entropy, confidence, dan DFL variance dari logits.
-
-        Args:
-            cls_logits : (B, nc, H, W)
-            reg_logits : (B, reg_max, H, W)
-
-        Returns:
-            avg_entropy, avg_conf, dfl_var — masing-masing (B, 1)
         """
-        eps = 1e-5 # 🚨 REVISI: eps 1e-9 terlalu kecil untuk FP16. Ubah ke 1e-5
-        B, nc, H, W = cls_logits.shape
-        K = max(1, int(H * W * 0.02))  # Top-2% lokasi
+        eps = 1e-5 
+        B = cls_logits.shape[0]
+        H = cls_logits.shape[2]
+        W = cls_logits.shape[3]
+        
+        # K dipaksa menjadi integer konstan agar aman untuk TorchScript
+        K = max(1, int(H * W * 0.02))  
 
         # --- Entropy & Confidence ---
-        if nc == 1:
+        # 🚨 PERBAIKAN: Gunakan self.num_classes, BUKAN dimensi tensor (nc)
+        if self.num_classes == 1:
             prob = torch.sigmoid(cls_logits)
-            # 🚨 REVISI: Gunakan clamp untuk memastikan tidak ada log(0)
             prob_safe = prob.clamp(min=eps, max=1.0 - eps)
             entropy_map = -(
                 prob_safe * torch.log(prob_safe)
@@ -2346,7 +2348,6 @@ class DifficultyAwareRouter(nn.Module):
             unc_conf = 1 - prob
         else:
             prob = torch.softmax(cls_logits, dim=1)
-            # 🚨 REVISI: Gunakan clamp
             prob_safe = prob.clamp(min=eps, max=1.0)
             entropy_map = -(
                 prob_safe * torch.log(prob_safe)
@@ -2355,29 +2356,25 @@ class DifficultyAwareRouter(nn.Module):
                 dim=1, keepdim=True
             ).values
 
-        def topk_mean(t4d):
-            flat = t4d.view(B, 1, -1)
-            topk, _ = torch.topk(flat, k=K, dim=-1)
-            return (
-                0.7 * topk.mean(dim=-1)
-                + 0.3 * flat.mean(dim=-1)
-            )  # (B, 1)
+        # 🚨 PERBAIKAN: Panggil method _topk_mean yang sudah diekstrak
+        avg_entropy = self._topk_mean(entropy_map, B, K)
+        avg_conf    = self._topk_mean(unc_conf, B, K)
 
-        avg_entropy = topk_mean(entropy_map)
-        avg_conf    = topk_mean(unc_conf)
-
-        # --- DFL Variance — Persamaan (3) & (4) ---
+        # --- DFL Variance ---
         dist_prob = F.softmax(reg_logits, dim=1)
         bins = torch.arange(
             self.reg_max,
             device=cls_logits.device,
             dtype=cls_logits.dtype
         ).view(1, self.reg_max, 1, 1)
+        
         y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
         var_map = (
             dist_prob * (bins - y_hat) ** 2
         ).sum(dim=1, keepdim=True)
-        dfl_var = topk_mean(var_map)
+        
+        # 🚨 PERBAIKAN: Panggil method _topk_mean yang sudah diekstrak
+        dfl_var = self._topk_mean(var_map, B, K)
 
         return avg_entropy, avg_conf, dfl_var
 
