@@ -2046,6 +2046,12 @@ class DifficultyAwareRouter(nn.Module):
         Output = tensor nol dengan dimensi (B, c2f_out, H2, W2).
         GFLOPs benar-benar berkurang, bukan hanya di-mask.
     """
+    # 🚨 TAMBAHKAN ANOTASI INI DI SINI (Class Body Annotations)
+    loss_prob: Optional[torch.Tensor]
+    current_activation_prob: Optional[torch.Tensor]
+    last_entropy: Optional[torch.Tensor]
+    last_conf: Optional[torch.Tensor]
+    last_var: Optional[torch.Tensor]
 
     def __init__(
         self,
