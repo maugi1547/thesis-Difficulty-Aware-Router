@@ -2482,8 +2482,6 @@ class DifficultyAwareRouter(nn.Module):
         h = F.linear(z_norm_fp32, self.mlp_fc1.weight.float(), self.mlp_fc1.bias.float())
         h = F.silu(h)
         logits_fp32 = F.linear(h, self.mlp_fc2.weight.float(), self.mlp_fc2.bias.float())
-        # 🚨 TAMBAHKAN BARIS INI SEMENTARA UNTUK MELIHAT LOGIT
-        print(f"[DEBUG] Raw Logits MLP: {logits_fp32.detach().cpu().numpy()}")
 
         logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
 
