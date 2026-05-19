@@ -2411,16 +2411,23 @@ class DifficultyAwareRouter(nn.Module):
         device = f_p3.device
         dtype  = f_p3.dtype
 
-        # 1. Ambil nilai cache dan pastikan menjadi tensor skalar
-        # Kita gunakan torch.tensor untuk mengamankan tipe data
-        e_cache = torch.as_tensor(self._cached_entropy, device=device, dtype=dtype)
-        c_cache = torch.as_tensor(self._cached_conf, device=device, dtype=dtype)
-        v_cache = torch.as_tensor(self._cached_dfl_var, device=device, dtype=dtype)
+        # 🚨 PERBAIKAN: Berikan nilai default -1.0 jika atribut masih None
+        e_val = self._cached_entropy if self._cached_entropy is not None else -1.0
+        c_val = self._cached_conf if self._cached_conf is not None else -1.0
+        v_val = self._cached_dfl_var if self._cached_dfl_var is not None else -1.0
 
-        # 2. Definisikan kondisi kesiapan dengan tensor
-        # Membandingkan tensor dengan 0.0 jauh lebih stabil untuk JIT/ONNX
-        is_ready = (e_cache >= 0.0) & (c_cache >= 0.0) & (v_cache >= 0.0)
-        cache_ready = self.use_hook_cache and is_ready
+        # Konversi ke tensor setelah memastikan nilainya adalah angka
+        e_cache = torch.as_tensor(e_val, device=device, dtype=dtype)
+        c_cache = torch.as_tensor(c_val, device=device, dtype=dtype)
+        v_cache = torch.as_tensor(v_val, device=device, dtype=dtype)
+
+        # Kondisi kesiapan sekarang aman
+        cache_ready = (
+            self.use_hook_cache
+            and e_cache >= 0.0
+            and c_cache >= 0.0
+            and v_cache >= 0.0
+        )
 
         # 3. Gunakan torch.where untuk alur kontrol yang "diterima" oleh ONNX/TRT
         # Ini menggantikan if/else konvensional yang sering bermasalah saat tracing
