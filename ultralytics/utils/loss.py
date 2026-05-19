@@ -351,8 +351,14 @@ class v8DetectionLoss:
         # ==========================================================
         # 1. PENCARIAN ROUTER (DEEP SEARCH - ANTI WRAPPER ERROR)
         # ==========================================================
+        if not self.model.training:
+            return loss
+
         router = None
-        for m in self.model.modules():
+        from ultralytics.utils.torch_utils import unwrap_model
+        raw_model = unwrap_model(self.model)
+        
+        for m in raw_model.modules():
             if 'DifficultyAwareRouter' in m.__class__.__name__:
                 router = m
                 break
@@ -362,6 +368,7 @@ class v8DetectionLoss:
                 print("\n[WARNING] compute_router_loss: DifficultyAwareRouter TIDAK DITEMUKAN di model!\n")
                 self._router_warned = True
             return loss
+
 
         # ==========================================================
         # 2. EXTEND TENSOR LOSS SECARA AMAN (DARI 3 KE 4 DIMENSI)
