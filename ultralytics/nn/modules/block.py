@@ -2137,6 +2137,7 @@ class DifficultyAwareRouter(nn.Module):
         # HAPUS self.mlp = nn.Sequential(...) dan ganti dengan:
         self.mlp_fc1 = nn.Linear(self.input_dim, hidden_dim)
         self.mlp_fc2 = nn.Linear(hidden_dim, 2)
+        self.mlp = nn.ModuleList([self.mlp_fc1, nn.SiLU(), self.mlp_fc2])
         # 🚨 MODIFIKASI: Inisialisasi bias pada fc2
         nn.init.constant_(self.mlp_fc2.bias[0], 0.0)
         nn.init.constant_(self.mlp_fc2.bias[1], 0.0)
@@ -2594,9 +2595,9 @@ class DifficultyAwareRouter(nn.Module):
         )
 
         # Eksekusi manual 3-lapis MLP (Linear -> SiLU -> Linear) murni di FP32
-        h = F.linear(z_norm_fp32, self.mlp[0].weight.float(), self.mlp[0].bias.float())
+        h = F.linear(z_norm_fp32, self.mlp_fc1.weight.float(), self.mlp_fc1.bias.float())
         h = F.silu(h)
-        logits_fp32 = F.linear(h, self.mlp[2].weight.float(), self.mlp[2].bias.float())
+        logits_fp32 = F.linear(h, self.mlp_fc2.weight.float(), self.mlp_fc2.bias.float())
         
         # 🚨 FIX FINAL 1: Tanh Soft-Clipping (Anti-Deadlock, Batas [-3, 3]
         # Menggantikan torch.clamp agar gradien penalti selalu bisa masuk
