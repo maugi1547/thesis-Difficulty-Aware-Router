@@ -2411,23 +2411,23 @@ class DifficultyAwareRouter(nn.Module):
         device = f_p3.device
         dtype  = f_p3.dtype
 
-        e_cache = self._cached_entropy
-        c_cache = self._cached_conf
-        v_cache = self._cached_dfl_var
+        # 1. Ambil nilai cache dan pastikan menjadi tensor skalar
+        # Kita gunakan torch.tensor untuk mengamankan tipe data
+        e_cache = torch.as_tensor(self._cached_entropy, device=device, dtype=dtype)
+        c_cache = torch.as_tensor(self._cached_conf, device=device, dtype=dtype)
+        v_cache = torch.as_tensor(self._cached_dfl_var, device=device, dtype=dtype)
 
-        # 🚨 FIX JIT: Cek apakah nilai cache >= 0.0 (menggantikan is not None)
-        cache_ready = (
-            self.use_hook_cache
-            and e_cache >= 0.0
-            and c_cache >= 0.0
-            and v_cache >= 0.0
-        )
-        
+        # 2. Definisikan kondisi kesiapan dengan tensor
+        # Membandingkan tensor dengan 0.0 jauh lebih stabil untuk JIT/ONNX
+        is_ready = (e_cache >= 0.0) & (c_cache >= 0.0) & (v_cache >= 0.0)
+        cache_ready = self.use_hook_cache and is_ready
+
+        # 3. Gunakan torch.where untuk alur kontrol yang "diterima" oleh ONNX/TRT
+        # Ini menggantikan if/else konvensional yang sering bermasalah saat tracing
         if cache_ready:
-            # Broadcast scalar → (B, 1)
             avg_entropy = torch.full((B, 1), e_cache, device=device, dtype=dtype)
-            avg_conf    = torch.full((B, 1), c_cache, device=device, dtype=dtype)
-            dfl_var     = torch.full((B, 1), v_cache, device=device, dtype=dtype)
+            avg_conf = torch.full((B, 1), c_cache, device=device, dtype=dtype)
+            dfl_var = torch.full((B, 1), v_cache, device=device, dtype=dtype)
         else:
             # Proxy fallback
             cls_logits = self.proxy_cls(f_p3)
