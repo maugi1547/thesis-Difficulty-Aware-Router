@@ -96,51 +96,52 @@ from ultralytics.utils.torch_utils import (
 
 # Di tasks.py — hook_router_to_head (versi final)
 
+
 def hook_router_to_head(model):
     router_module = None
-    detect_head   = None
+    detect_head = None
 
     for m in model.modules():
-        if m.__class__.__name__ == 'DifficultyAwareRouter':
+        if m.__class__.__name__ == "DifficultyAwareRouter":
             router_module = m
-        elif m.__class__.__name__ == 'Detect':
+        elif m.__class__.__name__ == "Detect":
             detect_head = m
 
     if router_module is None or detect_head is None:
         print("[WARNING] Router atau Detect head tidak ditemukan.")
         return
 
-    if not (hasattr(detect_head, 'cv3') and len(detect_head.cv3) > 1):
+    if not (hasattr(detect_head, "cv3") and len(detect_head.cv3) > 1):
         print("[WARNING] cv3 tidak cukup panjang di Detect head.")
         return
 
     # Sinkronisasi metadata
-    router_module.nc      = detect_head.nc
+    router_module.nc = detect_head.nc
     router_module.reg_max = detect_head.reg_max
 
     # Pasang hook langsung menggunakan method milik class Router (Pickle-safe)
     handle_cls = detect_head.cv3[1].register_forward_hook(router_module._hook_cls)
     handle_reg = detect_head.cv2[1].register_forward_hook(router_module._hook_reg)
 
-    router_module._hook_handles  = [handle_cls, handle_reg]
+    router_module._hook_handles = [handle_cls, handle_reg]
     router_module._cached_entropy = None
-    router_module._cached_conf    = None
+    router_module._cached_conf = None
     router_module._cached_dfl_var = None
-    router_module.use_hook_cache  = True
+    router_module.use_hook_cache = True
 
     print(f"[INFO] Hook terpasang secara PICKLE-SAFE. nc={detect_head.nc}, reg_max={detect_head.reg_max}.")
 
+
 def remove_router_hooks(model):
-    """
-    Lepas semua hook sebelum export/ONNX agar tidak ada
-    referensi ke router di dalam graph export.
+    """Lepas semua hook sebelum export/ONNX agar tidak ada referensi ke router di dalam graph export.
     """
     for m in model.modules():
-        if m.__class__.__name__ == 'DifficultyAwareRouter':
-            for handle in getattr(m, '_hook_handles', []):
+        if m.__class__.__name__ == "DifficultyAwareRouter":
+            for handle in getattr(m, "_hook_handles", []):
                 handle.remove()
             m._hook_handles = []
             print("[INFO] Router hooks dilepas.")
+
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -462,7 +463,7 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
-        
+
         hook_router_to_head(self)
 
     def _predict_augment(self, x):
@@ -1637,7 +1638,7 @@ def parse_model(d, ch, verbose=True):
                 else getattr(__import__("torchvision").ops, m[16:])
                 if "torchvision.ops." in m
                 else globals()[m]
-            ) # get module
+            )  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
@@ -1701,18 +1702,18 @@ def parse_model(d, ch, verbose=True):
             args = [*args[1:]]
         # --- TAMBAHAN UNTUK MOE-P2 ROUTER ---
         elif m is DifficultyAwareRouter:
-            c_p3 = ch[f[0]] # Ambil channel P3 dari layer sebelumnya
-            c_p2 = ch[f[1]] # Ambil channel P2 dari layer sebelumnya
-            
+            c_p3 = ch[f[0]]  # Ambil channel P3 dari layer sebelumnya
+            c_p2 = ch[f[1]]  # Ambil channel P2 dari layer sebelumnya
+
             # 1. PENSKALAAN CHANNEL (WIDTH)
             c2f_out_scaled = make_divisible(args[0] * width, 8)
-            
+
             # 2. PENSKALAAN BOTTLENECK (DEPTH)
             n_bottleneck_scaled = max(round(args[1] * depth), 1) if len(args) > 1 else 1
-            
-            # 3. RAKIT KEMBALI ARGUMEN 
+
+            # 3. RAKIT KEMBALI ARGUMENT
             args = [c_p3, c_p2, c2f_out_scaled, n_bottleneck_scaled, *args[2:]]
-            
+
             # 4. Set ukuran channel akhir (c2)
             c2 = args[2]
         # -------------------------------------
