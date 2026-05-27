@@ -158,7 +158,7 @@ class DetectionTrainer(BaseTrainer):
         model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         if weights:
             model.load(weights)
-        
+
         # --- [MODIFIKASI ANDA DI SINI] ---
         # Kita mendefinisikan nama kolom loss untuk ditampilkan di terminal.
         # Urutannya harus sama persis dengan urutan return di loss.py
