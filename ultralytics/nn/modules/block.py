@@ -55,6 +55,7 @@ __all__ = (
     "SCDown",
     "TorchVision",
     "DifficultyAwareRouter",
+    "LightWeightDifficultyAwareRouter",
 )
 
 
@@ -2676,6 +2677,424 @@ class DifficultyAwareRouter(nn.Module):
                 # Dimensi HARUS sama persis dengan kembalian compute_expert
                 output = torch.zeros(
                     (B, self.c2f_out, H2, W2), # Gunakan tuple untuk dimensi
+                    device=f_p3.device,
+                    dtype=f_p3.dtype
+                )
+
+        return output   
+    
+class LightWeightDifficultyAwareRouter(nn.Module):
+    """
+    Router dinamis yang mengontrol aktivasi jalur P2 secara
+    kondisional berdasarkan tingkat kesulitan visual input.
+
+    Arsitektur internal (PRUNED VERSION):
+        1. Z_visual : Conv1x1(F_P3) → GAP → (B, 16)  [SAM Dihapus]
+        2. Z_low    : Conv1x1(F_P2) → GAP → (B, 16)
+        3. S        : statistik agregat (Top-K=10) → (B, 3)
+        4. Z_in     : Concat + LayerNorm → (B, 35)
+        5. MLP      : Z_in → 2 (Single-layer projection)
+        6. Gate     : STE Gumbel-Softmax (train) / Hard (infer)
+        7. C2f P2   : di dalam router → true skip saat gate=0
+    """
+
+    def __init__(
+        self,
+        c_p3: int,
+        c_p2: int,
+        c2f_out: int,
+        n_bottleneck: int = 1,
+        shortcut: bool = False,
+        num_classes: int = 1,
+        reg_max: int = 16,
+        warmup_epochs: int = 5,
+    ):
+        super().__init__()
+
+        self.c_p3         = c_p3
+        self.c_p2         = c_p2
+        self.c2f_out      = c2f_out
+        self.num_classes  = num_classes
+        self.reg_max      = reg_max
+        self.warmup_epochs = warmup_epochs
+
+        # =====================================================
+        # 🚨 PRUNING LANGKAH 1 & 2: Z_VISUAL (SAM Dihapus + Channel Pruning)
+        # c_p3 (256) -> direduksi ekstrem ke 16 channel -> GAP
+        # =====================================================
+        self.c_visual = 16
+        self.conv_visual = nn.Conv2d(c_p3, self.c_visual, 1, bias=False)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        # =====================================================
+        # 🚨 PRUNING LANGKAH 2: Z_LOW (Channel Pruning)
+        # c_p2 (128) -> direduksi ekstrem ke 16 channel -> GAP
+        # =====================================================
+        self.c_low = 16
+        self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, bias=False)
+
+        # =====================================================
+        # 3. PROXY FALLBACK
+        # =====================================================
+        self.proxy_cls = nn.Sequential(
+            nn.Conv2d(c_p3, max(c_p3 // 2, 32), 3, padding=1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(max(c_p3 // 2, 32), num_classes, 1)
+        )
+        self.proxy_reg_dist = nn.Conv2d(c_p3, reg_max, 1)
+
+        # =====================================================
+        # 4. C2F P2 — DI DALAM ROUTER
+        # =====================================================
+        from ultralytics.nn.modules import C2f
+        self.c2f_p2 = C2f(
+            c_p3 + c_p2, c2f_out,
+            n=n_bottleneck,
+            shortcut=shortcut
+        )
+
+        # =====================================================
+        # 🚨 PRUNING LANGKAH 4: MLP ROUTER (Single-Layer)
+        # input_dim = 16 (visual) + 16 (low) + 3 (stats) = 35
+        # Arsitektur: 35 -> 2 (Langsung ke output, tanpa hidden layer)
+        # =====================================================
+        self.input_dim = self.c_visual + self.c_low + 3
+        self.layer_norm = nn.LayerNorm(self.input_dim)
+        
+        self.mlp_fc = nn.Linear(self.input_dim, 2)
+        nn.init.constant_(self.mlp_fc.bias[0], 0.0)
+        nn.init.constant_(self.mlp_fc.bias[1], 0.0)
+
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+        # =====================================================
+        # STATE TRAINING & HOOK CACHE
+        # =====================================================
+        self.current_epoch = 0
+        self._is_warmup    = True
+        self.force_active  = True  
+
+        self.current_activation_prob = torch.tensor(0.0)
+        self.loss_prob    = torch.tensor(0.0)
+        self.last_entropy = torch.tensor(0.0)
+        self.last_conf    = torch.tensor(0.0)
+        self.last_var     = torch.tensor(0.0)
+
+        self.use_hook_cache = False
+        self._cached_entropy = -1.0 
+        self._cached_conf    = -1.0 
+        self._cached_dfl_var = -1.0 
+        self._hook_handles   = []
+
+        self._running_mean      = torch.zeros(3)  
+        self._running_std       = torch.ones(3)   
+        self._ema_momentum      = 0.99
+        self._stats_initialized = False
+        self.stats_weight = nn.Parameter(torch.ones(1, 3))
+
+    def set_epoch(self, epoch: int):
+        self.current_epoch = epoch
+        self._is_warmup   = (epoch < self.warmup_epochs)
+        self.force_active = self._is_warmup
+
+    def remove_hooks(self):
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles = []
+        
+    # =========================================================
+    # HOOK METHODS 
+    # =========================================================
+    def _hook_cls(self, module, input, output):
+        with torch.no_grad():
+            tensor_aman = output.detach().float()
+            
+            if not self.training:
+                if tensor_aman.max() <= 1.0 and tensor_aman.min() >= 0.0:
+                    tensor_aman = tensor_aman.clamp(min=1e-5, max=1.0 - 1e-5)
+                    tensor_aman = torch.log(tensor_aman / (1.0 - tensor_aman))
+            
+            tensor_aman = tensor_aman.clamp(min=-20.0, max=20.0)
+            B, C, H, W = tensor_aman.shape
+            
+            # 🚨 PRUNING LANGKAH 3: Fix Top-K = 10 (Sangat cepat di CPU)
+            K = 10 
+            eps = 1e-5 
+
+            if C == 1:
+                prob = torch.sigmoid(tensor_aman)
+                prob_safe = prob.clamp(min=eps, max=1.0 - eps)
+                entropy_map = -(prob_safe * torch.log(prob_safe) + (1 - prob_safe) * torch.log(1 - prob_safe))
+                unc_conf = 1 - prob
+            else:
+                prob = torch.softmax(tensor_aman, dim=1)
+                prob_safe = prob.clamp(min=eps, max=1.0)
+                entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
+                unc_conf = 1 - prob.max(dim=1, keepdim=True).values
+
+            flat_e = entropy_map.view(B, 1, -1)
+            topk_e, _ = torch.topk(flat_e, k=K, dim=-1)
+            per_sample_e = (0.7 * topk_e.mean(dim=-1) + 0.3 * flat_e.mean(dim=-1))
+            self._cached_entropy = per_sample_e.mean().item()
+
+            flat_c = unc_conf.view(B, 1, -1)
+            topk_c, _ = torch.topk(flat_c, k=K, dim=-1)
+            per_sample_c = (0.7 * topk_c.mean(dim=-1) + 0.3 * flat_c.mean(dim=-1))
+            self._cached_conf = per_sample_c.mean().item()
+
+    def _hook_reg(self, module, input, output):
+        with torch.no_grad():
+            B, _, H, W = output.shape
+            
+            # 🚨 PRUNING LANGKAH 3: Fix Top-K = 10
+            K = 10 
+
+            reg_one   = output[:, :self.reg_max, :, :]
+            dist_prob = torch.softmax(reg_one, dim=1)
+            bins      = torch.arange(self.reg_max, device=output.device, dtype=output.dtype).view(1, self.reg_max, 1, 1)
+
+            y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
+            var_map = (dist_prob * (bins - y_hat) ** 2).sum(dim=1, keepdim=True)
+
+            flat    = var_map.view(B, 1, -1)
+            topk, _ = torch.topk(flat, k=K, dim=-1)
+            per_sample = (0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1))
+            self._cached_dfl_var = per_sample.mean().item()
+
+    # =========================================================
+    # NORMALISASI STABIL
+    # =========================================================
+    def _safe_normalize(self, stats: torch.Tensor) -> torch.Tensor:
+        stats_fp32 = stats.float()
+
+        with torch.no_grad():
+            batch_mean = stats_fp32.mean(dim=0)
+            batch_std  = stats_fp32.std(dim=0, unbiased=False).clamp(min=1e-4)
+
+            if not self._stats_initialized:
+                self._running_mean = batch_mean.clone()
+                self._running_std  = batch_std.clone()
+                self._stats_initialized = True
+            else:
+                m = self._ema_momentum
+                curr_mean = self._running_mean.to(device=stats.device, dtype=torch.float32)
+                curr_std  = self._running_std.to(device=stats.device, dtype=torch.float32)
+                
+                self._running_mean = (m * curr_mean + (1 - m) * batch_mean)
+                self._running_std = (m * curr_std + (1 - m) * batch_std)
+
+        curr_mean_stable = self._running_mean.to(device=stats.device, dtype=torch.float32)
+        curr_std_stable  = self._running_std.to(device=stats.device, dtype=torch.float32).clamp(min=1e-4)
+        
+        stats_norm = (stats_fp32 - curr_mean_stable) / curr_std_stable
+        return stats_norm.clamp(-3.0, 3.0).to(stats.dtype)
+
+    def _topk_mean(self, t4d: torch.Tensor, B: int, K: int) -> torch.Tensor:
+        flat = t4d.view(B, 1, -1)
+        topk, _ = torch.topk(flat, k=K, dim=-1)
+        return 0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1)
+    
+    def _compute_stats(self, cls_logits: torch.Tensor, reg_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        eps = 1e-5 
+        B = cls_logits.shape[0]
+        
+        # 🚨 PRUNING LANGKAH 3: Fix Top-K = 10
+        K = 10  
+
+        if self.num_classes == 1:
+            prob = torch.sigmoid(cls_logits)
+            prob_safe = prob.clamp(min=eps, max=1.0 - eps)
+            entropy_map = -(prob_safe * torch.log(prob_safe) + (1 - prob_safe) * torch.log(1 - prob_safe))
+            unc_conf = 1 - prob
+        else:
+            prob = torch.softmax(cls_logits, dim=1)
+            prob_safe = prob.clamp(min=eps, max=1.0)
+            entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
+            unc_conf = 1 - prob.max(dim=1, keepdim=True).values
+
+        avg_entropy = self._topk_mean(entropy_map, B, K)
+        avg_conf    = self._topk_mean(unc_conf, B, K)
+
+        dist_prob = F.softmax(reg_logits, dim=1)
+        bins = torch.arange(self.reg_max, device=cls_logits.device, dtype=cls_logits.dtype).view(1, self.reg_max, 1, 1)
+        y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
+        var_map = (dist_prob * (bins - y_hat) ** 2).sum(dim=1, keepdim=True)
+        
+        dfl_var = self._topk_mean(var_map, B, K)
+
+        return avg_entropy, avg_conf, dfl_var
+
+    def _get_uncertainty_signals(self, f_p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B      = f_p3.shape[0]
+        device = f_p3.device
+        dtype  = f_p3.dtype
+
+        e_val = self._cached_entropy if self._cached_entropy is not None else -1.0
+        c_val = self._cached_conf if self._cached_conf is not None else -1.0
+        v_val = self._cached_dfl_var if self._cached_dfl_var is not None else -1.0
+
+        e_cache = torch.as_tensor(e_val, device=device, dtype=dtype)
+        c_cache = torch.as_tensor(c_val, device=device, dtype=dtype)
+        v_cache = torch.as_tensor(v_val, device=device, dtype=dtype)
+
+        cache_ready = (self.use_hook_cache and e_cache >= 0.0 and c_cache >= 0.0 and v_cache >= 0.0)
+
+        if cache_ready:
+            avg_entropy = torch.full((B, 1), e_cache, device=device, dtype=dtype)
+            avg_conf = torch.full((B, 1), c_cache, device=device, dtype=dtype)
+            dfl_var = torch.full((B, 1), v_cache, device=device, dtype=dtype)
+        else:
+            cls_logits = self.proxy_cls(f_p3)
+            reg_logits = self.proxy_reg_dist(f_p3)
+            avg_entropy, avg_conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
+
+        return avg_entropy, avg_conf, dfl_var
+
+    # =========================================================
+    # FUNGSI UNTUK TENSORRT
+    # =========================================================
+    def compute_gate(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        B = f_p3.shape[0]
+
+        # 🚨 PRUNING LANGKAH 1 & 2: Conv1x1 -> GAP
+        z_visual = self.gap(self.conv_visual(f_p3)).view(B, -1)
+        z_low = self.gap(self.conv_hint(f_p2_back)).view(B, -1)
+
+        cls_logits = self.proxy_cls(f_p3)
+        reg_logits = self.proxy_reg_dist(f_p3)
+        entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
+
+        stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
+        stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        stats_norm = self._safe_normalize(stats_raw)
+        stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
+
+        z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
+
+        # 🚨 PRUNING LANGKAH 4: Eksekusi Single-Layer Linear 
+        z_in_fp32 = z_in.float()
+        ln_shape: List[int] = [self.input_dim] 
+        
+        z_norm_fp32 = F.layer_norm(
+            z_in_fp32, 
+            ln_shape,
+            self.layer_norm.weight.float(), 
+            self.layer_norm.bias.float(), 
+            self.layer_norm.eps
+        )
+
+        logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
+        logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
+
+        probs = F.softmax(logits.float(), dim=1) 
+        gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
+
+        return gate_mask
+
+    @torch.jit.export
+    def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        f_p3_up = self.upsample(f_p3)
+        f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
+        
+        cv1_out = self.c2f_p2.cv1(f_fused)
+        chunk1, chunk2 = torch.chunk(cv1_out, 2, dim=1)
+        m_out = self.c2f_p2.m[0](chunk2)
+        concat_out = torch.cat((chunk1, chunk2, m_out), dim=1)
+        f_c2f_final = self.c2f_p2.cv2(concat_out)
+        
+        return f_c2f_final
+    
+    # =========================================================
+    # FORWARD
+    # =========================================================
+    def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
+        f_p3 = x[0]
+        f_p2_back = x[1]
+        B = f_p3.shape[0]
+        dim_shape = f_p2_back.shape 
+        H2 = dim_shape[2]
+        W2 = dim_shape[3]
+
+        f_p3_detached = f_p3.detach()
+        f_p2_back_detached = f_p2_back.detach()
+
+        # 🚨 PRUNING LANGKAH 1 & 2: Conv1x1 -> GAP
+        z_visual = self.gap(self.conv_visual(f_p3_detached)).view(B, -1)
+        z_low = self.gap(self.conv_hint(f_p2_back_detached)).view(B, -1)
+
+        entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3)
+        self.last_entropy = entropy.detach()
+        self.last_conf    = conf.detach()
+        self.last_var     = dfl_var.detach()
+
+        stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
+        stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        stats_norm = self._safe_normalize(stats_raw)
+        stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
+
+        z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
+
+        # 🚨 PRUNING LANGKAH 4: Single-Layer Linear (Murni FP32)
+        z_in_fp32 = z_in.float()
+        
+        z_norm_fp32 = F.layer_norm(
+            z_in_fp32, 
+            self.layer_norm.normalized_shape, 
+            self.layer_norm.weight.float(), 
+            self.layer_norm.bias.float(), 
+            self.layer_norm.eps
+        )
+
+        logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
+        logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
+
+        tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
+
+        if self.training:
+            soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
+            
+            if self._is_warmup:
+                hard_warmup = torch.zeros_like(soft)
+                hard_warmup[:, 1] = 1.0 
+                
+                gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                
+                self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
+                self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
+            else:
+                hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
+                
+                gate_onehot = hard - soft.detach() + soft
+                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                
+                self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
+                self.current_activation_prob = hard[:, 1].mean().detach()
+
+            f_p3_up = self.upsample(f_p3)
+            f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
+            f_c2f   = self.c2f_p2(f_fused)
+            
+            output = (f_c2f * gate_scalar_feature) + \
+                     (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
+            
+        else: 
+            gate_mask = self.compute_gate(f_p3, f_p2_back)
+            
+            if not torch.jit.is_tracing():
+                self.current_activation_prob = gate_mask.mean().detach()
+
+            condition = gate_mask[0, 0, 0, 0] > 0.5
+
+            if condition:
+                f_c2f = self.compute_expert(f_p3, f_p2_back)
+                output = f_c2f * gate_mask[0, 0, 0, 0] 
+            else:
+                output = torch.zeros(
+                    (B, self.c2f_out, H2, W2), 
                     device=f_p3.device,
                     dtype=f_p3.dtype
                 )

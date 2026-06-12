@@ -60,6 +60,7 @@ from .block import (
     SCDown,
     TorchVision,
     DifficultyAwareRouter,
+    LightWeightDifficultyAwareRouter,
 )
 from .conv import (
     CBAM,
@@ -159,6 +160,7 @@ __all__ = (
     "LRPCHead",
     "LayerNorm2d",
     "LightConv",
+    "LightWeightDifficultyAwareRouter",
     "MLPBlock",
     "MSDeformAttn",
     "MaxSigmoidAttnBlock",

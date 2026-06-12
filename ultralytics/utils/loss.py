@@ -359,7 +359,7 @@ class v8DetectionLoss:
         raw_model = unwrap_model(self.model)
         
         for m in raw_model.modules():
-            if 'DifficultyAwareRouter' in m.__class__.__name__:
+            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter']:
                 router = m
                 break
 
@@ -380,7 +380,7 @@ class v8DetectionLoss:
         # ==========================================================
         # 3. AMBIL PARAMETER KONTROL
         # ==========================================================
-        target_lambda = getattr(self.model, 'router_penalty_lambda', 0.0)
+        target_lambda = getattr(raw_model, 'router_penalty_lambda', 0.0)
 
         # Ambil probabilitas SOFT (untuk backprop)
         val_for_loss = getattr(router, 'loss_prob', None)
@@ -479,7 +479,6 @@ class v8DetectionLoss:
         #   Loss_router = λ * p * L_hybrid
         # ==========================================================
         alpha = getattr(self, 'alpha', 0.5) # Pembobot keseimbangan (default 50-50)
-        
         hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
         
         # PERHITUNGAN FINAL:
