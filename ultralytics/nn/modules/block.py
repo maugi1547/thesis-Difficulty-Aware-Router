@@ -3016,6 +3016,46 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         return f_c2f_final
     
     # =========================================================
+    # PYTORCH DEEPCOPY FIX (UNTUK YOLOv8 NaN RECOVERY)
+    # =========================================================
+    def __getstate__(self):
+        """
+        Dipanggil otomatis oleh PyTorch saat deepcopy() / YOLO recovery.
+        Kita harus menghapus tensor yang memiliki gradient graph (non-leaf)
+        agar deepcopy tidak crash.
+        """
+        state = self.__dict__.copy()
+        
+        # Daftar variabel dinamis yang mengikat computation graph
+        dynamic_keys = [
+            'loss_prob', 
+            'current_activation_prob', 
+            'last_entropy', 
+            'last_conf', 
+            'last_var'
+        ]
+        
+        for key in dynamic_keys:
+            if key in state:
+                state[key] = None # Sembunyikan dari deepcopy
+                
+        return state
+
+    def __setstate__(self, state):
+        """
+        Dipanggil otomatis setelah objek berhasil di-deepcopy.
+        Kita inisialisasi ulang variabel tersebut sebagai tensor aman (leaf tensors).
+        """
+        self.__dict__.update(state)
+        
+        # Bangkitkan kembali sebagai tensor aman yang tidak memblokir graph
+        self.loss_prob = torch.tensor(0.0)
+        self.current_activation_prob = torch.tensor(0.0)
+        self.last_entropy = torch.tensor(0.0)
+        self.last_conf = torch.tensor(0.0)
+        self.last_var = torch.tensor(0.0)
+        
+    # =========================================================
     # FORWARD
     # =========================================================
     def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
