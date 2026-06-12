@@ -2683,15 +2683,16 @@ class DifficultyAwareRouter(nn.Module):
 
         return output   
     
+
 class LightWeightDifficultyAwareRouter(nn.Module):
     """
     Router dinamis yang mengontrol aktivasi jalur P2 secara
     kondisional berdasarkan tingkat kesulitan visual input.
 
-    Arsitektur internal (PRUNED VERSION):
-        1. Z_visual : Conv1x1(F_P3) → GAP → (B, 16)  [SAM Dihapus]
+    Arsitektur internal (ULTRA-LIGHTWEIGHT + DECOUPLED MICRO-HEAD):
+        1. Z_visual : Conv1x1(F_P3) → GAP → (B, 16)  
         2. Z_low    : Conv1x1(F_P2) → GAP → (B, 16)
-        3. S        : statistik agregat (Top-K=10) → (B, 3)
+        3. S        : statistik agregat (Top-K=10) dari Decoupled Micro-Head → (B, 3)
         4. Z_in     : Concat + LayerNorm → (B, 35)
         5. MLP      : Z_in → 2 (Single-layer projection)
         6. Gate     : STE Gumbel-Softmax (train) / Hard (infer)
@@ -2719,32 +2720,46 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.warmup_epochs = warmup_epochs
 
         # =====================================================
-        # 🚨 PRUNING LANGKAH 1 & 2: Z_VISUAL (SAM Dihapus + Channel Pruning)
-        # c_p3 (256) -> direduksi ekstrem ke 16 channel -> GAP
+        # 1. KOMPONEN Z_VISUAL & Z_LOW (POINTWISE + GAP)
         # =====================================================
         self.c_visual = 16
         self.conv_visual = nn.Conv2d(c_p3, self.c_visual, 1, bias=False)
         self.gap = nn.AdaptiveAvgPool2d(1)
 
-        # =====================================================
-        # 🚨 PRUNING LANGKAH 2: Z_LOW (Channel Pruning)
-        # c_p2 (128) -> direduksi ekstrem ke 16 channel -> GAP
-        # =====================================================
         self.c_low = 16
         self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, bias=False)
 
         # =====================================================
-        # 3. PROXY FALLBACK
+        # 2. PROXY FALLBACK (DECOUPLED MICRO-HEAD)
+        # Meniru head YOLOv8 asli dengan Depthwise Convolution 
+        # untuk mempertahankan konteks spasial (3x3) tanpa beban berat.
         # =====================================================
+        hidden_c = max(c_p3 // 4, 32) # Reduksi ke 64 channel
+
+        # --- Micro Classification Head ---
         self.proxy_cls = nn.Sequential(
-            nn.Conv2d(c_p3, max(c_p3 // 2, 32), 3, padding=1, bias=False),
+            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=False), # Pointwise
+            nn.BatchNorm2d(hidden_c),
             nn.SiLU(),
-            nn.Conv2d(max(c_p3 // 2, 32), num_classes, 1)
+            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=False), # Depthwise
+            nn.BatchNorm2d(hidden_c),
+            nn.SiLU(),
+            nn.Conv2d(hidden_c, num_classes, kernel_size=1) # Output projection
         )
-        self.proxy_reg_dist = nn.Conv2d(c_p3, reg_max, 1)
+
+        # --- Micro Regression (DFL) Head ---
+        self.proxy_reg_dist = nn.Sequential(
+            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=False), # Pointwise
+            nn.BatchNorm2d(hidden_c),
+            nn.SiLU(),
+            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=False), # Depthwise
+            nn.BatchNorm2d(hidden_c),
+            nn.SiLU(),
+            nn.Conv2d(hidden_c, reg_max, kernel_size=1) # Output projection
+        )
 
         # =====================================================
-        # 4. C2F P2 — DI DALAM ROUTER
+        # 3. C2F P2 — DI DALAM ROUTER
         # =====================================================
         from ultralytics.nn.modules import C2f
         self.c2f_p2 = C2f(
@@ -2754,9 +2769,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         )
 
         # =====================================================
-        # 🚨 PRUNING LANGKAH 4: MLP ROUTER (Single-Layer)
-        # input_dim = 16 (visual) + 16 (low) + 3 (stats) = 35
-        # Arsitektur: 35 -> 2 (Langsung ke output, tanpa hidden layer)
+        # 4. MLP ROUTER (SINGLE-LAYER LINEAR)
         # =====================================================
         self.input_dim = self.c_visual + self.c_low + 3
         self.layer_norm = nn.LayerNorm(self.input_dim)
@@ -2803,7 +2816,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self._hook_handles = []
         
     # =========================================================
-    # HOOK METHODS 
+    # HOOK METHODS (Hanya untuk lag t-1 saat Cache aktif)
     # =========================================================
     def _hook_cls(self, module, input, output):
         with torch.no_grad():
@@ -2816,9 +2829,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             
             tensor_aman = tensor_aman.clamp(min=-20.0, max=20.0)
             B, C, H, W = tensor_aman.shape
-            
-            # 🚨 PRUNING LANGKAH 3: Fix Top-K = 10 (Sangat cepat di CPU)
-            K = 10 
+            K = 10 # Fix Top-K
             eps = 1e-5 
 
             if C == 1:
@@ -2845,9 +2856,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
     def _hook_reg(self, module, input, output):
         with torch.no_grad():
             B, _, H, W = output.shape
-            
-            # 🚨 PRUNING LANGKAH 3: Fix Top-K = 10
-            K = 10 
+            K = 10 # Fix Top-K
 
             reg_one   = output[:, :self.reg_max, :, :]
             dist_prob = torch.softmax(reg_one, dim=1)
@@ -2862,7 +2871,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             self._cached_dfl_var = per_sample.mean().item()
 
     # =========================================================
-    # NORMALISASI STABIL
+    # NORMALISASI STABIL & KOMPUTASI STATISTIK
     # =========================================================
     def _safe_normalize(self, stats: torch.Tensor) -> torch.Tensor:
         stats_fp32 = stats.float()
@@ -2897,9 +2906,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
     def _compute_stats(self, cls_logits: torch.Tensor, reg_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         eps = 1e-5 
         B = cls_logits.shape[0]
-        
-        # 🚨 PRUNING LANGKAH 3: Fix Top-K = 10
-        K = 10  
+        K = 10  # Fix Top-K
 
         if self.num_classes == 1:
             prob = torch.sigmoid(cls_logits)
@@ -2944,6 +2951,9 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             avg_conf = torch.full((B, 1), c_cache, device=device, dtype=dtype)
             dfl_var = torch.full((B, 1), v_cache, device=device, dtype=dtype)
         else:
+            # Karena user memutuskan Proxy selalu hidup saat inferensi:
+            # Tidak ada "if not self.training" bypass. 
+            # Decoupled Head akan selalu memproses ini.
             cls_logits = self.proxy_cls(f_p3)
             reg_logits = self.proxy_reg_dist(f_p3)
             avg_entropy, avg_conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
@@ -2954,12 +2964,16 @@ class LightWeightDifficultyAwareRouter(nn.Module):
     # FUNGSI UNTUK TENSORRT
     # =========================================================
     def compute_gate(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        """
+        Diisolasi untuk Engine A (Front-End TensorRT/ONNX).
+        Beban komputasi sangat ringan berkat Micro-Head DWConv.
+        """
         B = f_p3.shape[0]
 
-        # 🚨 PRUNING LANGKAH 1 & 2: Conv1x1 -> GAP
         z_visual = self.gap(self.conv_visual(f_p3)).view(B, -1)
         z_low = self.gap(self.conv_hint(f_p2_back)).view(B, -1)
 
+        # Proxy tetap hidup saat inferensi sesuai request
         cls_logits = self.proxy_cls(f_p3)
         reg_logits = self.proxy_reg_dist(f_p3)
         entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
@@ -2972,16 +2986,12 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
-        # 🚨 PRUNING LANGKAH 4: Eksekusi Single-Layer Linear 
         z_in_fp32 = z_in.float()
         ln_shape: List[int] = [self.input_dim] 
         
         z_norm_fp32 = F.layer_norm(
-            z_in_fp32, 
-            ln_shape,
-            self.layer_norm.weight.float(), 
-            self.layer_norm.bias.float(), 
-            self.layer_norm.eps
+            z_in_fp32, ln_shape,
+            self.layer_norm.weight.float(), self.layer_norm.bias.float(), self.layer_norm.eps
         )
 
         logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
@@ -3019,7 +3029,6 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         f_p3_detached = f_p3.detach()
         f_p2_back_detached = f_p2_back.detach()
 
-        # 🚨 PRUNING LANGKAH 1 & 2: Conv1x1 -> GAP
         z_visual = self.gap(self.conv_visual(f_p3_detached)).view(B, -1)
         z_low = self.gap(self.conv_hint(f_p2_back_detached)).view(B, -1)
 
@@ -3036,7 +3045,6 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
-        # 🚨 PRUNING LANGKAH 4: Single-Layer Linear (Murni FP32)
         z_in_fp32 = z_in.float()
         
         z_norm_fp32 = F.layer_norm(
