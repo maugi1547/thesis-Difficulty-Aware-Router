@@ -102,7 +102,7 @@ def hook_router_to_head(model):
     detect_head   = None
 
     for m in model.modules():
-        if m.__class__.__name__ == 'DifficultyAwareRouter':
+        if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter']:
             router_module = m
         elif m.__class__.__name__ == 'Detect':
             detect_head = m
