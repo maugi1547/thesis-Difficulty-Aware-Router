@@ -339,18 +339,7 @@ class v8DetectionLoss:
     def compute_router_loss(self, loss: torch.Tensor) -> torch.Tensor:
         """
         Hitung router penalty dan tambahkan ke index [3] dari tensor loss.
-        Fungsi ini memperluas tensor loss YOLOv8 dari ukuran (3,) menjadi (4,).
-
-        Formulasi Utama:
-            L_total = L_det + (λ_cost * P2_prob * L_hybrid) 
-        
-        L_hybrid terdiri dari dua komponen:
-            1. L_rel  (Relative Penalty)  : Mendorong aktivasi di bawah rata-rata historis (EMA).
-            2. W_diff (Difficulty Weight) : Diskon denda untuk sampel sulit (Local Intelligence).
         """
-        # ==========================================================
-        # 1. PENCARIAN ROUTER (DEEP SEARCH - ANTI WRAPPER ERROR)
-        # ==========================================================
         if not self.model.training:
             return loss
 
@@ -369,38 +358,24 @@ class v8DetectionLoss:
                 self._router_warned = True
             return loss
 
-
-        # ==========================================================
-        # 2. EXTEND TENSOR LOSS SECARA AMAN (DARI 3 KE 4 DIMENSI)
-        # ==========================================================
+        # Ekstensi Tensor Loss
         if loss.shape[0] == 3:
             router_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
             loss = torch.cat([loss, router_slot])
 
-        # ==========================================================
-        # 3. AMBIL PARAMETER KONTROL
-        # ==========================================================
         target_lambda = getattr(raw_model, 'router_penalty_lambda', 0.0)
-
-        # Ambil probabilitas SOFT (untuk backprop)
         val_for_loss = getattr(router, 'loss_prob', None)
-        
-        # Ambil probabilitas HARD (untuk dicetak jujur di terminal)
-        # Fallback ke val_for_loss jika current_activation_prob tidak ditemukan
         val_for_log = getattr(router, 'current_activation_prob', val_for_loss)
 
         if val_for_loss is None:
             return loss 
 
-        # Variabel p2_active_prob digunakan MUTLAK untuk hitungan matematika Loss
+        # 🚨 PERBAIKAN 1: Pastikan P2_prob selalu dalam bentuk Float32
         p2_active_prob = val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
+        p2_active_prob = p2_active_prob.float() 
         
-        # Variabel p2_log_prob HANYA untuk fungsi print()
         p2_log_prob = val_for_log.item() if torch.is_tensor(val_for_log) else float(val_for_log)
 
-        # ==========================================================
-        # 4. CEK FASE WARMUP
-        # ==========================================================
         is_warmup = getattr(router, '_is_warmup', False)
         if is_warmup:
             loss[3] = torch.tensor(0.0, device=loss.device, requires_grad=True)
@@ -408,81 +383,83 @@ class v8DetectionLoss:
 
         # ==========================================================
         # 5. HITUNG RELATIVE PENALTY (GLOBAL SPARSITY)
-        # Rumus: 
-        #   EMA_t = (β * EMA_{t-1}) + ((1 - β) * p_t)
-        #   L_rel = max(0, p_t - EMA_t)^2
         # ==========================================================
         if not hasattr(self, 'p2_running_avg'):
-            self.p2_running_avg = p2_active_prob.detach().clone()
+            self.p2_running_avg = p2_active_prob.detach().clone().float()
 
-        momentum = getattr(self, 'momentum', 0.9) # β = 0.9
+        momentum = getattr(self, 'momentum', 0.95) 
         
-        # Matematika: Update Exponential Moving Average (EMA)
         self.p2_running_avg = (momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach())
-        
-        # Matematika: Selisih probabilitas saat ini dengan rata-rata. 
-        # ReLU memotong nilai negatif (hanya didenda jika melampaui rata-rata historis).
-        # Dikuadratkan (MSE style) agar penalti tumbuh eksponensial jika pelanggaran besar.
         relative_diff = p2_active_prob - self.p2_running_avg
         relative_penalty = torch.relu(relative_diff) ** 2
+        
+        # Pengaman L_rel dari NaN
+        relative_penalty = torch.nan_to_num(relative_penalty, nan=0.0)
 
         # ==========================================================
-        # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE)
-        # Tujuan: Mendapatkan nilai bobot W_diff ∈ [0.1, 2.0]
+        # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE) - ANTI NaN
         # ==========================================================
-        difficulty_weight = torch.tensor(1.0, device=loss.device)
+        # Default aman jika terjadi kegagalan sistem
+        difficulty_weight = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
+        
         try:
-            entropy = getattr(router, 'last_entropy', None) # H
-            conf    = getattr(router, 'last_conf', None)    # C
-            var     = getattr(router, 'last_var', None)     # V
+            entropy = getattr(router, 'last_entropy', None)
+            conf    = getattr(router, 'last_conf', None)
+            var     = getattr(router, 'last_var', None)
 
             if all(v is not None for v in [entropy, conf, var]):
-                # Matematika: Skor Kesulitan (D)
-                # D = H + V - C
-                # Logika: Gambar sulit = Entropi tinggi, Varians spasial tinggi, Confidence Head rendah.
-                diff_score = (entropy + var - conf).detach()
-                batch_d_mean = diff_score.mean() # μ_batch
+                # 🚨 PERBAIKAN 2: Paksa murni ke FP32 untuk mencegah overflow
+                entropy_f = entropy.detach().float()
+                conf_f    = conf.detach().float()
+                var_f     = var.detach().float()
+                
+                # Sabuk pengaman 1: netralisir jika ternyata input sudah NaN
+                entropy_f = torch.nan_to_num(entropy_f, nan=0.0)
+                conf_f    = torch.nan_to_num(conf_f, nan=0.0)
+                var_f     = torch.nan_to_num(var_f, nan=0.0)
 
-                # Inisialisasi EMA untuk Mean (μ) dan Variance (σ^2)
+                diff_score = entropy_f + var_f - conf_f
+                batch_d_mean = diff_score.mean()
+
                 if not hasattr(self, 'diff_run_mean'):
                     self.diff_run_mean = batch_d_mean.clone()
-                    self.diff_run_var = torch.tensor(1.0, device=loss.device) 
+                    self.diff_run_var = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
 
-                # Matematika: Update Welford's EMA untuk Mean dan Variance
-                # μ_t = (β * μ_{t-1}) + ((1 - β) * μ_batch)
+                self.diff_run_mean = self.diff_run_mean.float()
+                self.diff_run_var = self.diff_run_var.float()
+
                 self.diff_run_mean = (momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean)
                 
-                # σ^2_t = (β * σ^2_{t-1}) + ((1 - β) * (μ_batch - μ_t)^2)
+                # 🚨 PERBAIKAN 3: Hitung Variance dengan aman di FP32
                 curr_var = (batch_d_mean - self.diff_run_mean) ** 2
                 self.diff_run_var = (momentum * self.diff_run_var + (1 - momentum) * curr_var)
 
-                # Matematika: Normalisasi Z-Score
-                # Z = (D - μ_t) / sqrt(σ^2_t)
-                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-5) # Mencegah pembagian dengan 0
+                # Batas min dinaikkan ke 1e-4 agar root(var) benar-benar jauh dari 0
+                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4) 
+                
                 diff_score_norm = (diff_score - self.diff_run_mean) / d_std_global
+                
+                # 🚨 PERBAIKAN 4: Sabuk Pengaman Z-Score sebelum Eksponensial!
+                # Jika nilai Z sangat ekstrem (misal -30), exp(30) akan menjadi Inf.
+                # Kita pasung nilai Z-score di ambang wajar [-10.0, 10.0]
+                diff_score_norm = torch.clamp(diff_score_norm, min=-10.0, max=10.0)
+                diff_score_norm = torch.nan_to_num(diff_score_norm, nan=0.0)
 
-                # Matematika: Fungsi Pemetaan Eksponensial Terbalik
-                # W_diff = exp(-Z)
-                # Jika Z positif (gambar lebih sulit dari rata-rata), exp(-Z) < 1 -> Denda diringankan (Diskon).
-                # Jika Z negatif (gambar lebih mudah dari rata-rata), exp(-Z) > 1 -> Denda diperberat.
-                # Clamp [0.1, 2.0] agar diskon/hukuman tidak meledak tak terhingga.
+                # Hitung diskon/hukuman akhir
                 difficulty_weight = torch.exp(-diff_score_norm).clamp(0.1, 2.0).mean()
 
         except Exception as e:
-            # Silently fallback ke bobot netral 1.0 jika perhitungan gagal
             pass 
 
         # ==========================================================
         # 7. HITUNG TOTAL HYBRID ROUTER LOSS
-        # Rumus: 
-        #   L_hybrid = (α * L_rel) + ((1 - α) * W_diff)
-        #   Loss_router = λ * p * L_hybrid
         # ==========================================================
-        alpha = getattr(self, 'alpha', 0.5) # Pembobot keseimbangan (default 50-50)
+        alpha = getattr(self, 'alpha', 0.5) 
         hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
         
-        # PERHITUNGAN FINAL:
-        loss[3] = target_lambda * p2_active_prob * hybrid_weight
+        # 🚨 PERBAIKAN 5: Pastikan final dikembalikan ke tipe asal (FP16)
+        final_router_loss = target_lambda * p2_active_prob * hybrid_weight
+        loss[3] = final_router_loss.to(loss.dtype)
 
         # ==========================================================
         # 8. DEBUGGING LOG (TERMINAL) & MEMORY BUFFERING (CSV)
@@ -492,38 +469,27 @@ class v8DetectionLoss:
             
         self.debug_counter += 1
 
-        # --- MATEMATIKA ABSOLUT UNTUK EPOCH & BATCH ---
-        
-        # Ambil total batch yang disuntikkan dari Kaggle
-        TOTAL_BATCHES = getattr(self.model, 'total_batches') 
+        TOTAL_BATCHES = getattr(self.model, 'total_batches', 324) 
         
         current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 4
         current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
-        # --- EKSTRAK NILAI ---
+        
         val_lambda = float(target_lambda)
         val_p2_prob = p2_log_prob.item() if isinstance(p2_log_prob, torch.Tensor) else p2_log_prob
         val_rel = relative_penalty.item() if isinstance(relative_penalty, torch.Tensor) else relative_penalty
         val_diff = difficulty_weight.item() if isinstance(difficulty_weight, torch.Tensor) else difficulty_weight
         val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
-        # --- TAMPILAN TERMINAL ---
         if self.debug_counter % 100 == 0:
             print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
                   f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
 
-        # --- BUFFER RAM UNTUK CSV ---
         if not hasattr(self.model, 'router_buffer'):
             self.model.router_buffer = []
 
-        # Data bersih, format standar (desimal titik)
         val_data = [
-            current_epoch, 
-            current_batch, 
-            f"{val_lambda:.4f}", 
-            f"{val_p2_prob:.6f}", 
-            f"{val_rel:.6f}", 
-            f"{val_diff:.6f}", 
-            f"{val_final_l3:.6f}"
+            current_epoch, current_batch, f"{val_lambda:.4f}", 
+            f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}"
         ]
 
         self.model.router_buffer.append(val_data)
