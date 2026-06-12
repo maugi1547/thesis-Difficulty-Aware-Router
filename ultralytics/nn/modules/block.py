@@ -3045,6 +3045,9 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
+        # =================================================
+        # LANGKAH 2: MLP → LOGITS (PURE FP32 EXECUTION)
+        # =================================================
         z_in_fp32 = z_in.float()
         
         z_norm_fp32 = F.layer_norm(
@@ -3056,19 +3059,29 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         )
 
         logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
-        logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
+        
+        # 🚨 PERBAIKAN PENTING: Tahan variabel ini tetap di FP32!
+        # Jangan langsung di- .to(f_p3.dtype)
+        logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
+        # =================================================
+        # LANGKAH 3: KEPUTUSAN GATE
+        # =================================================
         tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
 
         if self.training:
-            soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=1)
+            # 🚨 PERBAIKAN PENTING: Eksekusi Gumbel di FP32 agar bebas dari kutukan NaN Log(0)
+            soft_fp32 = F.gumbel_softmax(logits_safe_fp32, tau=tau, hard=False, dim=1)
+            
+            # Baru kembalikan ke tipe asal (FP16) setelah operasi Gumbel selesai
+            soft = soft_fp32.to(f_p3.dtype) 
             
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0 
                 
-                gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1)
+                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1)
                 
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
                 self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
@@ -3076,10 +3089,11 @@ class LightWeightDifficultyAwareRouter(nn.Module):
                 hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
                 
                 gate_onehot = hard - soft.detach() + soft
-                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
-                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1).to(f_p3.dtype)
+                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1)
+                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1)
                 
-                self.loss_prob = F.softmax(logits.float(), dim=1)[:, 1].mean()
+                # 🚨 PERBAIKAN PENTING: Hitung loss_prob juga dari FP32 yang aman
+                self.loss_prob = F.softmax(logits_safe_fp32, dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
             f_p3_up = self.upsample(f_p3)
