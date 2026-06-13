@@ -2730,32 +2730,37 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, bias=False)
 
         # =====================================================
-        # 2. PROXY FALLBACK (DECOUPLED MICRO-HEAD)
-        # Meniru head YOLOv8 asli dengan Depthwise Convolution 
-        # untuk mempertahankan konteks spasial (3x3) tanpa beban berat.
+        # 2. PROXY FALLBACK (ULTRA-LIGHT DECOUPLED MICRO-HEAD)
         # =====================================================
-        hidden_c = max(c_p3 // 4, 32) # Reduksi ke 64 channel
+        # 🚨 OPTIMASI 1: Spatial Downsampling Ekstrem (80x80 -> 20x20)
+        # Menurunkan beban komputasi proxy hingga 16x lipat!
+        self.proxy_pool = nn.MaxPool2d(kernel_size=4, stride=4)
+
+        # 🚨 OPTIMASI 2: Extreme Channel Reduction (256 -> 32 channel)
+        hidden_c = max(c_p3 // 8, 16) 
+
+        # 🚨 OPTIMASI 3: Shared Stem (Satu Conv 1x1 untuk 2 Head)
+        # Daripada melakukan reduksi channel dua kali, kita lakukan sekali
+        self.proxy_stem = nn.Sequential(
+            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_c),
+            nn.SiLU()
+        )
 
         # --- Micro Classification Head ---
         self.proxy_cls = nn.Sequential(
-            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=False), # Pointwise
-            nn.BatchNorm2d(hidden_c),
-            nn.SiLU(),
             nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=False), # Depthwise
             nn.BatchNorm2d(hidden_c),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, num_classes, kernel_size=1) # Output projection
+            nn.Conv2d(hidden_c, num_classes, kernel_size=1) 
         )
 
         # --- Micro Regression (DFL) Head ---
         self.proxy_reg_dist = nn.Sequential(
-            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=False), # Pointwise
-            nn.BatchNorm2d(hidden_c),
-            nn.SiLU(),
             nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=False), # Depthwise
             nn.BatchNorm2d(hidden_c),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, reg_max, kernel_size=1) # Output projection
+            nn.Conv2d(hidden_c, reg_max, kernel_size=1) 
         )
 
         # =====================================================
@@ -2954,8 +2959,14 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             # Karena user memutuskan Proxy selalu hidup saat inferensi:
             # Tidak ada "if not self.training" bypass. 
             # Decoupled Head akan selalu memproses ini.
-            cls_logits = self.proxy_cls(f_p3)
-            reg_logits = self.proxy_reg_dist(f_p3)
+            # 🚨 Alirkan ke Spatial Pool lalu ke Shared Stem
+            f_p3_pooled = self.proxy_pool(f_p3)
+            stem_out = self.proxy_stem(f_p3_pooled)
+            
+            # 🚨 Baru sebarkan ke masing-masing micro-head
+            cls_logits = self.proxy_cls(stem_out)
+            reg_logits = self.proxy_reg_dist(stem_out)
+            
             avg_entropy, avg_conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
 
         return avg_entropy, avg_conf, dfl_var

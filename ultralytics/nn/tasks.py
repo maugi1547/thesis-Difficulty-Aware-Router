@@ -1746,6 +1746,22 @@ def parse_model(d, ch, verbose=True):
         if i == 0:
             ch = []
         ch.append(c2)
+    
+    # =====================================================================
+    # 🚨 TESIS AGUNG: SUNTIKKAN FLAG BYPASS KE DETECT HEAD (DYNAMIC ROUTER)
+    # =====================================================================
+    # 1. Cek apakah ada Router di dalam tumpukan arsitektur model ini
+    has_router = any(m.type in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter'] for m in layers)
+    
+    # 2. Jika ada, cari modul Detect dan aktifkan fitur penghematan GFLOPs
+    if has_router:
+        for m in layers:
+            if m.type in ['Detect', 'Segment', 'Pose', 'OBB']:
+                # Suntikkan atribut ini langsung ke dalam memori class Detect
+                m.use_dynamic_bypass = True 
+                if verbose:
+                    LOGGER.info(f"⚡ [INFO] Detect Head: Dynamic Bypass AKTIF (Model Router terdeteksi).")
+
     return torch.nn.Sequential(*layers), sorted(save)
 
 

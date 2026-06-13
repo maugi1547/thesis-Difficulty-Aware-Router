@@ -86,10 +86,15 @@ class Detect(nn.Module):
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
-        self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+        self.reg_max = 16  # DFL channels
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        
+        # 🚨 TESIS: Simpan referensi arsitektur keluaran konvolusi untuk Bypass
+        self.c2_out_channels = 4 * self.reg_max
+        self.c3_out_channels = self.nc
+
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
@@ -116,10 +121,34 @@ class Detect(nn.Module):
         if self.end2end:
             return self.forward_end2end(x)
 
+        shape = x[0].shape  # BCHW (Batch, Channels, Height, Width)
+
         for i in range(self.nl):
+            # =========================================================
+            # 🚨 TESIS AGUNG: DETECT HEAD BYPASS (DYNAMIC ROUTING)
+            # =========================================================
+            # Pengaman 1: Cek apakah model ini menggunakan Dynamic Router
+            # (Flag ini akan disuntikkan dari luar saat inisialisasi)
+            is_dynamic_router = getattr(self, 'use_dynamic_bypass', False)
+
+            # Pengaman 2: Inferensi + Tensor Nol
+            if is_dynamic_router and not self.training and x[i].abs().max() == 0.0:
+                B, _, H, W = x[i].shape
+                total_out_channels = self.c2_out_channels + self.c3_out_channels
+                
+                x[i] = torch.zeros(
+                    (B, total_out_channels, H, W), 
+                    device=x[i].device, 
+                    dtype=x[i].dtype
+                )
+                continue  
+            
+            # --- EKSEKUSI NORMAL ---
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+
         if self.training:  # Training path
             return x
+            
         y = self._inference(x)
         return y if self.export else (y, x)
 
