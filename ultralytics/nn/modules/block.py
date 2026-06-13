@@ -2956,15 +2956,12 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             avg_conf = torch.full((B, 1), c_cache, device=device, dtype=dtype)
             dfl_var = torch.full((B, 1), v_cache, device=device, dtype=dtype)
         else:
-            # Karena user memutuskan Proxy selalu hidup saat inferensi:
-            # Tidak ada "if not self.training" bypass. 
-            # Decoupled Head akan selalu memproses ini.
-            # 🚨 Alirkan ke Spatial Pool lalu ke Shared Stem
-            f_p3_pooled = self.proxy_pool(f_p3)
-            stem_out = self.proxy_stem(f_p3_pooled)
+            # 🚨 PERBAIKAN: Gunakan Pool dan Stem yang sudah kita buat!
+            f_p3_pooled = self.proxy_pool(f_p3) # Ciutkan 80x80 -> 20x20
+            stem_out = self.proxy_stem(f_p3_pooled) # Reduksi 64ch -> 16ch
             
-            # 🚨 Baru sebarkan ke masing-masing micro-head
-            cls_logits = self.proxy_cls(stem_out)
+            # Sebarkan hasil stem ke kedua micro-head
+            cls_logits = self.proxy_cls(stem_out) 
             reg_logits = self.proxy_reg_dist(stem_out)
             
             avg_entropy, avg_conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
@@ -2984,9 +2981,13 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         z_visual = self.gap(self.conv_visual(f_p3)).view(B, -1)
         z_low = self.gap(self.conv_hint(f_p2_back)).view(B, -1)
 
-        # Proxy tetap hidup saat inferensi sesuai request
-        cls_logits = self.proxy_cls(f_p3)
-        reg_logits = self.proxy_reg_dist(f_p3)
+        # 🚨 PERBAIKAN: Gunakan Pool dan Stem untuk Inferensi Statis juga!
+        f_p3_pooled = self.proxy_pool(f_p3)
+        stem_out = self.proxy_stem(f_p3_pooled)
+        
+        cls_logits = self.proxy_cls(stem_out)
+        reg_logits = self.proxy_reg_dist(stem_out)
+        
         entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
 
         stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
