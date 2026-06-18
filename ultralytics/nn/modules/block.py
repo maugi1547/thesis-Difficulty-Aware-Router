@@ -2804,10 +2804,13 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self._cached_dfl_var = -1.0 
         self._hook_handles   = []
 
-        self._running_mean      = torch.zeros(3)  
-        self._running_std       = torch.ones(3)   
-        self._ema_momentum      = 0.99
-        self._stats_initialized = False
+        self._ema_momentum = 0.99
+        
+        # 🚨 PERBAIKAN: Gunakan register_buffer agar ikut tersimpan di best.pt
+        self.register_buffer('_running_mean', torch.zeros(3))
+        self.register_buffer('_running_std', torch.ones(3))
+        self.register_buffer('_stats_initialized', torch.tensor(0, dtype=torch.uint8))
+        
         self.stats_weight = nn.Parameter(torch.ones(1, 3))
 
     def set_epoch(self, epoch: int):
@@ -2885,22 +2888,17 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             batch_mean = stats_fp32.mean(dim=0)
             batch_std  = stats_fp32.std(dim=0, unbiased=False).clamp(min=1e-4)
 
-            if not self._stats_initialized:
-                self._running_mean = batch_mean.clone()
-                self._running_std  = batch_std.clone()
-                self._stats_initialized = True
+            # _stats_initialized sekarang adalah tensor (0 atau 1)
+            if self._stats_initialized.item() == 0:
+                self._running_mean.copy_(batch_mean)
+                self._running_std.copy_(batch_std)
+                self._stats_initialized.fill_(1)
             else:
                 m = self._ema_momentum
-                curr_mean = self._running_mean.to(device=stats.device, dtype=torch.float32)
-                curr_std  = self._running_std.to(device=stats.device, dtype=torch.float32)
-                
-                self._running_mean = (m * curr_mean + (1 - m) * batch_mean)
-                self._running_std = (m * curr_std + (1 - m) * batch_std)
+                self._running_mean.copy_(m * self._running_mean + (1 - m) * batch_mean)
+                self._running_std.copy_(m * self._running_std + (1 - m) * batch_std)
 
-        curr_mean_stable = self._running_mean.to(device=stats.device, dtype=torch.float32)
-        curr_std_stable  = self._running_std.to(device=stats.device, dtype=torch.float32).clamp(min=1e-4)
-        
-        stats_norm = (stats_fp32 - curr_mean_stable) / curr_std_stable
+        stats_norm = (stats_fp32 - self._running_mean) / self._running_std
         return stats_norm.clamp(-3.0, 3.0).to(stats.dtype)
 
     def _topk_mean(self, t4d: torch.Tensor, B: int, K: int) -> torch.Tensor:
