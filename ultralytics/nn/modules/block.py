@@ -2688,15 +2688,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
     """
     Router dinamis yang mengontrol aktivasi jalur P2 secara
     kondisional berdasarkan tingkat kesulitan visual input.
-
-    Arsitektur internal (ULTRA-LIGHTWEIGHT + DECOUPLED MICRO-HEAD):
-        1. Z_visual : Conv1x1(F_P3) → GAP → (B, 16)  
-        2. Z_low    : Conv1x1(F_P2) → GAP → (B, 16)
-        3. S        : statistik agregat (Top-K=10) dari Decoupled Micro-Head → (B, 3)
-        4. Z_in     : Concat + LayerNorm → (B, 35)
-        5. MLP      : Z_in → 2 (Single-layer projection)
-        6. Gate     : STE Gumbel-Softmax (train) / Hard (infer)
-        7. C2f P2   : di dalam router → true skip saat gate=0
+    Versi: STATELESS (Anti-Amnesia, Anti-BatchNorm, Fix 100% Activation Bug, ONNX-Ready)
     """
 
     def __init__(
@@ -2720,7 +2712,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.warmup_epochs = warmup_epochs
 
         # =====================================================
-        # 1. KOMPONEN Z_VISUAL & Z_LOW (POINTWISE + GAP)
+        # 1. KOMPONEN Z_VISUAL & Z_LOW
         # =====================================================
         self.c_visual = 16
         self.conv_visual = nn.Conv2d(c_p3, self.c_visual, 1, bias=False)
@@ -2730,52 +2722,34 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, bias=False)
 
         # =====================================================
-        # 2. PROXY FALLBACK (ULTRA-LIGHT DECOUPLED MICRO-HEAD)
+        # 2. STATELESS PROXY HEAD (TANPA BATCHNORM!)
         # =====================================================
-        # 🚨 OPTIMASI 1: Spatial Downsampling Ekstrem (80x80 -> 20x20)
-        # Menurunkan beban komputasi proxy hingga 16x lipat!
         self.proxy_pool = nn.MaxPool2d(kernel_size=4, stride=4)
-
-        # 🚨 OPTIMASI 2: Extreme Channel Reduction (256 -> 32 channel)
         hidden_c = max(c_p3 // 8, 16) 
 
-        # 🚨 OPTIMASI 3: Shared Stem (Satu Conv 1x1 untuk 2 Head)
-        # Daripada melakukan reduksi channel dua kali, kita lakukan sekali
+        # 🚨 BatchNorm dihapus, bias diubah menjadi True
         self.proxy_stem = nn.Sequential(
-            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hidden_c),
+            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=True),
             nn.SiLU()
         )
 
-        # --- Micro Classification Head ---
         self.proxy_cls = nn.Sequential(
-            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=False), # Depthwise
-            nn.BatchNorm2d(hidden_c),
+            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, num_classes, kernel_size=1) 
+            nn.Conv2d(hidden_c, num_classes, kernel_size=1, bias=True) 
         )
 
-        # --- Micro Regression (DFL) Head ---
         self.proxy_reg_dist = nn.Sequential(
-            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=False), # Depthwise
-            nn.BatchNorm2d(hidden_c),
+            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, reg_max, kernel_size=1) 
+            nn.Conv2d(hidden_c, reg_max, kernel_size=1, bias=True) 
         )
 
         # =====================================================
-        # 3. C2F P2 — DI DALAM ROUTER
+        # 3. C2F P2 & MLP ROUTER
         # =====================================================
-        from ultralytics.nn.modules import C2f
-        self.c2f_p2 = C2f(
-            c_p3 + c_p2, c2f_out,
-            n=n_bottleneck,
-            shortcut=shortcut
-        )
+        self.c2f_p2 = C2f(c_p3 + c_p2, c2f_out, n=n_bottleneck, shortcut=shortcut)
 
-        # =====================================================
-        # 4. MLP ROUTER (SINGLE-LAYER LINEAR)
-        # =====================================================
         self.input_dim = self.c_visual + self.c_low + 3
         self.layer_norm = nn.LayerNorm(self.input_dim)
         
@@ -2786,120 +2760,29 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
 
         # =====================================================
-        # STATE TRAINING & HOOK CACHE
+        # 4. STATIC SCALER (Pengganti _running_mean / _safe_normalize)
+        # =====================================================
+        # Nilai maksimal yang mungkin dicapai oleh masing-masing statistik
+        self.max_entropy = math.log(num_classes) if num_classes > 1 else math.log(2)
+        self.max_var = float(reg_max)
+        self.stats_weight = nn.Parameter(torch.ones(1, 3))
+
+        # =====================================================
+        # STATE & VARIABEL DINAMIS
         # =====================================================
         self.current_epoch = 0
         self._is_warmup    = True
-        self.force_active  = True  
 
+        # Variabel untuk pencatatan (Disembunyikan dari deepcopy)
         self.current_activation_prob = torch.tensor(0.0)
         self.loss_prob    = torch.tensor(0.0)
         self.last_entropy = torch.tensor(0.0)
         self.last_conf    = torch.tensor(0.0)
         self.last_var     = torch.tensor(0.0)
 
-        self.use_hook_cache = False
-        self._cached_entropy = -1.0 
-        self._cached_conf    = -1.0 
-        self._cached_dfl_var = -1.0 
-        self._hook_handles   = []
-
-        self._ema_momentum = 0.99
-        
-        # 🚨 PERBAIKAN: Gunakan register_buffer agar ikut tersimpan di best.pt
-        self.register_buffer('_running_mean', torch.zeros(3))
-        self.register_buffer('_running_std', torch.ones(3))
-        self.register_buffer('_stats_initialized', torch.tensor(0, dtype=torch.uint8))
-        
-        self.stats_weight = nn.Parameter(torch.ones(1, 3))
-
     def set_epoch(self, epoch: int):
         self.current_epoch = epoch
         self._is_warmup   = (epoch < self.warmup_epochs)
-        self.force_active = self._is_warmup
-
-    def remove_hooks(self):
-        for h in self._hook_handles:
-            h.remove()
-        self._hook_handles = []
-        
-    # =========================================================
-    # HOOK METHODS (Hanya untuk lag t-1 saat Cache aktif)
-    # =========================================================
-    def _hook_cls(self, module, input, output):
-        with torch.no_grad():
-            tensor_aman = output.detach().float()
-            
-            if not self.training:
-                if tensor_aman.max() <= 1.0 and tensor_aman.min() >= 0.0:
-                    tensor_aman = tensor_aman.clamp(min=1e-5, max=1.0 - 1e-5)
-                    tensor_aman = torch.log(tensor_aman / (1.0 - tensor_aman))
-            
-            tensor_aman = tensor_aman.clamp(min=-20.0, max=20.0)
-            B, C, H, W = tensor_aman.shape
-            K = 10 # Fix Top-K
-            eps = 1e-5 
-
-            if C == 1:
-                prob = torch.sigmoid(tensor_aman)
-                prob_safe = prob.clamp(min=eps, max=1.0 - eps)
-                entropy_map = -(prob_safe * torch.log(prob_safe) + (1 - prob_safe) * torch.log(1 - prob_safe))
-                unc_conf = 1 - prob
-            else:
-                prob = torch.softmax(tensor_aman, dim=1)
-                prob_safe = prob.clamp(min=eps, max=1.0)
-                entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
-                unc_conf = 1 - prob.max(dim=1, keepdim=True).values
-
-            flat_e = entropy_map.view(B, 1, -1)
-            topk_e, _ = torch.topk(flat_e, k=K, dim=-1)
-            per_sample_e = (0.7 * topk_e.mean(dim=-1) + 0.3 * flat_e.mean(dim=-1))
-            self._cached_entropy = per_sample_e.mean().item()
-
-            flat_c = unc_conf.view(B, 1, -1)
-            topk_c, _ = torch.topk(flat_c, k=K, dim=-1)
-            per_sample_c = (0.7 * topk_c.mean(dim=-1) + 0.3 * flat_c.mean(dim=-1))
-            self._cached_conf = per_sample_c.mean().item()
-
-    def _hook_reg(self, module, input, output):
-        with torch.no_grad():
-            B, _, H, W = output.shape
-            K = 10 # Fix Top-K
-
-            reg_one   = output[:, :self.reg_max, :, :]
-            dist_prob = torch.softmax(reg_one, dim=1)
-            bins      = torch.arange(self.reg_max, device=output.device, dtype=output.dtype).view(1, self.reg_max, 1, 1)
-
-            y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
-            var_map = (dist_prob * (bins - y_hat) ** 2).sum(dim=1, keepdim=True)
-
-            flat    = var_map.view(B, 1, -1)
-            topk, _ = torch.topk(flat, k=K, dim=-1)
-            per_sample = (0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1))
-            self._cached_dfl_var = per_sample.mean().item()
-
-    # =========================================================
-    # NORMALISASI STABIL & KOMPUTASI STATISTIK
-    # =========================================================
-    def _safe_normalize(self, stats: torch.Tensor) -> torch.Tensor:
-        stats_fp32 = stats.float()
-
-        with torch.no_grad():
-            batch_mean = stats_fp32.mean(dim=0)
-            batch_std  = stats_fp32.std(dim=0, unbiased=False).clamp(min=1e-4)
-
-            # _stats_initialized sekarang adalah tensor (0 atau 1)
-            if self._stats_initialized.item() == 0:
-                self._running_mean.copy_(batch_mean)
-                self._running_std.copy_(batch_std)
-                self._stats_initialized.fill_(1)
-            else:
-                m = self._ema_momentum
-                self._running_mean.copy_(m * self._running_mean + (1 - m) * batch_mean)
-                self._running_std.copy_(m * self._running_std + (1 - m) * batch_std)
-
-        stats_norm = (stats_fp32 - self._running_mean) / self._running_std
-        return stats_norm.clamp(-3.0, 3.0).to(stats.dtype)
 
     def _topk_mean(self, t4d: torch.Tensor, B: int, K: int) -> torch.Tensor:
         flat = t4d.view(B, 1, -1)
@@ -2909,7 +2792,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
     def _compute_stats(self, cls_logits: torch.Tensor, reg_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         eps = 1e-5 
         B = cls_logits.shape[0]
-        K = 10  # Fix Top-K
+        K = 10 
 
         if self.num_classes == 1:
             prob = torch.sigmoid(cls_logits)
@@ -2935,84 +2818,14 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         return avg_entropy, avg_conf, dfl_var
 
     def _get_uncertainty_signals(self, f_p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B      = f_p3.shape[0]
-        device = f_p3.device
-        dtype  = f_p3.dtype
-
-        e_val = self._cached_entropy if self._cached_entropy is not None else -1.0
-        c_val = self._cached_conf if self._cached_conf is not None else -1.0
-        v_val = self._cached_dfl_var if self._cached_dfl_var is not None else -1.0
-
-        e_cache = torch.as_tensor(e_val, device=device, dtype=dtype)
-        c_cache = torch.as_tensor(c_val, device=device, dtype=dtype)
-        v_cache = torch.as_tensor(v_val, device=device, dtype=dtype)
-
-        cache_ready = (self.use_hook_cache and e_cache >= 0.0 and c_cache >= 0.0 and v_cache >= 0.0)
-
-        if cache_ready:
-            avg_entropy = torch.full((B, 1), e_cache, device=device, dtype=dtype)
-            avg_conf = torch.full((B, 1), c_cache, device=device, dtype=dtype)
-            dfl_var = torch.full((B, 1), v_cache, device=device, dtype=dtype)
-        else:
-            # 🚨 PERBAIKAN: Gunakan Pool dan Stem yang sudah kita buat!
-            f_p3_pooled = self.proxy_pool(f_p3) # Ciutkan 80x80 -> 20x20
-            stem_out = self.proxy_stem(f_p3_pooled) # Reduksi 64ch -> 16ch
-            
-            # Sebarkan hasil stem ke kedua micro-head
-            cls_logits = self.proxy_cls(stem_out) 
-            reg_logits = self.proxy_reg_dist(stem_out)
-            
-            avg_entropy, avg_conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
-
-        return avg_entropy, avg_conf, dfl_var
-
-    # =========================================================
-    # FUNGSI UNTUK TENSORRT
-    # =========================================================
-    def compute_gate(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
-        """
-        Diisolasi untuk Engine A (Front-End TensorRT/ONNX).
-        Beban komputasi sangat ringan berkat Micro-Head DWConv.
-        """
-        B = f_p3.shape[0]
-
-        z_visual = self.gap(self.conv_visual(f_p3)).view(B, -1)
-        z_low = self.gap(self.conv_hint(f_p2_back)).view(B, -1)
-
-        # 🚨 PERBAIKAN: Gunakan Pool dan Stem untuk Inferensi Statis juga!
         f_p3_pooled = self.proxy_pool(f_p3)
         stem_out = self.proxy_stem(f_p3_pooled)
         
-        cls_logits = self.proxy_cls(stem_out)
+        cls_logits = self.proxy_cls(stem_out) 
         reg_logits = self.proxy_reg_dist(stem_out)
         
-        entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
+        return self._compute_stats(cls_logits, reg_logits)
 
-        stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
-        stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        stats_norm = self._safe_normalize(stats_raw)
-        stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
-
-        z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
-
-        z_in_fp32 = z_in.float()
-        ln_shape: List[int] = [self.input_dim] 
-        
-        z_norm_fp32 = F.layer_norm(
-            z_in_fp32, ln_shape,
-            self.layer_norm.weight.float(), self.layer_norm.bias.float(), self.layer_norm.eps
-        )
-
-        logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
-        logits = (3.0 * torch.tanh(logits_fp32 / 3.0)).to(f_p3.dtype)
-
-        probs = F.softmax(logits.float(), dim=1) 
-        gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1)
-
-        return gate_mask
-
-    @torch.jit.export
     def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
         f_p3_up = self.upsample(f_p3)
         f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
@@ -3021,44 +2834,18 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         chunk1, chunk2 = torch.chunk(cv1_out, 2, dim=1)
         m_out = self.c2f_p2.m[0](chunk2)
         concat_out = torch.cat((chunk1, chunk2, m_out), dim=1)
-        f_c2f_final = self.c2f_p2.cv2(concat_out)
-        
-        return f_c2f_final
-    
-    # =========================================================
-    # PYTORCH DEEPCOPY FIX (UNTUK YOLOv8 NaN RECOVERY)
-    # =========================================================
+        return self.c2f_p2.cv2(concat_out)
+
     def __getstate__(self):
-        """
-        Dipanggil otomatis oleh PyTorch saat deepcopy() / YOLO recovery.
-        Kita harus menghapus tensor yang memiliki gradient graph (non-leaf)
-        agar deepcopy tidak crash.
-        """
         state = self.__dict__.copy()
-        
-        # Daftar variabel dinamis yang mengikat computation graph
-        dynamic_keys = [
-            'loss_prob', 
-            'current_activation_prob', 
-            'last_entropy', 
-            'last_conf', 
-            'last_var'
-        ]
-        
+        dynamic_keys = ['loss_prob', 'current_activation_prob', 'last_entropy', 'last_conf', 'last_var']
         for key in dynamic_keys:
             if key in state:
-                state[key] = None # Sembunyikan dari deepcopy
-                
+                state[key] = None 
         return state
 
     def __setstate__(self, state):
-        """
-        Dipanggil otomatis setelah objek berhasil di-deepcopy.
-        Kita inisialisasi ulang variabel tersebut sebagai tensor aman (leaf tensors).
-        """
         self.__dict__.update(state)
-        
-        # Bangkitkan kembali sebagai tensor aman yang tidak memblokir graph
         self.loss_prob = torch.tensor(0.0)
         self.current_activation_prob = torch.tensor(0.0)
         self.last_entropy = torch.tensor(0.0)
@@ -3066,64 +2853,58 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.last_var = torch.tensor(0.0)
         
     # =========================================================
-    # FORWARD
+    # FORWARD (STATELESS SCALING & INLINED GATE COMPUTATION)
     # =========================================================
     def forward(self, x: List[torch.Tensor]) -> torch.Tensor:
         f_p3 = x[0]
         f_p2_back = x[1]
         B = f_p3.shape[0]
-        dim_shape = f_p2_back.shape 
-        H2 = dim_shape[2]
-        W2 = dim_shape[3]
 
+        # 1. Z_VISUAL & Z_LOW
         f_p3_detached = f_p3.detach()
         f_p2_back_detached = f_p2_back.detach()
 
         z_visual = self.gap(self.conv_visual(f_p3_detached)).view(B, -1)
         z_low = self.gap(self.conv_hint(f_p2_back_detached)).view(B, -1)
 
+        # 2. DAPATKAN STATISTIK MENTAH
         entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3)
-        self.last_entropy = entropy.detach()
-        self.last_conf    = conf.detach()
-        self.last_var     = dfl_var.detach()
-
-        stats_raw = torch.cat([entropy, conf, dfl_var], dim=1)
-        stats_raw = torch.nan_to_num(stats_raw, nan=0.0, posinf=10.0, neginf=-10.0)
         
-        stats_norm = self._safe_normalize(stats_raw)
+        if not torch.jit.is_tracing():
+            self.last_entropy = entropy.detach().mean()
+            self.last_conf    = conf.detach().mean()
+            self.last_var     = dfl_var.detach().mean()
+
+        # 🚨 TESIS: STATIC MIN-MAX SCALING (ANTI 100% BUG)
+        entropy_scaled = entropy / self.max_entropy
+        conf_scaled = conf 
+        var_scaled = dfl_var / self.max_var
+        
+        stats_norm = torch.cat([entropy_scaled, conf_scaled, var_scaled], dim=1)
         stats_scaled = stats_norm * self.stats_weight.to(f_p3.dtype)
 
+        # 3. GABUNGKAN VEKTOR INPUT
         z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
-        # =================================================
-        # LANGKAH 2: MLP → LOGITS (PURE FP32 EXECUTION)
-        # =================================================
+        # 4. MLP -> LOGITS (PURE FP32)
         z_in_fp32 = z_in.float()
-        
         z_norm_fp32 = F.layer_norm(
             z_in_fp32, 
-            self.layer_norm.normalized_shape, 
+            [self.input_dim], 
             self.layer_norm.weight.float(), 
             self.layer_norm.bias.float(), 
             self.layer_norm.eps
         )
 
         logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
-        
-        # 🚨 PERBAIKAN PENTING: Tahan variabel ini tetap di FP32!
-        # Jangan langsung di- .to(f_p3.dtype)
         logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
-        # =================================================
-        # LANGKAH 3: KEPUTUSAN GATE
-        # =================================================
+        # 5. KEPUTUSAN GATE
         tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
 
         if self.training:
-            # 🚨 PERBAIKAN PENTING: Eksekusi Gumbel di FP32 agar bebas dari kutukan NaN Log(0)
+            # TRAIN MODE (Gumbel Softmax)
             soft_fp32 = F.gumbel_softmax(logits_safe_fp32, tau=tau, hard=False, dim=1)
-            
-            # Baru kembalikan ke tipe asal (FP16) setelah operasi Gumbel selesai
             soft = soft_fp32.to(f_p3.dtype) 
             
             if self._is_warmup:
@@ -3142,33 +2923,28 @@ class LightWeightDifficultyAwareRouter(nn.Module):
                 gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1)
                 gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1)
                 
-                # 🚨 PERBAIKAN PENTING: Hitung loss_prob juga dari FP32 yang aman
                 self.loss_prob = F.softmax(logits_safe_fp32, dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
-            f_p3_up = self.upsample(f_p3)
-            f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
-            f_c2f   = self.c2f_p2(f_fused)
-            
-            output = (f_c2f * gate_scalar_feature) + \
-                     (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
+            f_c2f = self.compute_expert(f_p3, f_p2_back)
+            output = (f_c2f * gate_scalar_feature) + (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
             
         else: 
-            gate_mask = self.compute_gate(f_p3, f_p2_back)
+            # INFERENCE / EVAL MODE (SIAP ONNX & TENSORRT)
+            probs = F.softmax(logits_safe_fp32, dim=1)
+            gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1).to(f_p3.dtype)
             
+            # 🚨 SABUK PENGAMAN ONNX TRACER 🚨
             if not torch.jit.is_tracing():
                 self.current_activation_prob = gate_mask.mean().detach()
+                
+                # Bypass Eksekusi P2 untuk Menghemat Latensi di PyTorch murni
+                if gate_mask.abs().max() == 0.0:
+                    H2, W2 = f_p2_back.shape[2], f_p2_back.shape[3]
+                    return torch.zeros((B, self.c2f_out, H2, W2), device=f_p3.device, dtype=f_p3.dtype)
 
-            condition = gate_mask[0, 0, 0, 0] > 0.5
-
-            if condition:
-                f_c2f = self.compute_expert(f_p3, f_p2_back)
-                output = f_c2f * gate_mask[0, 0, 0, 0] 
-            else:
-                output = torch.zeros(
-                    (B, self.c2f_out, H2, W2), 
-                    device=f_p3.device,
-                    dtype=f_p3.dtype
-                )
+            # Eksekusi Matematis murni (ONNX / TensorRT akan merekam jalur ini)
+            f_c2f = self.compute_expert(f_p3, f_p2_back)
+            output = f_c2f * gate_mask 
 
         return output
