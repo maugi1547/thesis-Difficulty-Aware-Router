@@ -98,37 +98,44 @@ from ultralytics.utils.torch_utils import (
 # Di tasks.py — hook_router_to_head (versi final)
 
 def hook_router_to_head(model):
+    """
+    Menghubungkan Router ke Detect Head.
+    Diperbarui untuk mendukung Stateless LightWeight Router yang tidak lagi
+    membutuhkan mekanisme hook caching yang lambat.
+    """
     router_module = None
-    detect_head   = None
+    detect_head = None
 
+    # Cari modul Router dan Detect Head di dalam model
     for m in model.modules():
-        if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter']:
+        if m.__class__.__name__ == 'DifficultyAwareRouter':
+            router_module = m
+        elif m.__class__.__name__ == 'LightWeightDifficultyAwareRouter':
             router_module = m
         elif m.__class__.__name__ == 'Detect':
             detect_head = m
 
     if router_module is None or detect_head is None:
-        print("[WARNING] Router atau Detect head tidak ditemukan.")
+        return  # Tidak ada router atau detect head, abaikan.
+
+    # 🚨 PENTING: LightWeight router versi terbaru sudah Stateless dan menggunakan
+    # Micro-Head internal, jadi TIDAK PERLU lagi dipasangi hook ke Detect Head.
+    if router_module.__class__.__name__ == 'LightWeightDifficultyAwareRouter':
+        # print("[INFO] LightWeight Router terdeteksi. Melewati pemasangan hook (Stateless Mode).")
         return
 
-    if not (hasattr(detect_head, 'cv3') and len(detect_head.cv3) > 1):
-        print("[WARNING] cv3 tidak cukup panjang di Detect head.")
-        return
+    # --- KODE LAMA (Hanya dieksekusi jika menggunakan DifficultyAwareRouter lama) ---
+    if not hasattr(router_module, '_hook_cls'):
+        return # Fallback aman jika method tidak ada
 
-    # Sinkronisasi metadata
-    router_module.nc      = detect_head.nc
-    router_module.reg_max = detect_head.reg_max
-
-    # Pasang hook langsung menggunakan method milik class Router (Pickle-safe)
+    # Pasang hook (Pickle-safe)
     handle_cls = detect_head.cv3[1].register_forward_hook(router_module._hook_cls)
     handle_reg = detect_head.cv2[1].register_forward_hook(router_module._hook_reg)
 
-    router_module._hook_handles  = [handle_cls, handle_reg]
-    router_module._cached_entropy = None
-    router_module._cached_conf    = None
-    router_module._cached_dfl_var = None
-    router_module.use_hook_cache  = True
-
+    if not hasattr(router_module, '_hook_handles'):
+        router_module._hook_handles = []
+    
+    router_module._hook_handles.extend([handle_cls, handle_reg])
     print(f"[INFO] Hook terpasang secara PICKLE-SAFE. nc={detect_head.nc}, reg_max={detect_head.reg_max}.")
 
 def remove_router_hooks(model):
