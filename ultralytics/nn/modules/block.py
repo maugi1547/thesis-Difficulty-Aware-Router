@@ -2932,7 +2932,11 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             
         else: 
             # INFERENCE / EVAL MODE (SIAP ONNX & TENSORRT)
-            probs = F.softmax(logits_safe_fp32, dim=1)
+            # 🚨 TESIS: Inference Temperature Scaling 🚨
+            # Membagi logits dengan suhu akhir training (0.5) untuk melawan 
+            # Train-Test Discrepancy akibat Gumbel-Softmax.
+            tau_final = 0.5 
+            probs = F.softmax(logits_safe_fp32 / tau_final, dim=1)
             gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1).to(f_p3.dtype)
             
             # 🚨 SABUK PENGAMAN ONNX TRACER 🚨
