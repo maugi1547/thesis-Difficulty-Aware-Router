@@ -2711,6 +2711,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.num_classes  = num_classes
         self.reg_max      = reg_max
         self.warmup_epochs = warmup_epochs
+        self.tau_param = nn.Parameter(torch.tensor(1.5))
 
         # =====================================================
         # 1. KOMPONEN Z_VISUAL & Z_LOW
@@ -2901,7 +2902,10 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
         # 5. KEPUTUSAN GATE
-        tau = max(0.5, 1.5 * (0.98 ** self.current_epoch))
+        # 🚨 STRATEGI 5: Gunakan Learnable Temperature
+        # F.softplus menjamin nilai tetap positif yang dapat diturunkan gradiennya, 
+        # + 0.1 sebagai safety margin (batas minimum) agar suhu tidak menabrak 0 absolut.
+        tau = F.softplus(self.tau_param) + 0.1
 
         if self.training:
             # TRAIN MODE (Gumbel Softmax)
@@ -2932,11 +2936,8 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             
         else: 
             # INFERENCE / EVAL MODE (SIAP ONNX & TENSORRT)
-            # 🚨 TESIS: Inference Temperature Scaling 🚨
-            # Membagi logits dengan suhu akhir training (0.5) untuk melawan 
-            # Train-Test Discrepancy akibat Gumbel-Softmax.
-            tau_final = 0.5 
-            probs = F.softmax(logits_safe_fp32 / tau_final, dim=1)
+            tau_infer = (F.softplus(self.tau_param) + 0.1).detach()
+            probs = F.softmax(logits_safe_fp32 / tau_infer, dim=1)
             gate_mask = (probs[:, 1] > 0.5).float().view(B, 1, 1, 1).to(f_p3.dtype)
             
             # 🚨 SABUK PENGAMAN ONNX TRACER 🚨
