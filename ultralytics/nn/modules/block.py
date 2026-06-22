@@ -2792,7 +2792,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         return 0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1)
     
     def _compute_stats(self, cls_logits: torch.Tensor, reg_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        eps = 1e-5 
+        eps = 1e-6 
         B = cls_logits.shape[0]
         K = 10 
 
@@ -2803,7 +2803,8 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             unc_conf = 1 - prob
         else:
             prob = torch.softmax(cls_logits, dim=1)
-            prob_safe = prob.clamp(min=eps, max=1.0)
+            # Wajib max=1.0 - eps agar torch.log(1.0) tidak anomali saat gradient dihitung
+            prob_safe = prob.clamp(min=eps, max=1.0 - eps) 
             entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
             unc_conf = 1 - prob.max(dim=1, keepdim=True).values
 
@@ -2870,7 +2871,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         z_low = self.gap(self.conv_hint(f_p2_back_detached)).view(B, -1)
 
         # 2. DAPATKAN STATISTIK MENTAH
-        entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3)
+        entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3.detach())
         
         if not torch.jit.is_tracing():
             self.last_entropy = entropy.detach().mean()
@@ -2905,7 +2906,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         # 🚨 STRATEGI 5: Gunakan Learnable Temperature
         # F.softplus menjamin nilai tetap positif yang dapat diturunkan gradiennya, 
         # + 0.1 sebagai safety margin (batas minimum) agar suhu tidak menabrak 0 absolut.
-        tau = F.softplus(self.tau_param) + 0.1
+        tau = F.softplus(self.tau_param.float()) + 0.1
 
         if self.training:
             # TRAIN MODE (Gumbel Softmax)
