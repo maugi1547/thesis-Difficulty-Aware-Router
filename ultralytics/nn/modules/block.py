@@ -2717,12 +2717,17 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         # 1. KOMPONEN Z_VISUAL & Z_LOW
         # =====================================================
         self.c_visual = 16
-        self.conv_visual = nn.Conv2d(c_p3, self.c_visual, 1, bias=False)
+        self.conv_visual = nn.Sequential(
+            nn.Conv2d(c_p3, self.c_visual, 1, bias=True), # Bias diganti True
+            nn.SiLU()
+        )
         self.gap = nn.AdaptiveAvgPool2d(1)
 
         self.c_low = 16
-        self.conv_hint = nn.Conv2d(c_p2, self.c_low, 1, bias=False)
-
+        self.conv_hint = nn.Sequential(
+            nn.Conv2d(c_p2, self.c_low, 1, bias=True), # Bias diganti True
+            nn.SiLU()
+        )
         # =====================================================
         # 2. STATELESS PROXY HEAD (TANPA BATCHNORM!)
         # =====================================================
@@ -2757,7 +2762,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         
         self.mlp_fc = nn.Linear(self.input_dim, 2)
         nn.init.constant_(self.mlp_fc.bias[0], 0.0)
-        nn.init.constant_(self.mlp_fc.bias[1], 0.0)
+        nn.init.constant_(self.mlp_fc.bias[1], 1.0)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
 
