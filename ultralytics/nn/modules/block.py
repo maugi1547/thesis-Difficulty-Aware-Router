@@ -2758,7 +2758,6 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         self.c2f_p2 = C2f(c_p3 + c_p2, c2f_out, n=n_bottleneck, shortcut=shortcut)
 
         self.input_dim = self.c_visual + self.c_low + 3
-        self.layer_norm = nn.LayerNorm(self.input_dim)
         
         self.mlp_fc = nn.Linear(self.input_dim, 2)
         nn.init.constant_(self.mlp_fc.bias[0], 0.0)
@@ -2899,15 +2898,8 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         # 4. MLP -> LOGITS (PURE FP32)
         z_in_fp32 = z_in.float()
-        z_norm_fp32 = F.layer_norm(
-            z_in_fp32, 
-            [self.input_dim], 
-            self.layer_norm.weight.float(), 
-            self.layer_norm.bias.float(), 
-            self.layer_norm.eps
-        )
 
-        logits_fp32 = F.linear(z_norm_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
+        logits_fp32 = F.linear(z_in_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
         logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
         # 5. KEPUTUSAN GATE
