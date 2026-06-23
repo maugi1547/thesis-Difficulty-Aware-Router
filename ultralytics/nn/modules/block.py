@@ -2877,11 +2877,14 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         # 2. DAPATKAN STATISTIK MENTAH
         entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3.detach())
+        entropy = entropy.detach()
+        conf    = conf.detach()
+        dfl_var = dfl_var.detach()
         
         if not torch.jit.is_tracing():
-            self.last_entropy = entropy.detach().mean()
-            self.last_conf    = conf.detach().mean()
-            self.last_var     = dfl_var.detach().mean()
+            self.last_entropy = entropy.mean()
+            self.last_conf    = conf.mean()
+            self.last_var     = dfl_var.mean()
 
         # 🚨 TESIS: STATIC MIN-MAX SCALING (ANTI 100% BUG)
         entropy_scaled = entropy / self.max_entropy
