@@ -2906,11 +2906,12 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         # 3. GABUNGKAN VEKTOR INPUT
         z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
-        # 4. MLP -> LOGITS (PURE FP32)
-        z_in_fp32 = z_in.float()
-
-        logits_fp32 = self.mlp_fc(z_in_fp32)
-        logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
+        # 4. MLP -> LOGITS 
+        # Memaksa PyTorch menjalankan Sequential MLP secara murni di FP32
+        with torch.cuda.amp.autocast(enabled=False):
+            # Pastikan input dan weight MLP berjalan di ranah float32 murni
+            logits_fp32 = self.mlp_fc(z_in.float())
+            logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
         # 5. KEPUTUSAN GATE
         # 🚨 STRATEGI 5: Gunakan Learnable Temperature
