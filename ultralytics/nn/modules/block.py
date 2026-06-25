@@ -2909,7 +2909,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         # 4. MLP -> LOGITS (PURE FP32)
         z_in_fp32 = z_in.float()
 
-        logits_fp32 = F.linear(z_in_fp32, self.mlp_fc.weight.float(), self.mlp_fc.bias.float())
+        logits_fp32 = self.mlp_fc(z_in_fp32)
         logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
         # 5. KEPUTUSAN GATE
