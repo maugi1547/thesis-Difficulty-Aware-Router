@@ -2907,10 +2907,15 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         z_in = torch.cat([z_visual, z_low, stats_scaled], dim=1)
 
         # 4. MLP -> LOGITS 
-        # Memaksa PyTorch menjalankan Sequential MLP secara murni di FP32
-        with torch.amp.autocast('cuda', enabled=False):
-            logits_fp32 = self.mlp_fc(z_in.float())
-            logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
+        # Konversi z_in agar selalu mengikuti tipe data dari f_p3 (bisa Half16 atau Float32 tergantung AMP)
+        z_in_matched = z_in.to(f_p3.dtype) 
+        
+        # Eksekusi MLP dengan tipe data yang sudah cocok
+        logits_raw = self.mlp_fc(z_in_matched)
+        
+        # Kembalikan ke FP32 MURNI khusus untuk Gumbel-Softmax (Mencegah NaN)
+        logits_fp32 = logits_raw.float() 
+        logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
         # 5. KEPUTUSAN GATE
         # 🚨 STRATEGI 5: Gunakan Learnable Temperature
