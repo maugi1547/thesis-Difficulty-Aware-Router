@@ -2908,8 +2908,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         # 4. MLP -> LOGITS 
         # Memaksa PyTorch menjalankan Sequential MLP secara murni di FP32
-        with torch.cuda.amp.autocast(enabled=False):
-            # Pastikan input dan weight MLP berjalan di ranah float32 murni
+        with torch.amp.autocast('cuda', enabled=False):
             logits_fp32 = self.mlp_fc(z_in.float())
             logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
 
