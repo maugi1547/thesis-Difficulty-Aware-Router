@@ -2759,7 +2759,15 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         self.input_dim = self.c_visual + self.c_low + 3
         
-        self.mlp_fc = nn.Linear(self.input_dim, 2)
+        # 🚨 PERBAIKAN: Upgrade Kapasitas Router (Mencegah Mode Collapse)
+        hidden_dim = self.input_dim // 2  # Dimensi tengah (sekitar 17)
+        
+        self.mlp_fc = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim), # Opsional tapi sangat dianjurkan untuk menstabilkan fitur sebelum aktivasi
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2)
+        )
         nn.init.constant_(self.mlp_fc.bias[0], 0.0)
         nn.init.constant_(self.mlp_fc.bias[1], 1.0)
 
