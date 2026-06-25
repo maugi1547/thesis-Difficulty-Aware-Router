@@ -2764,12 +2764,14 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         
         self.mlp_fc = nn.Sequential(
             nn.Linear(self.input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim), # Opsional tapi sangat dianjurkan untuk menstabilkan fitur sebelum aktivasi
+            nn.BatchNorm1d(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 2)
         )
-        nn.init.constant_(self.mlp_fc.bias[0], 0.0)
-        nn.init.constant_(self.mlp_fc.bias[1], 1.0)
+        
+        # 🚨 SOLUSI ERROR: Gunakan [-1] untuk menunjuk ke layer Linear terakhir
+        nn.init.constant_(self.mlp_fc[-1].bias[0], 0.0)
+        nn.init.constant_(self.mlp_fc[-1].bias[1], 1.0)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
 
