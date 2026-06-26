@@ -2759,19 +2759,26 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         self.input_dim = self.c_visual + self.c_low + 3
         
-        # 🚨 PERBAIKAN: Upgrade Kapasitas Router (Mencegah Mode Collapse)
-        hidden_dim = self.input_dim // 2  # Dimensi tengah (sekitar 17)
+        # 🚨 PERBAIKAN: Deep Bottleneck MLP untuk Ketajaman Ekstrem
+        expand_dim = self.input_dim * 2  # Perlebar ke 70 neuron untuk mencari kombinasi fitur
+        squeeze_dim = self.input_dim // 2 # Padatkan ke 17 neuron untuk intisari keputusan
         
         self.mlp_fc = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.Linear(self.input_dim, expand_dim),
+            nn.BatchNorm1d(expand_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 2)
+            
+            nn.Linear(expand_dim, squeeze_dim),
+            nn.BatchNorm1d(squeeze_dim),
+            nn.SiLU(),
+            
+            nn.Linear(squeeze_dim, 2)
         )
         
-        # 🚨 SOLUSI ERROR: Gunakan [-1] untuk menunjuk ke layer Linear terakhir
-        nn.init.constant_(self.mlp_fc[-1].bias[0], 0.0)
-        nn.init.constant_(self.mlp_fc[-1].bias[1], 1.0)
+        # Inisialisasi bias yang agresif di layer terakhir
+        # Mendorong kuat awal eksplorasi
+        nn.init.constant_(self.mlp_fc[-1].bias[0], -1.0) # Kelas 0 (Mati)
+        nn.init.constant_(self.mlp_fc[-1].bias[1],  1.0) # Kelas 1 (Aktif)
 
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
 
@@ -2915,7 +2922,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         
         # Kembalikan ke FP32 MURNI khusus untuk Gumbel-Softmax (Mencegah NaN)
         logits_fp32 = logits_raw.float() 
-        logits_safe_fp32 = 3.0 * torch.tanh(logits_fp32 / 3.0)
+        logits_safe_fp32 = 6.0 * torch.tanh(logits_fp32 / 6.0)
 
         # 5. KEPUTUSAN GATE
         # 🚨 STRATEGI 5: Gunakan Learnable Temperature
