@@ -2721,7 +2721,8 @@ class LightWeightDifficultyAwareRouter(nn.Module):
             nn.Conv2d(c_p3, self.c_visual, 1, bias=True), # Bias diganti True
             nn.SiLU()
         )
-        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
 
         self.c_low = 16
         self.conv_hint = nn.Sequential(
@@ -2888,8 +2889,17 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         f_p3_detached = f_p3.detach()
         f_p2_back_detached = f_p2_back.detach()
 
-        z_visual = self.gap(self.conv_visual(f_p3_detached)).view(B, -1)
-        z_low = self.gap(self.conv_hint(f_p2_back_detached)).view(B, -1)
+        # Ekstraksi P3 (Visual)
+        v_conv = self.conv_visual(f_p3_detached)
+        z_visual_avg = self.avg_pool(v_conv).view(B, -1)
+        z_visual_max = self.max_pool(v_conv).view(B, -1)
+        z_visual = z_visual_avg + z_visual_max  # Penyatuan Sinyal Tajam
+
+        # Ekstraksi P2 (Low-level Hint)
+        l_conv = self.conv_hint(f_p2_back_detached)
+        z_low_avg = self.avg_pool(l_conv).view(B, -1)
+        z_low_max = self.max_pool(l_conv).view(B, -1)
+        z_low = z_low_avg + z_low_max  # Penyatuan Sinyal Tajam
 
         # 2. DAPATKAN STATISTIK MENTAH
         entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3.detach())
@@ -2922,7 +2932,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         
         # Kembalikan ke FP32 MURNI khusus untuk Gumbel-Softmax (Mencegah NaN)
         logits_fp32 = logits_raw.float() 
-        logits_safe_fp32 = 6.0 * torch.tanh(logits_fp32 / 6.0)
+        logits_safe_fp32 = 5.0 * torch.tanh(logits_fp32)
 
         # 5. KEPUTUSAN GATE
         # 🚨 STRATEGI 5: Gunakan Learnable Temperature
