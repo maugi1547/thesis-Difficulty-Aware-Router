@@ -2932,7 +2932,7 @@ class LightWeightDifficultyAwareRouter(nn.Module):
         
         # Kembalikan ke FP32 MURNI khusus untuk Gumbel-Softmax (Mencegah NaN)
         logits_fp32 = logits_raw.float() 
-        logits_safe_fp32 = 5.0 * torch.tanh(logits_fp32)
+        logits_safe_fp32 = 5.0 * torch.tanh(logits_fp32/5.0)
 
         # 5. KEPUTUSAN GATE
         # 🚨 STRATEGI 5: Gunakan Learnable Temperature
