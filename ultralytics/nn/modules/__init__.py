@@ -47,10 +47,12 @@ from .block import (
     CBFuse,
     CBLinear,
     ContrastiveHead,
+    DifficultyAwareRouter,
     GhostBottleneck,
     HGBlock,
     HGStem,
     ImagePoolingAttn,
+    LightWeightDifficultyAwareRouter,
     MaxSigmoidAttnBlock,
     Proto,
     RepC3,
@@ -59,8 +61,6 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
-    DifficultyAwareRouter,
-    LightWeightDifficultyAwareRouter,
 )
 from .conv import (
     CBAM,
