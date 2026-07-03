@@ -1,10 +1,10 @@
 # Ultralytics YOLOv8-MoE-P2 (Nano Version)
 # Tesis: Difficulty-Aware Spatial Router for Tiny Object Detection
 #
-# PERUBAHAN UTAMA dari versi lama:
-#   - C2f P2 (layer 17 lama) DIHAPUS dari head
+# PERUBAHAN UTAMA dari versi llama:
+#   - C2f P2 (layer 17 llama) DIHAPUS dari head
 #   - C2f P2 sekarang ADA DI DALAM DifficultyAwareRouter
-#   - Argumen Router dilengkapi: [c_p3, c_p2, c2f_out, n, shortcut]
+#   - Argument Router dilengkapi: [c_p3, c_p2, c2f_out, n, shortcut]
 #   - Nomor layer Detect diperbarui sesuai pergeseran indeks
 #   - hook_router_to_head() dipanggil di tasks.py setelah parse_model
 
@@ -20,16 +20,16 @@ scales:
 # BACKBONE (tidak berubah)
 # ===========================================================
 backbone:
-  - [-1, 1, Conv, [64, 3, 2]]    # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]]   # 1-P2/4
-  - [-1, 3, C2f, [128, True]]    # 2-P2/4  ← sumber Z_low (hint P2)
-  - [-1, 1, Conv, [256, 3, 2]]   # 3-P3/8
-  - [-1, 6, C2f, [256, True]]    # 4-P3/8
-  - [-1, 1, Conv, [512, 3, 2]]   # 5-P4/16
-  - [-1, 6, C2f, [512, True]]    # 6-P4/16
-  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
-  - [-1, 3, C2f, [1024, True]]   # 8-P5/32
-  - [-1, 1, SPPF, [1024, 5]]     # 9-P5/32
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 3, C2f, [128, True]] # 2-P2/4  ← sumber Z_low (hint P2)
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 6, C2f, [256, True]] # 4-P3/8
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 6, C2f, [512, True]] # 6-P4/16
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 3, C2f, [1024, True]] # 8-P5/32
+  - [-1, 1, SPPF, [1024, 5]] # 9-P5/32
 
 # ===========================================================
 # HEAD
@@ -38,32 +38,32 @@ head:
   # ----------------------------------------------------------
   # 1. TOP-DOWN PATH: P5 → P4 → P3
   # ----------------------------------------------------------
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 10
-  - [[-1, 6], 1, Concat, [1]]                    # 11 gabung P4 backbone
-  - [-1, 3, C2f, [512]]                          # 12 fitur P4 siap
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 10
+  - [[-1, 6], 1, Concat, [1]] # 11 gabung P4 backbone
+  - [-1, 3, C2f, [512]] # 12 fitur P4 siap
 
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 13
-  - [[-1, 4], 1, Concat, [1]]                    # 14 gabung P3 backbone
-  - [-1, 3, C2f, [256]]                          # 15 fitur P3 siap
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 13
+  - [[-1, 4], 1, Concat, [1]] # 14 gabung P3 backbone
+  - [-1, 3, C2f, [256]] # 15 fitur P3 siap
   #                                                    ↑ ini input Z_visual
 
   # ----------------------------------------------------------
   # 2. DIFFICULTY-AWARE SPATIAL ROUTER (P3 → P2)
   #
-  # FIX 1: Argumen lengkap [c_p3, c_p2, c2f_out, n, shortcut]
+  # FIX 1: Argument lengkap [c_p3, c_p2, c2f_out, n, shortcut]
   #   c_p3    = 256  (channel output layer 15, setelah scaling)
   #   c_p2    = 128  (channel backbone layer 2, setelah scaling)
   #   c2f_out = 128  (channel output C2f P2 yang ada di dalam router)
   #   n       = 1    (jumlah bottleneck C2f — ikuti depth scaling)
   #   shortcut= False
   #
-  # FIX 2: C2f P2 (layer 17 lama) DIHAPUS dari sini karena
+  # FIX 2: C2f P2 (layer 17 llama) DIHAPUS dari sini karena
   #         sudah ada di dalam DifficultyAwareRouter.
   #         Output Router langsung = fitur P2 final (128ch).
   #
   # Input: [-1 = layer 15 (P3 Neck), 2 = layer 2 (P2 Backbone)]
   # ----------------------------------------------------------
-  
+
   - [[-1, 2], 1, DifficultyAwareRouter, [128, 1, False]]
   # 16 ← output sudah berupa fitur P2 final (c2f_out = 128ch)
   #       TRUE SKIP terjadi di sini saat inferensi gate=0
@@ -71,24 +71,24 @@ head:
   # ----------------------------------------------------------
   # 3. BOTTOM-UP PATH: P2 → P3 → P4 → P5
   #
-  # FIX 3: Nomor layer bergeser karena layer 17 (C2f lama) dihapus
+  # FIX 3: Nomor layer bergeser karena layer 17 (C2f llama) dihapus
   #         Semua referensi layer di bawah ini sudah disesuaikan
   # ----------------------------------------------------------
 
   # P2 → P3
-  - [-1, 1, Conv, [256, 3, 2]]   # 17 downsample P2 → P3
-  - [[-1, 15], 1, Concat, [1]]   # 18 gabung dengan P3 Neck (layer 15)
-  - [-1, 3, C2f, [256]]          # 19 fitur P3 final
+  - [-1, 1, Conv, [256, 3, 2]] # 17 downsample P2 → P3
+  - [[-1, 15], 1, Concat, [1]] # 18 gabung dengan P3 Neck (layer 15)
+  - [-1, 3, C2f, [256]] # 19 fitur P3 final
 
   # P3 → P4
-  - [-1, 1, Conv, [512, 3, 2]]   # 20 downsample P3 → P4
-  - [[-1, 12], 1, Concat, [1]]   # 21 gabung dengan P4 Neck (layer 12)
-  - [-1, 3, C2f, [512]]          # 22 fitur P4 final
+  - [-1, 1, Conv, [512, 3, 2]] # 20 downsample P3 → P4
+  - [[-1, 12], 1, Concat, [1]] # 21 gabung dengan P4 Neck (layer 12)
+  - [-1, 3, C2f, [512]] # 22 fitur P4 final
 
   # P4 → P5
-  - [-1, 1, Conv, [1024, 3, 2]]  # 23 downsample P4 → P5
-  - [[-1, 9], 1, Concat, [1]]    # 24 gabung dengan P5/SPPF (layer 9)
-  - [-1, 3, C2f, [1024]]         # 25 fitur P5 final
+  - [-1, 1, Conv, [1024, 3, 2]] # 23 downsample P4 → P5
+  - [[-1, 9], 1, Concat, [1]] # 24 gabung dengan P5/SPPF (layer 9)
+  - [-1, 3, C2f, [1024]] # 25 fitur P5 final
 
   # ----------------------------------------------------------
   # 4. DETECT HEAD
@@ -99,4 +99,4 @@ head:
   #   P4 = layer 22 (dulu 23)
   #   P5 = layer 25 (dulu 26)
   # ----------------------------------------------------------
-  - [[16, 19, 22, 25], 1, Detect, [nc]]  # 26
+  - [[16, 19, 22, 25], 1, Detect, [nc]] # 26
