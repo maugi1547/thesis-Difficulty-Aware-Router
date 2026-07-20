@@ -54,8 +54,8 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Index,
+    LightWeightDifficultyAwareRouter,
     LRPCHead,
-    LightWeightDifficultyAwareRouter, 
     Pose,
     RepC3,
     RepConv,
@@ -97,22 +97,21 @@ from ultralytics.utils.torch_utils import (
 
 # Di tasks.py — hook_router_to_head (versi final)
 
+
 def hook_router_to_head(model):
-    """
-    Menghubungkan Router ke Detect Head.
-    Diperbarui untuk mendukung Stateless LightWeight Router yang tidak lagi
+    """Menghubungkan Router ke Detect Head. Diperbarui untuk mendukung Stateless LightWeight Router yang tidak lagi
     membutuhkan mekanisme hook caching yang lambat.
     """
     router_module = None
     detect_head = None
 
-    # Cari modul Router dan Detect Head di dalam model
+    # Cari module Router dan Detect Head di dalam model
     for m in model.modules():
-        if m.__class__.__name__ == 'DifficultyAwareRouter':
+        if m.__class__.__name__ == "DifficultyAwareRouter":
             router_module = m
-        elif m.__class__.__name__ == 'LightWeightDifficultyAwareRouter':
+        elif m.__class__.__name__ == "LightWeightDifficultyAwareRouter":
             router_module = m
-        elif m.__class__.__name__ == 'Detect':
+        elif m.__class__.__name__ == "Detect":
             detect_head = m
 
     if router_module is None or detect_head is None:
@@ -120,35 +119,35 @@ def hook_router_to_head(model):
 
     # 🚨 PENTING: LightWeight router versi terbaru sudah Stateless dan menggunakan
     # Micro-Head internal, jadi TIDAK PERLU lagi dipasangi hook ke Detect Head.
-    if router_module.__class__.__name__ == 'LightWeightDifficultyAwareRouter':
+    if router_module.__class__.__name__ == "LightWeightDifficultyAwareRouter":
         # print("[INFO] LightWeight Router terdeteksi. Melewati pemasangan hook (Stateless Mode).")
         return
 
     # --- KODE LAMA (Hanya dieksekusi jika menggunakan DifficultyAwareRouter lama) ---
-    if not hasattr(router_module, '_hook_cls'):
-        return # Fallback aman jika method tidak ada
+    if not hasattr(router_module, "_hook_cls"):
+        return  # Fallback aman jika method tidak ada
 
     # Pasang hook (Pickle-safe)
     handle_cls = detect_head.cv3[1].register_forward_hook(router_module._hook_cls)
     handle_reg = detect_head.cv2[1].register_forward_hook(router_module._hook_reg)
 
-    if not hasattr(router_module, '_hook_handles'):
+    if not hasattr(router_module, "_hook_handles"):
         router_module._hook_handles = []
-    
+
     router_module._hook_handles.extend([handle_cls, handle_reg])
     print(f"[INFO] Hook terpasang secara PICKLE-SAFE. nc={detect_head.nc}, reg_max={detect_head.reg_max}.")
 
+
 def remove_router_hooks(model):
-    """
-    Lepas semua hook sebelum export/ONNX agar tidak ada
-    referensi ke router di dalam graph export.
+    """Lepas semua hook sebelum export/ONNX agar tidak ada referensi ke router di dalam graph export.
     """
     for m in model.modules():
-        if m.__class__.__name__ == 'DifficultyAwareRouter':
-            for handle in getattr(m, '_hook_handles', []):
+        if m.__class__.__name__ == "DifficultyAwareRouter":
+            for handle in getattr(m, "_hook_handles", []):
                 handle.remove()
             m._hook_handles = []
             print("[INFO] Router hooks dilepas.")
+
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -470,7 +469,7 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
-        
+
         hook_router_to_head(self)
 
     def _predict_augment(self, x):
@@ -1645,7 +1644,7 @@ def parse_model(d, ch, verbose=True):
                 else getattr(__import__("torchvision").ops, m[16:])
                 if "torchvision.ops." in m
                 else globals()[m]
-            ) # get module
+            )  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
@@ -1709,34 +1708,34 @@ def parse_model(d, ch, verbose=True):
             args = [*args[1:]]
         # --- TAMBAHAN UNTUK MOE-P2 ROUTER ---
         elif m is DifficultyAwareRouter:
-            c_p3 = ch[f[0]] # Ambil channel P3 dari layer sebelumnya
-            c_p2 = ch[f[1]] # Ambil channel P2 dari layer sebelumnya
-            
+            c_p3 = ch[f[0]]  # Ambil channel P3 dari layer sebelumnya
+            c_p2 = ch[f[1]]  # Ambil channel P2 dari layer sebelumnya
+
             # 1. PENSKALAAN CHANNEL (WIDTH)
             c2f_out_scaled = make_divisible(args[0] * width, 8)
-            
+
             # 2. PENSKALAAN BOTTLENECK (DEPTH)
             n_bottleneck_scaled = max(round(args[1] * depth), 1) if len(args) > 1 else 1
-            
-            # 3. RAKIT KEMBALI ARGUMEN 
+
+            # 3. RAKIT KEMBALI ARGUMENT
             args = [c_p3, c_p2, c2f_out_scaled, n_bottleneck_scaled, *args[2:]]
-            
+
             # 4. Set ukuran channel akhir (c2)
             c2 = args[2]
         # -------------------------------------
         elif m is LightWeightDifficultyAwareRouter:
-            c_p3 = ch[f[0]] # Ambil channel P3 dari layer sebelumnya
-            c_p2 = ch[f[1]] # Ambil channel P2 dari layer sebelumnya
-            
+            c_p3 = ch[f[0]]  # Ambil channel P3 dari layer sebelumnya
+            c_p2 = ch[f[1]]  # Ambil channel P2 dari layer sebelumnya
+
             # 1. PENSKALAAN CHANNEL (WIDTH)
             c2f_out_scaled = make_divisible(args[0] * width, 8)
-            
+
             # 2. PENSKALAAN BOTTLENECK (DEPTH)
             n_bottleneck_scaled = max(round(args[1] * depth), 1) if len(args) > 1 else 1
-            
-            # 3. RAKIT KEMBALI ARGUMEN 
+
+            # 3. RAKIT KEMBALI ARGUMENT
             args = [c_p3, c_p2, c2f_out_scaled, n_bottleneck_scaled, *args[2:]]
-            
+
             # 4. Set ukuran channel akhir (c2)
             c2 = args[2]
         else:
@@ -1753,26 +1752,24 @@ def parse_model(d, ch, verbose=True):
         if i == 0:
             ch = []
         ch.append(c2)
-    
+
     # =====================================================================
     # 🚨 TESIS AGUNG: SUNTIKKAN FLAG BYPASS KE DETECT HEAD (DYNAMIC ROUTER)
     # =====================================================================
     # 1. Cek apakah ada Router di dalam tumpukan arsitektur model ini (String Match)
     has_router = any(
-        'DifficultyAwareRouter' in str(m.type) or 
-        'LightWeightDifficultyAwareRouter' in str(m.type) 
-        for m in layers
+        "DifficultyAwareRouter" in str(m.type) or "LightWeightDifficultyAwareRouter" in str(m.type) for m in layers
     )
-    
-    # 2. Jika ada, cari modul Detect dan aktifkan fitur penghematan GFLOPs
+
+    # 2. Jika ada, cari module Detect dan aktifkan fitur penghematan GFLOPs
     if has_router:
         for m in layers:
             # Gunakan string match juga untuk Detect head agar kebal path
-            if any(head_name in str(m.type) for head_name in ['Detect', 'Segment', 'Pose', 'OBB']):
-                m.use_dynamic_bypass = True 
+            if any(head_name in str(m.type) for head_name in ["Detect", "Segment", "Pose", "OBB"]):
+                m.use_dynamic_bypass = True
                 if verbose:
                     # Menggunakan print langsung agar pasti muncul di Kaggle/Jupyter
-                    print(f"⚡ [INFO] Detect Head: Dynamic Bypass AKTIF (Model Router terdeteksi).")
+                    print("⚡ [INFO] Detect Head: Dynamic Bypass AKTIF (Model Router terdeteksi).")
 
     return torch.nn.Sequential(*layers), sorted(save)
 
