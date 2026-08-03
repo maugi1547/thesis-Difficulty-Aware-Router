@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from . import LOGGER
 from .metrics import bbox_iou, probiou

@@ -5,10 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import csv
-import os
+from torch import nn
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -115,7 +113,6 @@ class BboxLoss(nn.Module):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
-
     def forward(
         self,
         pred_dist: torch.Tensor,
@@ -200,7 +197,7 @@ class v8DetectionLoss:
     def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         # --- TAMBAHKAN BARIS INI ---
-        self.model = model 
+        self.model = model
         # ---------------------------
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -224,10 +221,9 @@ class v8DetectionLoss:
         # INISIALISASI di __init__ DetectionLoss / BboxLoss
         # (tambahkan baris ini ke __init__ class yang relevan)
         # =========================================================
-        self.alpha = 0.5          # bobot relative_penalty vs difficulty_weight
-        self.momentum = 0.95      # EMA untuk running average aktivasi P2
+        self.alpha = 0.5  # bobot relative_penalty vs difficulty_weight
+        self.momentum = 0.95  # EMA untuk running average aktivasi P2
         # p2_running_avg diinisialisasi lazy saat pertama kali dipakai
-
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -323,7 +319,7 @@ class v8DetectionLoss:
     # ============================================================
     # FILE: tambahan di ultralytics/utils/loss.py
     # Bagian router loss — ditambahkan di akhir __call__
-    # setelah loss deteksi standar dihitung.
+    # setelah loss deteksi standard dihitung.
     # ============================================================
     #
     # Letakkan kode ini di dalam class DetectionLoss.__call__()
@@ -337,23 +333,22 @@ class v8DetectionLoss:
     #   # p2_running_avg diinisialisasi lazy saat pertama dipakai
     # ============================================================
     def compute_router_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        """
-        Hitung router penalty dan tambahkan ke index [3] dari tensor loss.
-        """
+        """Hitung router penalty dan tambahkan ke index [3] dari tensor loss."""
         if not self.model.training:
             return loss
 
         router = None
         from ultralytics.utils.torch_utils import unwrap_model
+
         raw_model = unwrap_model(self.model)
-        
+
         for m in raw_model.modules():
-            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter']:
+            if m.__class__.__name__ in ["DifficultyAwareRouter", "LightWeightDifficultyAwareRouter"]:
                 router = m
                 break
 
         if router is None:
-            if not hasattr(self, '_router_warned'):
+            if not hasattr(self, "_router_warned"):
                 print("\n[WARNING] compute_router_loss: DifficultyAwareRouter TIDAK DITEMUKAN di model!\n")
                 self._router_warned = True
             return loss
@@ -363,20 +358,22 @@ class v8DetectionLoss:
             router_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
             loss = torch.cat([loss, router_slot])
 
-        target_lambda = getattr(raw_model, 'router_penalty_lambda', 0.0)
-        val_for_loss = getattr(router, 'loss_prob', None)
-        val_for_log = getattr(router, 'current_activation_prob', val_for_loss)
+        target_lambda = getattr(raw_model, "router_penalty_lambda", 0.0)
+        val_for_loss = getattr(router, "loss_prob", None)
+        val_for_log = getattr(router, "current_activation_prob", val_for_loss)
 
         if val_for_loss is None:
-            return loss 
+            return loss
 
         # 🚨 PERBAIKAN 1: Pastikan P2_prob selalu dalam bentuk Float32
-        p2_active_prob = val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
-        p2_active_prob = p2_active_prob.float() 
-        
+        p2_active_prob = (
+            val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
+        )
+        p2_active_prob = p2_active_prob.float()
+
         p2_log_prob = val_for_log.item() if torch.is_tensor(val_for_log) else float(val_for_log)
 
-        is_warmup = getattr(router, '_is_warmup', False)
+        is_warmup = getattr(router, "_is_warmup", False)
         if is_warmup:
             loss[3] = torch.tensor(0.0, device=loss.device, requires_grad=True)
             return loss
@@ -384,61 +381,61 @@ class v8DetectionLoss:
         # ==========================================================
         # 5. HITUNG RELATIVE PENALTY (GLOBAL SPARSITY)
         # ==========================================================
-        if not hasattr(self, 'p2_running_avg'):
+        if not hasattr(self, "p2_running_avg"):
             self.p2_running_avg = p2_active_prob.detach().clone().float()
 
-        momentum = getattr(self, 'momentum', 0.95) 
-        
-        self.p2_running_avg = (momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach())
+        momentum = getattr(self, "momentum", 0.95)
+
+        self.p2_running_avg = momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach()
         relative_diff = p2_active_prob - self.p2_running_avg
         relative_penalty = torch.relu(relative_diff) ** 2
-        
+
         # Pengaman L_rel dari NaN
         relative_penalty = torch.nan_to_num(relative_penalty, nan=0.0)
 
         # ==========================================================
         # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE) - ANTI NaN
         # ==========================================================
-        # Default aman jika terjadi kegagalan sistem
+        # Default aman jika terjadi kegagalan system
         difficulty_weight = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
-        
+
         try:
-            entropy = getattr(router, 'last_entropy', None)
-            conf    = getattr(router, 'last_conf', None)
-            var     = getattr(router, 'last_var', None)
+            entropy = getattr(router, "last_entropy", None)
+            conf = getattr(router, "last_conf", None)
+            var = getattr(router, "last_var", None)
 
             if all(v is not None for v in [entropy, conf, var]):
                 # 🚨 PERBAIKAN 2: Paksa murni ke FP32 untuk mencegah overflow
                 entropy_f = entropy.detach().float()
-                conf_f    = conf.detach().float()
-                var_f     = var.detach().float()
-                
+                conf_f = conf.detach().float()
+                var_f = var.detach().float()
+
                 # Sabuk pengaman 1: netralisir jika ternyata input sudah NaN
                 entropy_f = torch.nan_to_num(entropy_f, nan=0.0)
-                conf_f    = torch.nan_to_num(conf_f, nan=0.0)
-                var_f     = torch.nan_to_num(var_f, nan=0.0)
+                conf_f = torch.nan_to_num(conf_f, nan=0.0)
+                var_f = torch.nan_to_num(var_f, nan=0.0)
 
                 diff_score = entropy_f + var_f - conf_f
                 batch_d_mean = diff_score.mean()
 
-                if not hasattr(self, 'diff_run_mean'):
+                if not hasattr(self, "diff_run_mean"):
                     self.diff_run_mean = batch_d_mean.clone()
                     self.diff_run_var = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
 
                 self.diff_run_mean = self.diff_run_mean.float()
                 self.diff_run_var = self.diff_run_var.float()
 
-                self.diff_run_mean = (momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean)
-                
+                self.diff_run_mean = momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean
+
                 # 🚨 PERBAIKAN 3: Hitung Variance dengan aman di FP32
                 curr_var = (batch_d_mean - self.diff_run_mean) ** 2
-                self.diff_run_var = (momentum * self.diff_run_var + (1 - momentum) * curr_var)
+                self.diff_run_var = momentum * self.diff_run_var + (1 - momentum) * curr_var
 
                 # Batas min dinaikkan ke 1e-4 agar root(var) benar-benar jauh dari 0
-                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4) 
-                
+                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4)
+
                 diff_score_norm = (diff_score - self.diff_run_mean) / d_std_global
-                
+
                 # 🚨 PERBAIKAN 4: Sabuk Pengaman Z-Score sebelum Eksponensial!
                 # Jika nilai Z sangat ekstrem (misal -30), exp(30) akan menjadi Inf.
                 # Kita pasung nilai Z-score di ambang wajar [-10.0, 10.0]
@@ -448,15 +445,15 @@ class v8DetectionLoss:
                 # Hitung diskon/hukuman akhir
                 difficulty_weight = torch.exp(-diff_score_norm).clamp(0.1, 2.0).mean()
 
-        except Exception as e:
-            pass 
+        except Exception:
+            pass
 
         # ==========================================================
         # 7. HITUNG TOTAL HYBRID ROUTER LOSS
         # ==========================================================
-        alpha = getattr(self, 'alpha', 0.5) 
-        hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
-        
+        alpha = getattr(self, "alpha", 0.5)
+        hybrid_weight = alpha * relative_penalty + (1 - alpha) * difficulty_weight
+
         # 🚨 PERBAIKAN 5: Pastikan final dikembalikan ke tipe asal (FP16)
         final_router_loss = target_lambda * p2_active_prob * hybrid_weight
         loss[3] = final_router_loss.to(loss.dtype)
@@ -464,16 +461,16 @@ class v8DetectionLoss:
         # ==========================================================
         # 8. DEBUGGING LOG (TERMINAL) & MEMORY BUFFERING (CSV)
         # ==========================================================
-        if not hasattr(self, 'debug_counter'):
+        if not hasattr(self, "debug_counter"):
             self.debug_counter = 0
-            
+
         self.debug_counter += 1
 
-        TOTAL_BATCHES = getattr(self.model, 'total_batches', 324) 
-        
+        TOTAL_BATCHES = getattr(self.model, "total_batches", 324)
+
         current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 4
         current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
-        
+
         val_lambda = float(target_lambda)
         val_p2_prob = p2_log_prob.item() if isinstance(p2_log_prob, torch.Tensor) else p2_log_prob
         val_rel = relative_penalty.item() if isinstance(relative_penalty, torch.Tensor) else relative_penalty
@@ -481,20 +478,28 @@ class v8DetectionLoss:
         val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
         if self.debug_counter % 100 == 0:
-            print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
-                  f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
+            print(
+                f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
+                f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}"
+            )
 
-        if not hasattr(self.model, 'router_buffer'):
+        if not hasattr(self.model, "router_buffer"):
             self.model.router_buffer = []
 
         val_data = [
-            current_epoch, current_batch, f"{val_lambda:.4f}", 
-            f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}"
+            current_epoch,
+            current_batch,
+            f"{val_lambda:.4f}",
+            f"{val_p2_prob:.6f}",
+            f"{val_rel:.6f}",
+            f"{val_diff:.6f}",
+            f"{val_final_l3:.6f}",
         ]
 
         self.model.router_buffer.append(val_data)
-        
+
         return loss
+
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
