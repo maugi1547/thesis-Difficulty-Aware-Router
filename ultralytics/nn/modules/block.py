@@ -3022,13 +3022,18 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         # =========================================================================
         hidden_dim = max(c_p3 // 4, 16) 
         
+        # Kompresi P3 (80x80 -> 20x20)
+        # Kernel 4 dan Stride 4: Melihat blok 4x4, lalu geser 4x4 (pas, tidak ada celah)
         self.squeeze_p3 = nn.Sequential(
-            nn.Conv2d(c_p3, hidden_dim, kernel_size=3, stride=4, padding=1, bias=False),
+            nn.Conv2d(c_p3, hidden_dim, kernel_size=4, stride=4, padding=0, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.SiLU()
         )
+        
+        # Kompresi P2 (160x160 -> 20x20)
+        # Kernel 8 dan Stride 8: Melihat blok 8x8, lalu geser 8x8 (pas, mencakup 100% area)
         self.squeeze_p2 = nn.Sequential(
-            nn.Conv2d(c_p2, hidden_dim, kernel_size=3, stride=8, padding=1, bias=False),
+            nn.Conv2d(c_p2, hidden_dim, kernel_size=8, stride=8, padding=0, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.SiLU()
         )
