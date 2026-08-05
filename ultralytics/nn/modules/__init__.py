@@ -61,6 +61,7 @@ from .block import (
     TorchVision,
     DifficultyAwareRouter,
     LightWeightDifficultyAwareRouter,
+    UltraLightWeightDifficultyAwareRouter,
 )
 from .conv import (
     CBAM,
@@ -179,6 +180,7 @@ __all__ = (
     "TransformerBlock",
     "TransformerEncoderLayer",
     "TransformerLayer",
+    "UltraLightWeightDifficultyAwareRouter"
     "WorldDetect",
     "YOLOEDetect",
     "YOLOESegment",

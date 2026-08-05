@@ -348,7 +348,7 @@ class v8DetectionLoss:
         raw_model = unwrap_model(self.model)
         
         for m in raw_model.modules():
-            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter']:
+            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter','UltraLightWeightDifficultyAwareRouter']:
                 router = m
                 break
 

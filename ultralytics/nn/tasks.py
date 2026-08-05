@@ -66,6 +66,7 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     TorchVision,
+    UltraLightWeightDifficultyAwareRouter,
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
@@ -1739,6 +1740,21 @@ def parse_model(d, ch, verbose=True):
             
             # 4. Set ukuran channel akhir (c2)
             c2 = args[2]
+        elif m is UltraLightWeightDifficultyAwareRouter:
+                    c_p3 = ch[f[0]] # Ambil channel P3 dari layer sebelumnya
+                    c_p2 = ch[f[1]] # Ambil channel P2 dari layer sebelumnya
+                    
+                    # 1. PENSKALAAN CHANNEL (WIDTH)
+                    c2f_out_scaled = make_divisible(args[0] * width, 8)
+                    
+                    # 2. PENSKALAAN BOTTLENECK (DEPTH)
+                    n_bottleneck_scaled = max(round(args[1] * depth), 1) if len(args) > 1 else 1
+                    
+                    # 3. RAKIT KEMBALI ARGUMEN 
+                    args = [c_p3, c_p2, c2f_out_scaled, n_bottleneck_scaled, *args[2:]]
+                    
+                    # 4. Set ukuran channel akhir (c2)
+                    c2 = args[2]
         else:
             c2 = ch[f]
 
@@ -1760,7 +1776,8 @@ def parse_model(d, ch, verbose=True):
     # 1. Cek apakah ada Router di dalam tumpukan arsitektur model ini (String Match)
     has_router = any(
         'DifficultyAwareRouter' in str(m.type) or 
-        'LightWeightDifficultyAwareRouter' in str(m.type) 
+        'LightWeightDifficultyAwareRouter' in str(m.type) or 
+        'UltraLightWeightDifficultyAwareRouter' in str(m.type)
         for m in layers
     )
     
