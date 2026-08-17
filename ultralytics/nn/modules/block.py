@@ -2989,13 +2989,14 @@ class LightWeightDifficultyAwareRouter(nn.Module):
 
         return output
 
+"""
 class UltraLightWeightDifficultyAwareRouter(nn.Module):
-    """
+    ""
     ULTRA-LIGHT HARDWARE-FRIENDLY ROUTER DENGAN AUXILIARY TRAINING BRANCH
     ---------------------------------------------------------------------
     - Saat Inferensi: Murni menggunakan Strided Convolutions (Sangat Cepat di GPU).
     - Saat Training : Mengaktifkan Proxy Head (Entropy, Var) untuk menyuplai Router Loss.
-    """
+    ""
     def __init__(
         self,
         c_p3: int,
@@ -3203,6 +3204,247 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
             probs = F.softmax(logits_safe / tau_infer, dim=1)
             
             # THRESHOLD THESIS: Gunakan 0.50 untuk menyeimbangkan latensi!
+            gate_mask = (probs[:, 1] > 0.50).float().view(B, 1, 1, 1).to(f_p3.dtype)
+            
+            if not torch.jit.is_tracing():
+                self.current_activation_prob = gate_mask.mean().detach()
+                if gate_mask.abs().max() == 0.0:
+                    H2, W2 = f_p2_back.shape[2], f_p2_back.shape[3]
+                    return torch.zeros((B, self.c2f_out, H2, W2), device=f_p3.device, dtype=f_p3.dtype)
+
+            f_c2f = self.compute_expert(f_p3, f_p2_back)
+            return f_c2f * gate_mask
+"""
+
+# Dibawah ini desain modul ultralight router versi 2 (sementara, yang asli ada diatas)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Tuple
+from ultralytics.nn.modules import C2f
+
+class LightWeightDifficultyAwareRouter(nn.Module):
+    """
+    ULTRA-LIGHT HARDWARE-FRIENDLY ROUTER (TENSORRT OPTIMIZED)
+    ---------------------------------------------------------------------
+    1. 100% Fully Convolutional (Tanpa nn.Linear).
+    2. Dimensi 4D dipertahankan dari awal hingga akhir (Tanpa Flatten memory).
+    3. Bebas AdaptiveAvgPool2d (Menggunakan Native Spatial Mean).
+    """
+    def __init__(
+        self,
+        c_p3: int,
+        c_p2: int,
+        c2f_out: int,
+        n_bottleneck: int = 1,
+        shortcut: bool = False,
+        num_classes: int = 1,
+        reg_max: int = 16,
+        warmup_epochs: int = 5,
+    ):
+        super().__init__()
+        self.c_p3 = c_p3
+        self.c_p2 = c_p2
+        self.c2f_out = c2f_out
+        self.num_classes = num_classes
+        self.reg_max = reg_max
+        self.warmup_epochs = warmup_epochs
+        
+        self.tau_param = nn.Parameter(torch.tensor(1.5))
+
+        # =========================================================================
+        # 1. JALUR UTAMA INFERENSI (MURNI CONVOLUTION & COMPUTE-BOUND)
+        # =========================================================================
+        hidden_dim = max(c_p3 // 4, 16) 
+        
+        # Kompresi P3 (Stride 4)
+        self.squeeze_p3 = nn.Sequential(
+            nn.Conv2d(c_p3, hidden_dim, kernel_size=4, stride=4, padding=0, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.SiLU()
+        )
+        
+        # Kompresi P2 (Stride 8)
+        self.squeeze_p2 = nn.Sequential(
+            nn.Conv2d(c_p2, hidden_dim, kernel_size=8, stride=8, padding=0, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.SiLU()
+        )
+
+        # 🚨 PERBAIKAN 1 & 2: PENGGANTI LINEAR DAN ADAPTIVE POOLING 🚨
+        # Menggunakan Pointwise Convolution (Conv 1x1) untuk menggantikan nn.Linear.
+        # Ini memungkinkan TensorRT melakukan Kernel Fusion secara sempurna tanpa memutus graf 4D.
+        self.classifier = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(hidden_dim // 2),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim // 2, 2, kernel_size=1, stride=1, padding=0, bias=True)
+        )
+        
+        # Inisialisasi bias (Layer Conv terakhir memiliki bias)
+        nn.init.constant_(self.classifier[-1].bias[0], -1.0) 
+        nn.init.constant_(self.classifier[-1].bias[1],  1.0) 
+
+        # =========================================================================
+        # 2. AUXILIARY BRANCH (HANYA TRAINING)
+        # =========================================================================
+        self.proxy_pool = nn.MaxPool2d(kernel_size=4, stride=4)
+        hidden_c = max(c_p3 // 8, 16) 
+
+        self.proxy_stem = nn.Sequential(
+            nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=True),
+            nn.SiLU()
+        )
+        self.proxy_cls = nn.Sequential(
+            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden_c, num_classes, kernel_size=1, bias=True) 
+        )
+        self.proxy_reg_dist = nn.Sequential(
+            nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden_c, reg_max, kernel_size=1, bias=True) 
+        )
+
+        # =========================================================================
+        # 3. EXPERT MODULE (C2f P2 Asli)
+        # =========================================================================
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.c2f_p2 = C2f(c_p3 + c_p2, c2f_out, n=n_bottleneck, shortcut=shortcut)
+
+        # =========================================================================
+        # 4. TRACKING STATE
+        # =========================================================================
+        self.current_epoch = 0
+        self._is_warmup = True
+        self.current_activation_prob = torch.tensor(0.0)
+        self.loss_prob = torch.tensor(0.0)
+        
+        self.last_entropy = torch.tensor(0.0)
+        self.last_conf = torch.tensor(0.0)
+        self.last_var = torch.tensor(0.0)
+
+    # -------------------------------------------------------------------------
+    # FUNGSI-FUNGSI STATISTIK (HANYA DIPANGGIL SAAT TRAINING)
+    # -------------------------------------------------------------------------
+    def set_epoch(self, epoch: int):
+        self.current_epoch = epoch
+        self._is_warmup = (epoch < self.warmup_epochs)
+
+    def _topk_mean(self, t4d: torch.Tensor, B: int, K: int) -> torch.Tensor:
+        flat = t4d.view(B, 1, -1)
+        topk, _ = torch.topk(flat, k=K, dim=-1)
+        return 0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1)
+
+    def _compute_stats(self, cls_logits: torch.Tensor, reg_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        eps = 1e-6 
+        B = cls_logits.shape[0]
+        K = 10 
+
+        if self.num_classes == 1:
+            prob = torch.sigmoid(cls_logits)
+            prob_safe = prob.clamp(min=eps, max=1.0 - eps)
+            entropy_map = -(prob_safe * torch.log(prob_safe) + (1 - prob_safe) * torch.log(1 - prob_safe))
+            unc_conf = 1 - prob
+        else:
+            prob = torch.softmax(cls_logits, dim=1)
+            prob_safe = prob.clamp(min=eps, max=1.0 - eps) 
+            entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
+            unc_conf = 1 - prob.max(dim=1, keepdim=True).values
+
+        avg_entropy = self._topk_mean(entropy_map, B, K)
+        avg_conf    = self._topk_mean(unc_conf, B, K)
+
+        dist_prob = F.softmax(reg_logits, dim=1)
+        bins = torch.arange(self.reg_max, device=cls_logits.device, dtype=cls_logits.dtype).view(1, self.reg_max, 1, 1)
+        y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
+        var_map = (dist_prob * (bins - y_hat) ** 2).sum(dim=1, keepdim=True)
+        dfl_var = self._topk_mean(var_map, B, K)
+
+        return avg_entropy, avg_conf, dfl_var
+
+    def _get_uncertainty_signals(self, f_p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        f_p3_pooled = self.proxy_pool(f_p3)
+        stem_out = self.proxy_stem(f_p3_pooled)
+        cls_logits = self.proxy_cls(stem_out) 
+        reg_logits = self.proxy_reg_dist(stem_out)
+        return self._compute_stats(cls_logits, reg_logits)
+
+    def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        f_p3_up = self.upsample(f_p3)
+        f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
+        return self.c2f_p2(f_fused)
+
+    # -------------------------------------------------------------------------
+    # FORWARD PASS UTAMA
+    # -------------------------------------------------------------------------
+    def forward(self, x: list) -> torch.Tensor:
+        f_p3 = x[0]
+        f_p2_back = x[1]
+        B = f_p3.shape[0]
+
+        # 1. JALUR UTAMA INFERENSI (Strided Convolutions - Super Cepat)
+        z_p3 = self.squeeze_p3(f_p3.detach())
+        z_p2 = self.squeeze_p2(f_p2_back.detach())
+        z_fused = z_p3 + z_p2
+        
+        # 🚨 PERBAIKAN 3: MENGGUNAKAN NATIVE SPATIAL MEAN 🚨
+        # Menggantikan AdaptiveAvgPool2d dengan reduksi dimensi native.
+        # Operasi ini direpresentasikan sebagai IReduceLayer pada TensorRT dan bebas barrier memori.
+        z_pool = z_fused.mean(dim=[2, 3], keepdim=True) # Output tetap 4D: (B, hidden_dim, 1, 1)
+        
+        # Menggunakan Conv 1x1 alih-alih nn.Linear
+        logits_raw = self.classifier(z_pool) # Output: (B, 2, 1, 1)
+        
+        # Penyesuaian shape sebelum masuk aktivasi Gumbel/Softmax
+        logits_fp32 = logits_raw.view(B, 2).float() 
+        logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
+        tau = F.softplus(self.tau_param.float()) + 0.1
+
+        # =====================================================================
+        # 2. JALUR TRAINING (Auxiliary Branch diaktifkan untuk menyuplai Loss)
+        # =====================================================================
+        if self.training:
+            # 🚨 INI DIA! Menghitung Entropy, Conf, Var HANYA saat training
+            entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3.detach())
+            self.last_entropy = entropy.mean().detach()
+            self.last_conf = conf.mean().detach()
+            self.last_var = dfl_var.mean().detach()
+
+            # Gumbel Softmax untuk Training
+            soft_fp32 = F.gumbel_softmax(logits_safe, tau=tau, hard=False, dim=1)
+            soft = soft_fp32.to(f_p3.dtype)
+            
+            if self._is_warmup:
+                hard_warmup = torch.zeros_like(soft)
+                hard_warmup[:, 1] = 1.0 
+                gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1)
+                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1)
+                
+                self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
+                self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
+            else:
+                hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
+                gate_onehot = hard - soft.detach() + soft
+                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1)
+                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1)
+                
+                self.loss_prob = F.softmax(logits_safe, dim=1)[:, 1].mean()
+                self.current_activation_prob = hard[:, 1].mean().detach()
+
+            f_c2f = self.compute_expert(f_p3, f_p2_back)
+            return (f_c2f * gate_scalar_feature) + (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
+            
+        # =====================================================================
+        # 3. JALUR INFERENSI (ONNX / TensorRT / Dunia Nyata)
+        # =====================================================================
+        else:
+            # CPU/GPU tidak akan lagi tersiksa oleh Branch Proxy dan Layer 2D!
+            tau_infer = tau.detach()
+            probs = F.softmax(logits_safe / tau_infer, dim=1)
+            
+            # THRESHOLD THESIS: Menggunakan ambang batas seimbang
             gate_mask = (probs[:, 1] > 0.50).float().view(B, 1, 1, 1).to(f_p3.dtype)
             
             if not torch.jit.is_tracing():
