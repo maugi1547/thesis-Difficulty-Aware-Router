@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # Load model dari YAML yang baru kita buat
-model = YOLO("ultralytics/cfg/models/v8/yolov8n-lightrouter.yaml")
+model = YOLO("ultralytics/cfg/models/v8/yolov8n-ultralightrouter.yaml")
 
 # Coba print info model
 model.info()
