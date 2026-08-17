@@ -3218,13 +3218,8 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
 
 # Dibawah ini desain modul ultralight router versi 2 (sementara, yang asli ada diatas)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Tuple
-from ultralytics.nn.modules import C2f
 
-class LightWeightDifficultyAwareRouter(nn.Module):
+class UltraLightWeightDifficultyAwareRouter(nn.Module):
     """
     ULTRA-LIGHT HARDWARE-FRIENDLY ROUTER (TENSORRT OPTIMIZED)
     ---------------------------------------------------------------------
