@@ -180,7 +180,7 @@ __all__ = (
     "TransformerBlock",
     "TransformerEncoderLayer",
     "TransformerLayer",
-    "UltraLightWeightDifficultyAwareRouter"
+    "UltraLightWeightDifficultyAwareRouter",
     "WorldDetect",
     "YOLOEDetect",
     "YOLOESegment",

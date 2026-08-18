@@ -343,6 +343,13 @@ class v8DetectionLoss:
         if not self.model.training:
             return loss
 
+        # --- TAMBAHKAN GUARD INI ---
+        if not getattr(self, "_compute_router_penalty", True):
+            if loss.shape[0] == 3:
+                loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
+            return loss  # skip semua logic router untuk instance loss_B
+        # ----------------------------
+
         router = None
         from ultralytics.utils.torch_utils import unwrap_model
         raw_model = unwrap_model(self.model)
