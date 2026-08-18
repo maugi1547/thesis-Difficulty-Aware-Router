@@ -62,6 +62,8 @@ class DualBranchDetectionModel(DetectionModel):
         max_idx = max(embed)
 
         det_A_out, det_B_out = None, None
+        detect_A = getattr(self, "detect_A", None)  # <-- guard: None saat masih di dalam super().__init__()
+        detect_B = getattr(self, "detect_B", None)
 
         for m in self.model:
             if m.f != -1:
@@ -70,11 +72,16 @@ class DualBranchDetectionModel(DetectionModel):
             if profile:
                 self._profile_one_layer(m, x, dt)
 
-            x = m(x)  # run — sama seperti versi asli
+            x = m(x)
 
-            if m is self.detect_A:
+            if detect_A is not None and m is detect_A:
                 det_A_out = x
-            elif m is self.detect_B:
+            elif detect_B is not None and m is detect_B:
+                det_B_out = x
+            elif isinstance(m, Detect) and detect_A is None and detect_B is None:
+                # fallback SEMENTARA saat super().__init__() masih berjalan
+                # (detect_A/detect_B belum di-assign) — anggap ini "single detect"
+                det_A_out = x
                 det_B_out = x
 
             y.append(x if m.i in self.save else None)
