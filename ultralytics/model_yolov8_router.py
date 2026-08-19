@@ -20,38 +20,42 @@ class DualBranchDetectionModel(DetectionModel):
     def __init__(self, cfg="yolov8-p2-router.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
-        # --- Cari kedua instance Detect ---
         self.detect_layers = [m for m in self.model if isinstance(m, Detect)]
         assert len(self.detect_layers) == 2, (
-            f"Expected exactly 2 Detect heads in YAML, found {len(self.detect_layers)}. "
-            f"Cek urutan layer di YAML — Detect_A harus muncul sebelum Detect_B."
+            f"Expected exactly 2 Detect heads in YAML, found {len(self.detect_layers)}."
         )
-        self.detect_A, self.detect_B = self.detect_layers  # urutan sesuai YAML (A dulu, B kedua/terakhir)
+        self.detect_A, self.detect_B = self.detect_layers
 
         # --- Stride & bias init untuk Detect_A ---
-        # (Detect_B == self.model[-1] sudah otomatis di-init oleh super().__init__())
         s = 256
         dummy = torch.zeros(1, ch, s, s)
         was_training = self.training
-        self.eval()
+
+        self.model.eval()          # matikan BN/dropout stat update
+        self.detect_A.training = True   # TAPI paksa Detect_A/B return list mentah (bukan decoded tuple)
+        self.detect_B.training = True
+
         with torch.no_grad():
             det_A_out, det_B_out = self._predict_once_dual(dummy)
-        self.detect_A.stride = torch.tensor([s / x.shape[-2] for x in det_A_out])
-        self.stride = self.detect_A.stride  # beberapa util Ultralytics baca model.stride langsung
-        self.detect_A.bias_init()
-        self.train(was_training)
 
-        assert self.detect_B.stride is not None and len(self.detect_B.stride) == 3, (
-            "Detect_B stride belum ter-init dengan benar oleh super().__init__(). "
-            "Pastikan Detect_B adalah layer TERAKHIR di YAML (self.model[-1])."
-        )
+        self.detect_A.stride = torch.tensor([s / x.shape[-2] for x in det_A_out])
+        self.stride = self.detect_A.stride
+        self.detect_A.bias_init()
+
+        self.detect_B.stride = torch.tensor([s / x.shape[-2] for x in det_B_out])
+        self.detect_B.bias_init()
+
+        # kembalikan training flag Detect ke default (akan di-set benar oleh self.train()/eval() nanti)
+        self.detect_A.training = was_training
+        self.detect_B.training = was_training
+        self.model.train(was_training)
 
         if verbose:
             print(f"[DualBranchDetectionModel] Detect_A stride: {self.detect_A.stride.tolist()} "
-                  f"({len(self.detect_A.stride)} scales)")
+                f"({len(self.detect_A.stride)} scales)")
             print(f"[DualBranchDetectionModel] Detect_B stride: {self.detect_B.stride.tolist()} "
-                  f"({len(self.detect_B.stride)} scales)")
-
+                f"({len(self.detect_B.stride)} scales)")
+            
     # -----------------------------------------------------------------
     # FORWARD PASS — replikasi persis _predict_once bawaan, + tangkap
     # output kedua Detect head secara terpisah.
