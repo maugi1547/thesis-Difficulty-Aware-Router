@@ -120,14 +120,22 @@ class DualBranchDetectionModel(DetectionModel):
     # LOSS — kirim KEDUA branch ke criterion
     # -----------------------------------------------------------------
     def loss(self, batch, preds=None):
+        """
+        Override loss() Ultralytics. CATATAN PENTING:
+        Parameter `preds` SENGAJA DIABAIKAN meski dikirim oleh DetectionValidator,
+        karena format preds dari situ (hasil forward() biasa -> branch A only)
+        TIDAK KOMPATIBEL dengan DualBranchDetectionLoss yang butuh (det_A, det_B).
+        Konsekuensinya: saat validasi, forward pass terjadi 2x per batch
+        (1x oleh validator utk metric, 1x di sini utk loss) — sedikit overhead,
+        tapi mencegah bug shape-mismatch yang jauh lebih berbahaya.
+        """
         if not hasattr(self, "criterion") or self.criterion is None:
             self.criterion = self.init_criterion()
 
         img = batch["img"]
-        if preds is None:
-            preds = self._predict_once_dual(img)  # (det_A_out, det_B_out)
+        preds_dual = self._predict_once_dual(img)  # SELALU recompute, jangan pakai preds argumen
 
-        return self.criterion(preds, batch)
+        return self.criterion(preds_dual, batch)
 
     def init_criterion(self):
         return DualBranchDetectionLoss(self)
