@@ -347,7 +347,7 @@ class v8DetectionLoss:
         )
         cx = (xv + 0.5) * stride  # (grid_h, grid_w)
         cy = (yv + 0.5) * stride
-
+        
         for b in range(B):
             valid = mask_gt[b, :, 0].bool()
             boxes = gt_bboxes[b][valid]  # (n_valid, 4) xyxy

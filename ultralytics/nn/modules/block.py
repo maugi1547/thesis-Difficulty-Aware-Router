@@ -3299,7 +3299,7 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         self.proxy_reg_dist = nn.Sequential(
             nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, reg_max * 4, kernel_size=1, bias=True)  # ubah dari reg_max -> reg_max*4
+            nn.Conv2d(hidden_c, reg_max, kernel_size=1, bias=True)   # <-- pastikan ini reg_max
         )
 
         # =========================================================================
