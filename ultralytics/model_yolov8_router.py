@@ -176,13 +176,10 @@ class DualBranchDetectionLoss:
     def __call__(self, preds, batch):
         det_A, det_B = preds
 
-        loss_A_sum, loss_A_items = self.loss_A(det_A, batch)
-        loss_B_sum, loss_B_items = self.loss_B(det_B, batch)
+        loss_A_sum, loss_A_items = self.loss_A(det_A, batch)   # sekarang 5 elemen: box,cls,dfl,router,proxy
+        loss_B_sum, loss_B_items = self.loss_B(det_B, batch)   # tetap 4 elemen: box,cls,dfl,0(router slot kosong)
 
         total_loss = loss_A_sum + self.branch_b_weight * loss_B_sum
-
-        # loss_A_items = [box_A, cls_A, dfl_A, router]
-        # loss_B_items = [box_B, cls_B, dfl_B, 0.0]  <- index 3 kosong krn _compute_router_penalty=False
-        combined_items = torch.cat([loss_A_items, loss_B_items[:3]])  # buang slot router dobel dari B
+        combined_items = torch.cat([loss_A_items, loss_B_items[:3]])  # 5 + 3 = 8, sudah benar
 
         return total_loss, combined_items.detach()
