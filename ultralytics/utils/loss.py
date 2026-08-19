@@ -453,8 +453,13 @@ class v8DetectionLoss:
 
 
     def compute_proxy_supervision_loss_wrapper(self, loss, batch, feat_shape):
+         # Selalu extend ke 5 elemen dulu, TERLEPAS dari training/eval
+        if loss.shape[0] == 4:
+            proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
+            loss = torch.cat([loss, proxy_slot])
+
         if not self.model.training:
-            return loss
+            return loss  # ukuran sudah 5, isi proxy=0 karena tidak dihitung saat eval
 
         router = None
         from ultralytics.utils.torch_utils import unwrap_model
@@ -511,14 +516,18 @@ class v8DetectionLoss:
         """
         Hitung router penalty dan tambahkan ke index [3] dari tensor loss.
         """
+        # Selalu pastikan ukuran loss konsisten (5 elemen: box,cls,dfl,router,proxy slot)
+        if loss.shape[0] == 3:
+            loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
+
         if not self.model.training:
-            return loss
+            return loss   # ukuran tetap 4, isi router=0 (tidak dihitung saat eval, itu wajar)
 
         # --- TAMBAHKAN GUARD INI ---
-        if not getattr(self, "_compute_router_penalty", True):
+        if not getattr(self, '_compute_router_penalty', True):
             if loss.shape[0] == 3:
                 loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
-            return loss  # skip semua logic router untuk instance loss_B
+            return loss
         # ----------------------------
 
         router = None
