@@ -3299,7 +3299,7 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         self.proxy_reg_dist = nn.Sequential(
             nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, reg_max, kernel_size=1, bias=True) 
+            nn.Conv2d(hidden_c, reg_max * 4, kernel_size=1, bias=True)  # ubah dari reg_max -> reg_max*4
         )
 
         # =========================================================================
@@ -3359,12 +3359,13 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
 
         return avg_entropy, avg_conf, dfl_var
 
-    def _get_uncertainty_signals(self, f_p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_uncertainty_signals(self, f_p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         f_p3_pooled = self.proxy_pool(f_p3)
         stem_out = self.proxy_stem(f_p3_pooled)
-        cls_logits = self.proxy_cls(stem_out) 
+        cls_logits = self.proxy_cls(stem_out)
         reg_logits = self.proxy_reg_dist(stem_out)
-        return self._compute_stats(cls_logits, reg_logits)
+        entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
+        return entropy, conf, dfl_var, cls_logits, reg_logits  # <-- tambahkan cls_logits, reg_logits
 
     def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
         f_p3_up = self.upsample(f_p3)
@@ -3402,10 +3403,14 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         # =====================================================================
         if self.training:
             # 🚨 INI DIA! Menghitung Entropy, Conf, Var HANYA saat training
-            entropy, conf, dfl_var = self._get_uncertainty_signals(f_p3.detach())
+            entropy, conf, dfl_var, cls_logits, reg_logits = self._get_uncertainty_signals(f_p3.detach())
             self.last_entropy = entropy.mean().detach()
             self.last_conf = conf.mean().detach()
             self.last_var = dfl_var.mean().detach()
+
+            # --- TAMBAHAN: simpan raw logits, dipakai loss.py utk supervisi ---
+            self._last_proxy_cls_logits = cls_logits
+            self._last_proxy_reg_logits = reg_logits
 
             # Gumbel Softmax untuk Training
             soft_fp32 = F.gumbel_softmax(logits_safe, tau=tau, hard=False, dim=1)

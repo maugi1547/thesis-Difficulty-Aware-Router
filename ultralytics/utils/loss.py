@@ -225,7 +225,7 @@ class v8DetectionLoss:
         # (tambahkan baris ini ke __init__ class yang relevan)
         # =========================================================
         self.alpha = 0.5          # bobot relative_penalty vs difficulty_weight
-        self.momentum = 0.95      # EMA untuk running average aktivasi P2
+        self.momentum = 0.99      # EMA untuk running average aktivasi P2
         # p2_running_avg diinisialisasi lazy saat pertama kali dipakai
 
 
@@ -316,9 +316,179 @@ class v8DetectionLoss:
 
         # Di akhir v8DetectionLoss.__call__(), sebelum return:
         loss = self.compute_router_loss(loss)
+        # --- TAMBAHAN: proxy supervision loss ---
+        loss = self.compute_proxy_supervision_loss_wrapper(loss, batch, feats[0].shape[2:])
 
         return loss.sum() * batch_size, loss.detach()
         # ---------------------------------------------------------------
+
+    def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, reg_max, device):
+        """
+        gt_bboxes: (B, N, 4) xyxy dalam skala pixel gambar penuh
+        gt_labels: (B, N, 1)
+        mask_gt:   (B, N, 1) — 1 kalau GT valid
+        grid_h, grid_w: resolusi grid proxy (setelah pooling, sama dgn P3_pooled)
+        stride: stride efektif grid ini (biasanya 32, sama seperti P5)
+        reg_max: jumlah bin DFL (ikut config Detect Anda)
+
+        Return:
+        cls_target: (B, 1, grid_h, grid_w)     — 1 di cell yang overlap GT, 0 lainnya
+        reg_target: (B, 4, grid_h, grid_w)     — jarak (l,t,r,b) dari cell center ke box, dalam satuan stride
+        fg_mask:    (B, grid_h, grid_w)        — cell mana yang dihitung utk reg loss
+        """
+        B = gt_bboxes.shape[0]
+        cls_target = torch.zeros(B, 1, grid_h, grid_w, device=device)
+        reg_target = torch.zeros(B, 4, grid_h, grid_w, device=device)
+        fg_mask = torch.zeros(B, grid_h, grid_w, dtype=torch.bool, device=device)
+
+        # Grid cell centers dalam skala pixel
+        yv, xv = torch.meshgrid(
+            torch.arange(grid_h, device=device), torch.arange(grid_w, device=device), indexing="ij"
+        )
+        cx = (xv + 0.5) * stride  # (grid_h, grid_w)
+        cy = (yv + 0.5) * stride
+
+        for b in range(B):
+            valid = mask_gt[b, :, 0].bool()
+            boxes = gt_bboxes[b][valid]  # (n_valid, 4) xyxy
+            if boxes.shape[0] == 0:
+                continue
+
+            for box in boxes:
+                x1, y1, x2, y2 = box
+                # cell dianggap foreground kalau center-nya berada di dalam box GT
+                inside = (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
+                if inside.sum() == 0:
+                    # fallback: box terlalu kecil utk grid kasar ini, assign ke cell terdekat dgn center box
+                    bcx, bcy = (x1 + x2) / 2, (y1 + y2) / 2
+                    dist = (cx - bcx) ** 2 + (cy - bcy) ** 2
+                    inside = dist == dist.min()
+
+                cls_target[b, 0][inside] = 1.0
+                fg_mask[b][inside] = True
+
+                # target jarak (l,t,r,b) ternormalisasi ke satuan stride, utk cell yg foreground
+                l = (cx[inside] - x1) / stride
+                t = (cy[inside] - y1) / stride
+                r = (x2 - cx[inside]) / stride
+                bt = (y2 - cy[inside]) / stride
+                reg_target[b, 0][inside] = l.clamp(0, reg_max - 1.01)
+                reg_target[b, 1][inside] = t.clamp(0, reg_max - 1.01)
+                reg_target[b, 2][inside] = r.clamp(0, reg_max - 1.01)
+                reg_target[b, 3][inside] = bt.clamp(0, reg_max - 1.01)
+
+        return cls_target, reg_target, fg_mask
+
+    def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz, device):
+        """
+        router: instance UltraLightWeightDifficultyAwareRouter (utk ambil reg_max, num_classes)
+        cls_logits, reg_logits: dari router._last_proxy_cls_logits / _last_proxy_reg_logits
+                                (disimpan saat forward training, lihat perubahan #3 di bawah)
+        batch: dict batch dari trainer (punya batch_idx, cls, bboxes dlm format ternormalisasi)
+        imgsz: (H, W) ukuran gambar input model saat ini
+        """
+        B, _, grid_h, grid_w = cls_logits.shape
+        reg_max = router.reg_max
+
+        # --- Reconstruct GT dalam format (B, N, 4) xyxy piksel, sama seperti v8DetectionLoss.preprocess ---
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        scale_tensor = torch.tensor([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], device=device)
+
+        nl = targets.shape[0]
+        if nl == 0:
+            gt_bboxes = torch.zeros(B, 0, 4, device=device)
+            gt_labels = torch.zeros(B, 0, 1, device=device)
+            mask_gt = torch.zeros(B, 0, 1, dtype=torch.bool, device=device)
+        else:
+            i = targets[:, 0]
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(B, counts.max(), targets.shape[1] - 1, device=device)
+            for j in range(B):
+                matches = i == j
+                if n := matches.sum():
+                    out[j, :n] = targets[matches, 1:]
+            from ultralytics.utils.ops import xywh2xyxy
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+            gt_labels, gt_bboxes = out.split((1, 4), 2)
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        # Stride grid proxy: imgsz[0] / grid_h (biasanya = 32 kalau proxy di resolusi P5-like)
+        stride = imgsz[0] / grid_h
+
+        cls_target, reg_target, fg_mask = build_proxy_targets(
+            gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, reg_max, device
+        )
+
+        # --- Cls loss: BCE objectness ---
+        proxy_cls_loss = F.binary_cross_entropy_with_logits(cls_logits, cls_target, reduction="mean")
+
+        # --- Reg loss: DFL-style, HANYA di cell foreground ---
+        if fg_mask.sum() > 0:
+            # reg_logits: (B, reg_max, grid_h, grid_w) -> perlu di-reshape agar sejalan dgn 4 sisi (l,t,r,b)
+            # CATATAN PENTING: proxy_reg_dist saat ini cuma output reg_max channel TOTAL,
+            # bukan reg_max x 4 sisi seperti Detect asli. Untuk skema simpel ini,
+            # kita treat sebagai representasi "jarak rata-rata" gabungan, bukan per-sisi.
+            # Kalau ingin presisi per-sisi, ARSITEKTUR proxy_reg_dist perlu diubah
+            # output-nya jadi reg_max*4 channel (lihat catatan di bawah).
+            reg_target_avg = reg_target.mean(dim=1, keepdim=False)  # (B, grid_h, grid_w), rata2 l,t,r,b
+            reg_target_fg = reg_target_avg[fg_mask].clamp(0, reg_max - 1.01)
+
+            reg_logits_fg = reg_logits.permute(0, 2, 3, 1)[fg_mask]  # (n_fg, reg_max)
+
+            target_left = reg_target_fg.long()
+            target_right = target_left + 1
+            weight_left = target_right.float() - reg_target_fg
+            weight_right = 1.0 - weight_left
+
+            proxy_reg_loss = (
+                F.cross_entropy(reg_logits_fg, target_left.clamp(max=reg_max - 1), reduction="none") * weight_left
+                + F.cross_entropy(reg_logits_fg, target_right.clamp(max=reg_max - 1), reduction="none") * weight_right
+            ).mean()
+        else:
+            proxy_reg_loss = torch.tensor(0.0, device=device)
+
+        return proxy_cls_loss, proxy_reg_loss
+
+
+    def compute_proxy_supervision_loss_wrapper(self, loss, batch, feat_shape):
+        if not self.model.training:
+            return loss
+
+        router = None
+        from ultralytics.utils.torch_utils import unwrap_model
+        raw_model = unwrap_model(self.model)
+        for m in raw_model.modules():
+            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter', 'UltraLightWeightDifficultyAwareRouter']:
+                router = m
+                break
+
+        if router is None or not hasattr(router, "_last_proxy_cls_logits"):
+            return loss
+
+        # imgsz asli (bukan feat_shape) — feat_shape itu resolusi grid P3, imgsz = feat_shape[0]*stride_P3
+        stride_p3 = 8  # sesuaikan dgn stride P3 di model Anda
+        imgsz = (feat_shape[0] * stride_p3, feat_shape[1] * stride_p3)
+
+        proxy_cls_loss, proxy_reg_loss = compute_proxy_supervision_loss(
+            router,
+            router._last_proxy_cls_logits,
+            router._last_proxy_reg_logits,
+            batch,
+            imgsz,
+            self.device
+        )
+
+        proxy_weight = getattr(self.model, "proxy_supervision_weight", 0.1)  # bobot kecil, ini cuma auxiliary
+
+        # Tambahkan sebagai komponen ke-5 (perlu extend tensor loss lagi)
+        if loss.shape[0] == 4:
+            proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
+            loss = torch.cat([loss, proxy_slot])
+
+        loss[4] = (proxy_weight * (proxy_cls_loss + proxy_reg_loss)).to(loss.dtype)
+
+        return loss
 
     # ============================================================
     # FILE: tambahan di ultralytics/utils/loss.py
