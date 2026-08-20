@@ -3221,7 +3221,7 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
 
 class UltraLightWeightDifficultyAwareRouter(nn.Module):
     """
-    ULTRA-LIGHT HARDWARE-FRIENDLY ROUTER (TENSORRT OPTIMIZED)
+    ULTRA-LIGHT ROUTER (TENSORRT OPTIMIZED)
     ---------------------------------------------------------------------
     1. 100% Fully Convolutional (Tanpa nn.Linear).
     2. Dimensi 4D dipertahankan dari awal hingga akhir (Tanpa Flatten memory).
@@ -3380,78 +3380,51 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         f_p2_back = x[1]
         B = f_p3.shape[0]
 
-        # 1. JALUR UTAMA INFERENSI (Strided Convolutions - Super Cepat)
         z_p3 = self.squeeze_p3(f_p3.detach())
         z_p2 = self.squeeze_p2(f_p2_back.detach())
         z_fused = z_p3 + z_p2
-        
-        # 🚨 PERBAIKAN 3: MENGGUNAKAN NATIVE SPATIAL MEAN 🚨
-        # Menggantikan AdaptiveAvgPool2d dengan reduksi dimensi native.
-        # Operasi ini direpresentasikan sebagai IReduceLayer pada TensorRT dan bebas barrier memori.
-        z_pool = z_fused.mean(dim=[2, 3], keepdim=True) # Output tetap 4D: (B, hidden_dim, 1, 1)
-        
-        # Menggunakan Conv 1x1 alih-alih nn.Linear
-        logits_raw = self.classifier(z_pool) # Output: (B, 2, 1, 1)
-        
-        # Penyesuaian shape sebelum masuk aktivasi Gumbel/Softmax
-        logits_fp32 = logits_raw.view(B, 2).float() 
+        z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
+        logits_raw = self.classifier(z_pool)
+        logits_fp32 = logits_raw.view(B, 2).float()
         logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
         tau = F.softplus(self.tau_param.float()) + 0.1
 
-        # =====================================================================
-        # 2. JALUR TRAINING (Auxiliary Branch diaktifkan untuk menyuplai Loss)
-        # =====================================================================
         if self.training:
-            # 🚨 INI DIA! Menghitung Entropy, Conf, Var HANYA saat training
             entropy, conf, dfl_var, cls_logits, reg_logits = self._get_uncertainty_signals(f_p3.detach())
             self.last_entropy = entropy.mean().detach()
             self.last_conf = conf.mean().detach()
             self.last_var = dfl_var.mean().detach()
-
-            # --- TAMBAHAN: simpan raw logits, dipakai loss.py utk supervisi ---
             self._last_proxy_cls_logits = cls_logits
             self._last_proxy_reg_logits = reg_logits
 
-            # Gumbel Softmax untuk Training
             soft_fp32 = F.gumbel_softmax(logits_safe, tau=tau, hard=False, dim=1)
             soft = soft_fp32.to(f_p3.dtype)
-            
+
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
-                hard_warmup[:, 1] = 1.0 
-                gate_scalar_router = (hard_warmup - soft.detach() + soft)[:, 1].view(B, 1, 1, 1)
-                gate_scalar_feature = hard_warmup[:, 1].view(B, 1, 1, 1)
-                
+                hard_warmup[:, 1] = 1.0
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
                 self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
             else:
                 hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
-                gate_onehot = hard - soft.detach() + soft
-                gate_scalar_router = gate_onehot[:, 1].view(B, 1, 1, 1)
-                gate_scalar_feature = hard[:, 1].view(B, 1, 1, 1)
-                
                 self.loss_prob = F.softmax(logits_safe, dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
+            # --- PERBAIKAN: SELALU return fitur P2 penuh, gate TIDAK memodulasi output ---
             f_c2f = self.compute_expert(f_p3, f_p2_back)
-            return (f_c2f * gate_scalar_feature) + (f_c2f.detach() * (gate_scalar_router - gate_scalar_feature))
-            
-        # =====================================================================
-        # 3. JALUR INFERENSI (ONNX / TensorRT / Dunia Nyata)
-        # =====================================================================
+            return f_c2f
+
         else:
-            # CPU/GPU tidak akan lagi tersiksa oleh Branch Proxy dan Layer 2D!
             tau_infer = tau.detach()
             probs = F.softmax(logits_safe / tau_infer, dim=1)
-            
-            # THRESHOLD THESIS: Menggunakan ambang batas seimbang
             gate_mask = (probs[:, 1] > 0.50).float().view(B, 1, 1, 1).to(f_p3.dtype)
-            
+
             if not torch.jit.is_tracing():
                 self.current_activation_prob = gate_mask.mean().detach()
-                if gate_mask.abs().max() == 0.0:
-                    H2, W2 = f_p2_back.shape[2], f_p2_back.shape[3]
-                    return torch.zeros((B, self.c2f_out, H2, W2), device=f_p3.device, dtype=f_p3.dtype)
 
+            # --- PERBAIKAN: SELALU compute & return fitur P2 penuh, TIDAK di-skip/di-mask ---
+            # True-skip HANYA boleh terjadi di level Python routing saat deployment
+            # (memanggil compute_expert() secara terpisah di Stage2A vs tidak sama sekali di Stage2B),
+            # BUKAN di dalam forward() ini.
             f_c2f = self.compute_expert(f_p3, f_p2_back)
-            return f_c2f * gate_mask
+            return f_c2f
