@@ -439,6 +439,34 @@ class v8DetectionLoss:
                 fg_mask,
             )
 
+        # =====================================================================
+        # TAMBAHAN TAHAP 2: hitung loss PER-SAMPLE (box + cls), dipakai
+        # gate_value_loss di DualBranchDetectionLoss. Di-detach karena ini
+        # HANYA sinyal/target, tidak boleh ikut backward loss deteksi ini sendiri.
+        # =====================================================================
+
+        per_image_target_sum = target_scores.sum(dim=[1, 2]).clamp(min=1.0)  # (B,)
+
+        cls_loss_per_anchor = self.bce(pred_scores, target_scores.to(dtype))  # (B, num_anchors, nc)
+        cls_loss_per_image = cls_loss_per_anchor.sum(dim=[1, 2]) / per_image_target_sum  # (B,)
+
+        if fg_mask.sum():
+            weight = target_scores.sum(-1)[fg_mask]  # (n_fg_total,)
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).squeeze(-1)
+            box_loss_raw = (1.0 - iou) * weight  # (n_fg_total,)
+
+            batch_idx_expanded = torch.arange(batch_size, device=self.device).view(-1, 1).expand_as(fg_mask)[fg_mask]
+            box_loss_per_image = torch.zeros(batch_size, device=self.device)
+            box_loss_per_image.scatter_add_(0, batch_idx_expanded, box_loss_raw)
+            box_loss_per_image = box_loss_per_image / per_image_target_sum
+        else:
+            box_loss_per_image = torch.zeros(batch_size, device=self.device)
+
+        self._last_per_sample_loss = (
+            box_loss_per_image * self.hyp.box + cls_loss_per_image * self.hyp.cls
+        ).detach()  # (B,)
+        # =====================================================================
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
@@ -509,7 +537,7 @@ class v8DetectionLoss:
     # Inisialisasi berikut WAJIB ada di __init__ DetectionLoss:
     #
     #   self.alpha        = 0.5    # bobot relative vs difficulty
-    #   self.momentum     = 0.95   # EMA running average aktivasi
+    #   self.momentum     = 0.99   # EMA running average aktivasi
     #   # p2_running_avg diinisialisasi lazy saat pertama dipakai
     # ============================================================
     def compute_router_loss(self, loss: torch.Tensor) -> torch.Tensor:

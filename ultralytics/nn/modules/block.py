@@ -3400,6 +3400,10 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
             soft_fp32 = F.gumbel_softmax(logits_safe, tau=tau, hard=False, dim=1)
             soft = soft_fp32.to(f_p3.dtype)
 
+            # --- TAMBAHAN TAHAP 2: simpan gate probability PER-SAMPLE ---
+            # Dipakai gate_value_loss di DualBranchDetectionLoss, bukan untuk masking p2_out.
+            self._last_gate_prob_per_sample = F.softmax(logits_safe, dim=1)[:, 1]  # shape (B,)
+
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0
@@ -3410,7 +3414,6 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
                 self.loss_prob = F.softmax(logits_safe, dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
-            # --- PERBAIKAN: SELALU return fitur P2 penuh, gate TIDAK memodulasi output ---
             f_c2f = self.compute_expert(f_p3, f_p2_back)
             return f_c2f
 
@@ -3422,9 +3425,22 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
             if not torch.jit.is_tracing():
                 self.current_activation_prob = gate_mask.mean().detach()
 
-            # --- PERBAIKAN: SELALU compute & return fitur P2 penuh, TIDAK di-skip/di-mask ---
-            # True-skip HANYA boleh terjadi di level Python routing saat deployment
-            # (memanggil compute_expert() secara terpisah di Stage2A vs tidak sama sekali di Stage2B),
-            # BUKAN di dalam forward() ini.
             f_c2f = self.compute_expert(f_p3, f_p2_back)
             return f_c2f
+
+        # --- Method tambahan untuk export nanti (Tahap 5), sudah disiapkan strukturnya ---
+        def compute_gate_only(self, f_p3, f_p2_back):
+            B = f_p3.shape[0]
+            z_p3 = self.squeeze_p3(f_p3.detach())
+            z_p2 = self.squeeze_p2(f_p2_back.detach())
+            z_fused = z_p3 + z_p2
+            z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
+            logits_raw = self.classifier(z_pool)
+            logits_fp32 = logits_raw.view(B, 2).float()
+            logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
+            tau_infer = (F.softplus(self.tau_param.float()) + 0.1).detach()
+            probs = F.softmax(logits_safe / tau_infer, dim=1)
+            return (probs[:, 1] > 0.5).float()
+
+        def compute_expert_only(self, f_p3, f_p2_back):
+            return self.compute_expert(f_p3, f_p2_back)

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.nn.modules import Detect
 from ultralytics.utils.loss import v8DetectionLoss
@@ -173,13 +174,99 @@ class DualBranchDetectionLoss:
 
         self.branch_b_weight = getattr(raw_model, "branch_b_loss_weight", 0.7)
 
+        # --- TAMBAHAN TAHAP 2: hyperparameter baru ---
+        self.gate_value_weight = getattr(raw_model, "gate_value_loss_weight", 0.5)
+        self.gate_value_margin = getattr(raw_model, "gate_value_margin", 0.02)
+
+        self._raw_model = raw_model
+        self._router_cache = None  # cache supaya tidak loop modules() tiap panggilan
+
+    def _find_router(self):
+        if self._router_cache is not None:
+            return self._router_cache
+        for m in self._raw_model.modules():
+            if 'DifficultyAwareRouter' in m.__class__.__name__:
+                self._router_cache = m
+                return m
+        return None
+
+
+class DualBranchDetectionLoss:
+    def __init__(self, model):
+        raw_model = model.module if hasattr(model, "module") else model
+
+        self.loss_A = v8DetectionLoss(model)
+        self.loss_A.stride = raw_model.detect_A.stride
+        self.loss_A.nc = raw_model.detect_A.nc
+        self.loss_A.no = raw_model.detect_A.nc + raw_model.detect_A.reg_max * 4
+        self.loss_A.reg_max = raw_model.detect_A.reg_max
+        self.loss_A.use_dfl = raw_model.detect_A.reg_max > 1
+        self.loss_A.assigner.num_classes = raw_model.detect_A.nc
+        self.loss_A._compute_router_penalty = True
+
+        self.loss_B = v8DetectionLoss(model)
+        self.loss_B.stride = raw_model.detect_B.stride
+        self.loss_B.nc = raw_model.detect_B.nc
+        self.loss_B.no = raw_model.detect_B.nc + raw_model.detect_B.reg_max * 4
+        self.loss_B.reg_max = raw_model.detect_B.reg_max
+        self.loss_B.use_dfl = raw_model.detect_B.reg_max > 1
+        self.loss_B.assigner.num_classes = raw_model.detect_B.nc
+        self.loss_B._compute_router_penalty = False
+
+        self.branch_b_weight = getattr(raw_model, "branch_b_loss_weight", 0.7)
+
+        # --- TAMBAHAN TAHAP 2: hyperparameter baru ---
+        self.gate_value_weight = getattr(raw_model, "gate_value_loss_weight", 0.5)
+        self.gate_value_margin = getattr(raw_model, "gate_value_margin", 0.02)
+
+        self._raw_model = raw_model
+        self._router_cache = None  # cache supaya tidak loop modules() tiap panggilan
+
+    def _find_router(self):
+        if self._router_cache is not None:
+            return self._router_cache
+        for m in self._raw_model.modules():
+            if 'DifficultyAwareRouter' in m.__class__.__name__:
+                self._router_cache = m
+                return m
+        return None
+
     def __call__(self, preds, batch):
         det_A, det_B = preds
 
-        loss_A_sum, loss_A_items = self.loss_A(det_A, batch)   # sekarang 5 elemen: box,cls,dfl,router,proxy
-        loss_B_sum, loss_B_items = self.loss_B(det_B, batch)   # tetap 4 elemen: box,cls,dfl,0(router slot kosong)
+        loss_A_sum, loss_A_items = self.loss_A(det_A, batch)
+        loss_B_sum, loss_B_items = self.loss_B(det_B, batch)
 
         total_loss = loss_A_sum + self.branch_b_weight * loss_B_sum
-        combined_items = torch.cat([loss_A_items, loss_B_items[:3]])  # 5 + 3 = 8, sudah benar
+        combined_items = torch.cat([loss_A_items, loss_B_items[:3]])
+
+        # =====================================================================
+        # TAMBAHAN TAHAP 2: gate_value_loss
+        # =====================================================================
+        router = self._find_router()
+        if (
+            router is not None
+            and self._raw_model.training
+            and hasattr(router, "_last_gate_prob_per_sample")
+            and hasattr(self.loss_A, "_last_per_sample_loss")
+            and hasattr(self.loss_B, "_last_per_sample_loss")
+        ):
+            per_sample_loss_A = self.loss_A._last_per_sample_loss  # (B,)
+            per_sample_loss_B = self.loss_B._last_per_sample_loss  # (B,)
+            gate_prob = router._last_gate_prob_per_sample           # (B,)
+
+            target_gate = (per_sample_loss_A < per_sample_loss_B - self.gate_value_margin).float().detach()
+
+            gate_value_loss = F.binary_cross_entropy(
+                gate_prob.clamp(1e-6, 1 - 1e-6), target_gate
+            )
+
+            batch_size = combined_items.new_tensor(gate_prob.shape[0])
+            total_loss = total_loss + self.gate_value_weight * gate_value_loss * batch_size
+
+            # simpan utk logging/debug opsional
+            self._last_gate_value_loss = gate_value_loss.detach()
+            self._last_target_gate_mean = target_gate.mean().detach()
+        # =====================================================================
 
         return total_loss, combined_items.detach()
