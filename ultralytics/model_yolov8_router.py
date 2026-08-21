@@ -215,12 +215,19 @@ class DualBranchDetectionLoss:
 
         self.branch_b_weight = getattr(raw_model, "branch_b_loss_weight", 0.7)
 
-        # --- TAMBAHAN TAHAP 2: hyperparameter baru ---
+        # --- Hyperparameter gate_value_loss ---
         self.gate_value_weight = getattr(raw_model, "gate_value_loss_weight", 0.5)
-        self.gate_value_margin = getattr(raw_model, "gate_value_margin", 0.02)
+        # temperature: seberapa "tajam" soft target bereaksi terhadap selisih loss_B - loss_A.
+        # Semakin KECIL temperature, semakin TAJAM (mendekati target biner keras).
+        # Semakin BESAR temperature, semakin HALUS/netral (target mendekati 0.5 utk selisih kecil).
+        self.gate_value_temperature = getattr(raw_model, "gate_value_temperature", 0.15)
 
         self._raw_model = raw_model
-        self._router_cache = None  # cache supaya tidak loop modules() tiap panggilan
+        self._router_cache = None
+
+        # simpan default utk logging kalau belum aktif (mis. masih warmup)
+        self._last_gate_value_loss = torch.tensor(0.0)
+        self._last_target_gate_mean = torch.tensor(0.0)
 
     def _find_router(self):
         if self._router_cache is not None:
@@ -241,23 +248,30 @@ class DualBranchDetectionLoss:
         combined_items = torch.cat([loss_A_items, loss_B_items[:3]])
 
         # =====================================================================
-        # TAMBAHAN TAHAP 2: gate_value_loss
+        # gate_value_loss — DENGAN warmup guard + soft target
         # =====================================================================
         router = self._find_router()
+        is_warmup = getattr(router, "_is_warmup", True) if router is not None else True
+
         if (
             router is not None
             and self._raw_model.training
-            and hasattr(router, "_last_gate_logit_per_sample")   # <-- ganti nama atribut
+            and not is_warmup                                    # <-- WARMUP GUARD
+            and hasattr(router, "_last_gate_logit_per_sample")
             and hasattr(self.loss_A, "_last_per_sample_loss")
             and hasattr(self.loss_B, "_last_per_sample_loss")
         ):
-            per_sample_loss_A = self.loss_A._last_per_sample_loss
-            per_sample_loss_B = self.loss_B._last_per_sample_loss
-            gate_logit = router._last_gate_logit_per_sample   # <-- logit mentah, bukan probabilitas
+            per_sample_loss_A = self.loss_A._last_per_sample_loss  # (B,)
+            per_sample_loss_B = self.loss_B._last_per_sample_loss  # (B,)
+            gate_logit = router._last_gate_logit_per_sample         # (B,)
 
-            target_gate = (per_sample_loss_A < per_sample_loss_B - self.gate_value_margin).float().detach()
+            # --- SOFT TARGET: sigmoid dari selisih relatif, BUKAN threshold biner keras ---
+            # diff > 0  => P2 menguntungkan (loss_A lebih kecil dari loss_B)
+            # diff ~ 0  => netral, target akan berada di sekitar 0.5 (tidak dipaksa ke 0 maupun 1)
+            # diff < 0  => P2 tidak menguntungkan, target mendekati 0
+            diff = (per_sample_loss_B - per_sample_loss_A).detach()
+            target_gate = torch.sigmoid(diff / self.gate_value_temperature)
 
-            # --- GANTI: pakai binary_cross_entropy_with_logits, aman utk AMP ---
             gate_value_loss = F.binary_cross_entropy_with_logits(gate_logit, target_gate)
 
             batch_size = combined_items.new_tensor(gate_logit.shape[0])
@@ -265,6 +279,10 @@ class DualBranchDetectionLoss:
 
             self._last_gate_value_loss = gate_value_loss.detach()
             self._last_target_gate_mean = target_gate.mean().detach()
+        else:
+            # selama warmup, tetap simpan nilai default utk logging supaya tidak error di callback
+            self._last_gate_value_loss = torch.tensor(0.0, device=combined_items.device)
+            self._last_target_gate_mean = torch.tensor(0.0, device=combined_items.device)
         # =====================================================================
 
         return total_loss, combined_items.detach()
