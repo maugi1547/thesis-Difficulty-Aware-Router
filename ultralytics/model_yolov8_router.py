@@ -247,24 +247,22 @@ class DualBranchDetectionLoss:
         if (
             router is not None
             and self._raw_model.training
-            and hasattr(router, "_last_gate_prob_per_sample")
+            and hasattr(router, "_last_gate_logit_per_sample")   # <-- ganti nama atribut
             and hasattr(self.loss_A, "_last_per_sample_loss")
             and hasattr(self.loss_B, "_last_per_sample_loss")
         ):
-            per_sample_loss_A = self.loss_A._last_per_sample_loss  # (B,)
-            per_sample_loss_B = self.loss_B._last_per_sample_loss  # (B,)
-            gate_prob = router._last_gate_prob_per_sample           # (B,)
+            per_sample_loss_A = self.loss_A._last_per_sample_loss
+            per_sample_loss_B = self.loss_B._last_per_sample_loss
+            gate_logit = router._last_gate_logit_per_sample   # <-- logit mentah, bukan probabilitas
 
             target_gate = (per_sample_loss_A < per_sample_loss_B - self.gate_value_margin).float().detach()
 
-            gate_value_loss = F.binary_cross_entropy(
-                gate_prob.clamp(1e-6, 1 - 1e-6), target_gate
-            )
+            # --- GANTI: pakai binary_cross_entropy_with_logits, aman utk AMP ---
+            gate_value_loss = F.binary_cross_entropy_with_logits(gate_logit, target_gate)
 
-            batch_size = combined_items.new_tensor(gate_prob.shape[0])
+            batch_size = combined_items.new_tensor(gate_logit.shape[0])
             total_loss = total_loss + self.gate_value_weight * gate_value_loss * batch_size
 
-            # simpan utk logging/debug opsional
             self._last_gate_value_loss = gate_value_loss.detach()
             self._last_target_gate_mean = target_gate.mean().detach()
         # =====================================================================

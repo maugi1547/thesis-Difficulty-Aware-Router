@@ -3402,7 +3402,9 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
 
             # --- TAMBAHAN TAHAP 2: simpan gate probability PER-SAMPLE ---
             # Dipakai gate_value_loss di DualBranchDetectionLoss, bukan untuk masking p2_out.
-            self._last_gate_prob_per_sample = F.softmax(logits_safe, dim=1)[:, 1]  # shape (B,)
+            # --- UBAH: simpan LOGIT mentah (bukan probabilitas hasil softmax) ---
+            self._last_gate_logit_per_sample = logits_safe[:, 1] - logits_safe[:, 0]  # logit "gate=1 vs gate=0"
+            # (selisih 2-class logit ini setara dengan logit biner utk BCEWithLogits)
 
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
