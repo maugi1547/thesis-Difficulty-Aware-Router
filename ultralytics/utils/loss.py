@@ -681,34 +681,45 @@ class v8DetectionLoss:
         # ==========================================================
         if not hasattr(self, 'debug_counter'):
             self.debug_counter = 0
-            
+
         self.debug_counter += 1
 
-        TOTAL_BATCHES = getattr(self.model, 'total_batches', 324) 
-        
+        TOTAL_BATCHES = getattr(self.model, 'total_batches', 324)
+
         current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 4
         current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
-        
+
         val_lambda = float(target_lambda)
         val_p2_prob = p2_log_prob.item() if isinstance(p2_log_prob, torch.Tensor) else p2_log_prob
         val_rel = relative_penalty.item() if isinstance(relative_penalty, torch.Tensor) else relative_penalty
         val_diff = difficulty_weight.item() if isinstance(difficulty_weight, torch.Tensor) else difficulty_weight
         val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
+        # --- TAMBAHAN: ambil nilai gate_value dari router ---
+        gv_target_mean = getattr(router, 'last_target_gate_mean', None)
+        gv_loss = getattr(router, 'last_gate_value_loss', None)
+        gv_weight_active = getattr(router, 'last_gate_value_weight_active', None)
+
+        val_gv_target = gv_target_mean.item() if isinstance(gv_target_mean, torch.Tensor) else (gv_target_mean or 0.0)
+        val_gv_loss = gv_loss.item() if isinstance(gv_loss, torch.Tensor) else (gv_loss or 0.0)
+        val_gv_weight = gv_weight_active.item() if isinstance(gv_weight_active, torch.Tensor) else (gv_weight_active or 0.0)
+
         if self.debug_counter % 100 == 0:
             print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
-                  f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f}")
+                f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f} | "
+                f"GV_Target: {val_gv_target:.4f} | GV_Loss: {val_gv_loss:.4f} | GV_Weight: {val_gv_weight:.3f}")
 
         if not hasattr(self.model, 'router_buffer'):
             self.model.router_buffer = []
 
         val_data = [
-            current_epoch, current_batch, f"{val_lambda:.4f}", 
-            f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}"
+            current_epoch, current_batch, f"{val_lambda:.4f}",
+            f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}",
+            f"{val_gv_target:.6f}", f"{val_gv_loss:.6f}", f"{val_gv_weight:.4f}"  # <-- TAMBAHAN kolom
         ]
 
         self.model.router_buffer.append(val_data)
-        
+
         return loss
 
 class v8SegmentationLoss(v8DetectionLoss):
