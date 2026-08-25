@@ -3380,15 +3380,26 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         f_p2_back = x[1]
         B = f_p3.shape[0]
 
+        # =====================================================================
+        # 1. JALUR UTAMA — hitung logit gate (dipakai KEDUA cabang training/eval)
+        # =====================================================================
         z_p3 = self.squeeze_p3(f_p3.detach())
         z_p2 = self.squeeze_p2(f_p2_back.detach())
         z_fused = z_p3 + z_p2
         z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
+
         logits_raw = self.classifier(z_pool)
         logits_fp32 = logits_raw.view(B, 2).float()
         logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
         tau = F.softplus(self.tau_param.float()) + 0.1
 
+        # =====================================================================
+        # 2. JALUR TRAINING
+        #    - compute_expert() SELALU dijalankan penuh, TIDAK di-masking gate
+        #      (fix bug lama yang merusak Branch A)
+        #    - simpan _last_gate_logit_per_sample utk gate_value_loss
+        #    - simpan proxy logits utk compute_proxy_supervision_loss
+        # =====================================================================
         if self.training:
             entropy, conf, dfl_var, cls_logits, reg_logits = self._get_uncertainty_signals(f_p3.detach())
             self.last_entropy = entropy.mean().detach()
@@ -3400,11 +3411,8 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
             soft_fp32 = F.gumbel_softmax(logits_safe, tau=tau, hard=False, dim=1)
             soft = soft_fp32.to(f_p3.dtype)
 
-            # --- TAMBAHAN TAHAP 2: simpan gate probability PER-SAMPLE ---
-            # Dipakai gate_value_loss di DualBranchDetectionLoss, bukan untuk masking p2_out.
-            # --- UBAH: simpan LOGIT mentah (bukan probabilitas hasil softmax) ---
-            self._last_gate_logit_per_sample = logits_safe[:, 1] - logits_safe[:, 0]  # logit "gate=1 vs gate=0"
-            # (selisih 2-class logit ini setara dengan logit biner utk BCEWithLogits)
+            # logit biner mentah per-sample, dipakai gate_value_loss (BCEWithLogits)
+            self._last_gate_logit_per_sample = logits_safe[:, 1] - logits_safe[:, 0]  # shape (B,)
 
             if self._is_warmup:
                 hard_warmup = torch.zeros_like(soft)
@@ -3416,13 +3424,25 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
                 self.loss_prob = F.softmax(logits_safe, dim=1)[:, 1].mean()
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
+            # SELALU return P2 feature penuh — gate TIDAK memodulasi fitur ini
             f_c2f = self.compute_expert(f_p3, f_p2_back)
             return f_c2f
 
+        # =====================================================================
+        # 3. JALUR INFERENSI (eval)
+        #    - gate dihitung dgn KALIBRASI (T, b) hasil post-hoc calibration
+        #    - compute_expert() tetap SELALU dijalankan penuh (gate cuma dilaporkan,
+        #      true-skip nyata baru terjadi nanti di tahap export/deployment terpisah)
+        # =====================================================================
         else:
-            tau_infer = tau.detach()
-            probs = F.softmax(logits_safe / tau_infer, dim=1)
-            gate_mask = (probs[:, 1] > 0.50).float().view(B, 1, 1, 1).to(f_p3.dtype)
+            raw_logit_diff = logits_safe[:, 1] - logits_safe[:, 0]  # shape (B,)
+
+            calib_T = getattr(self, "calib_T", 1.0)
+            calib_b = getattr(self, "calib_b", 0.0)
+            calibrated_logit = raw_logit_diff * calib_T + calib_b
+            probs_gate1 = torch.sigmoid(calibrated_logit)
+
+            gate_mask = (probs_gate1 > 0.50).float().view(B, 1, 1, 1).to(f_p3.dtype)
 
             if not torch.jit.is_tracing():
                 self.current_activation_prob = gate_mask.mean().detach()
@@ -3430,19 +3450,29 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
             f_c2f = self.compute_expert(f_p3, f_p2_back)
             return f_c2f
 
-        # --- Method tambahan untuk export nanti (Tahap 5), sudah disiapkan strukturnya ---
-        def compute_gate_only(self, f_p3, f_p2_back):
-            B = f_p3.shape[0]
-            z_p3 = self.squeeze_p3(f_p3.detach())
-            z_p2 = self.squeeze_p2(f_p2_back.detach())
-            z_fused = z_p3 + z_p2
-            z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
-            logits_raw = self.classifier(z_pool)
-            logits_fp32 = logits_raw.view(B, 2).float()
-            logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
-            tau_infer = (F.softplus(self.tau_param.float()) + 0.1).detach()
-            probs = F.softmax(logits_safe / tau_infer, dim=1)
-            return (probs[:, 1] > 0.5).float()
+    # =====================================================================
+    # 4. METHOD TAMBAHAN — disiapkan untuk Tahap 5 (export 3-engine deployment)
+    #    Belum dipakai sekarang, tapi sudah konsisten dgn kalibrasi yang sama
+    # =====================================================================
+    def compute_gate_only(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        """Dipanggil khusus saat export Stage 1 — TIDAK memanggil compute_expert()."""
+        B = f_p3.shape[0]
+        z_p3 = self.squeeze_p3(f_p3.detach())
+        z_p2 = self.squeeze_p2(f_p2_back.detach())
+        z_fused = z_p3 + z_p2
+        z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
+        logits_raw = self.classifier(z_pool)
+        logits_fp32 = logits_raw.view(B, 2).float()
+        logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
 
-        def compute_expert_only(self, f_p3, f_p2_back):
-            return self.compute_expert(f_p3, f_p2_back)
+        raw_logit_diff = logits_safe[:, 1] - logits_safe[:, 0]
+        calib_T = getattr(self, "calib_T", 1.0)
+        calib_b = getattr(self, "calib_b", 0.0)
+        calibrated_logit = raw_logit_diff * calib_T + calib_b
+        probs_gate1 = torch.sigmoid(calibrated_logit)
+
+        return (probs_gate1 > 0.5).float()
+
+    def compute_expert_only(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        """Dipanggil khusus saat export Stage 2A — C2f-P2 di engine terpisah."""
+        return self.compute_expert(f_p3, f_p2_back)
