@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import csv
 import os
+import time
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -471,10 +472,27 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
+        t_a = time.perf_counter()
         # Di akhir v8DetectionLoss.__call__(), sebelum return:
         loss = self.compute_router_loss(loss)
+        t_b = time.perf_counter()
         # --- TAMBAHAN: proxy supervision loss ---
-        loss = self.compute_proxy_supervision_loss_wrapper(loss, batch, feats[0].shape[2:])
+        # --- TAMBAHKAN GUARD: proxy supervision loss cuma perlu dihitung SEKALI ---
+        if getattr(self, '_compute_router_penalty', True):  # reuse flag yang sama: True hanya di loss_A
+            loss = self.compute_proxy_supervision_loss_wrapper(loss, batch, feats[0].shape[2:])
+        else:
+            # Pastikan tetap extend ke 5 elemen konsisten, isi proxy=0 di loss_B
+            if loss.shape[0] == 4:
+                proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
+                loss = torch.cat([loss, proxy_slot])
+        t_c = time.perf_counter()
+        
+        if not hasattr(self, '_debug_proxy_counter'):
+            self._debug_proxy_counter = 0
+        self._debug_proxy_counter += 1
+        if self._debug_proxy_counter % 50 == 0:
+            print(f"[PROXY PROFILE] router_loss: {(t_b-t_a)*1000:.1f}ms | proxy_supervision: {(t_c-t_b)*1000:.1f}ms | "
+                f"is_branch_A(penalty_active)={getattr(self, '_compute_router_penalty', True)}")
 
         return loss.sum() * batch_size, loss.detach()
         # ---------------------------------------------------------------
