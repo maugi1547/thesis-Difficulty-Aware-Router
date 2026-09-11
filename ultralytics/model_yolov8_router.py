@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.nn.modules import Detect
 from ultralytics.utils.loss import v8DetectionLoss
@@ -144,54 +145,10 @@ class DualBranchDetectionModel(DetectionModel):
 
 class DualBranchDetectionLoss:
     """
-    Wrapper yang membungkus 2 instance v8DetectionLoss — satu untuk Detect_A
-    (4 skala, termasuk router penalty), satu untuk Detect_B (3 skala, TANPA
-    router penalty supaya tidak dobel-hitung).
-    """
-
-    def __init__(self, model):
-        raw_model = model.module if hasattr(model, "module") else model
-
-        # --- Loss A: dapat router penalty (compute_router_loss aktif) ---
-        self.loss_A = v8DetectionLoss(model)
-        self.loss_A.stride = raw_model.detect_A.stride
-        self.loss_A.nc = raw_model.detect_A.nc
-        self.loss_A.no = raw_model.detect_A.nc + raw_model.detect_A.reg_max * 4
-        self.loss_A.reg_max = raw_model.detect_A.reg_max
-        self.loss_A.use_dfl = raw_model.detect_A.reg_max > 1
-        self.loss_A.assigner.num_classes = raw_model.detect_A.nc
-        self.loss_A._compute_router_penalty = True  # flag kontrol (lihat catatan di bawah)
-
-        # --- Loss B: TANPA router penalty (cegah double-count) ---
-        self.loss_B = v8DetectionLoss(model)
-        self.loss_B.stride = raw_model.detect_B.stride
-        self.loss_B.nc = raw_model.detect_B.nc
-        self.loss_B.no = raw_model.detect_B.nc + raw_model.detect_B.reg_max * 4
-        self.loss_B.reg_max = raw_model.detect_B.reg_max
-        self.loss_B.use_dfl = raw_model.detect_B.reg_max > 1
-        self.loss_B.assigner.num_classes = raw_model.detect_B.nc
-        self.loss_B._compute_router_penalty = False
-
-        self.branch_b_weight = getattr(raw_model, "branch_b_loss_weight", 0.7)
-
-        # --- TAMBAHAN TAHAP 2: hyperparameter baru ---
-        self.gate_value_weight = getattr(raw_model, "gate_value_loss_weight", 0.5)
-        self.gate_value_margin = getattr(raw_model, "gate_value_margin", 0.02)
-
-        self._raw_model = raw_model
-        self._router_cache = None  # cache supaya tidak loop modules() tiap panggilan
-
-    def _find_router(self):
-        if self._router_cache is not None:
-            return self._router_cache
-        for m in self._raw_model.modules():
-            if 'DifficultyAwareRouter' in m.__class__.__name__:
-                self._router_cache = m
-                return m
-        return None
-
-
-class DualBranchDetectionLoss:
+        Wrapper yang membungkus 2 instance v8DetectionLoss — satu untuk Detect_A
+        (4 skala, termasuk router penalty), satu untuk Detect_B (3 skala, TANPA
+        router penalty supaya tidak dobel-hitung).
+        """
     def __init__(self, model):
         raw_model = model.module if hasattr(model, "module") else model
 
@@ -241,8 +198,11 @@ class DualBranchDetectionLoss:
     def __call__(self, preds, batch):
         det_A, det_B = preds
 
+        t0 = time.perf_counter()
         loss_A_sum, loss_A_items = self.loss_A(det_A, batch)
+        t1 = time.perf_counter()
         loss_B_sum, loss_B_items = self.loss_B(det_B, batch)
+        t2 = time.perf_counter()
 
         total_loss = loss_A_sum + self.branch_b_weight * loss_B_sum
         combined_items = torch.cat([loss_A_items, loss_B_items[:3]])
@@ -289,5 +249,8 @@ class DualBranchDetectionLoss:
                 router.last_gate_value_weight_active = zero
             self._last_gate_value_loss = zero
             self._last_target_gate_mean = zero
+
+        if self.debug_counter_profile % 50 == 0:
+            print(f"loss_A: {(t1-t0)*1000:.1f}ms | loss_B: {(t2-t1)*1000:.1f}ms")
 
         return total_loss, combined_items.detach()
