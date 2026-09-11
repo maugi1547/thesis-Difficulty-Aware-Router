@@ -250,6 +250,11 @@ class DualBranchDetectionLoss:
             self._last_gate_value_loss = zero
             self._last_target_gate_mean = zero
 
+        # --- Tambahkan profiling di akhir, SETELAH semua logic lain ---
+        if not hasattr(self, 'debug_counter_profile'):
+            self.debug_counter_profile = 0
+        self.debug_counter_profile += 1
+        
         if self.debug_counter_profile % 50 == 0:
             print(f"loss_A: {(t1-t0)*1000:.1f}ms | loss_B: {(t2-t1)*1000:.1f}ms")
 
