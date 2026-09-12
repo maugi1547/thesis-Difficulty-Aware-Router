@@ -214,41 +214,67 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
     reg_target = torch.zeros(B, 4, grid_h, grid_w, device=device)
     fg_mask = torch.zeros(B, grid_h, grid_w, dtype=torch.bool, device=device)
 
-    # Grid cell centers dalam skala pixel
     yv, xv = torch.meshgrid(
         torch.arange(grid_h, device=device), torch.arange(grid_w, device=device), indexing="ij"
     )
     cx = (xv + 0.5) * stride  # (grid_h, grid_w)
     cy = (yv + 0.5) * stride
-    
-    for b in range(B):
+
+    for b in range(B):  # loop batch tetap ada (murah, cuma B=8x), TAPI loop per-box DIHAPUS
         valid = mask_gt[b, :, 0].bool()
-        boxes = gt_bboxes[b][valid]  # (n_valid, 4) xyxy
-        if boxes.shape[0] == 0:
+        boxes = gt_bboxes[b][valid]  # (n, 4)
+        n = boxes.shape[0]
+        if n == 0:
             continue
 
-        for box in boxes:
-            x1, y1, x2, y2 = box
-            # cell dianggap foreground kalau center-nya berada di dalam box GT
-            inside = (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
-            if inside.sum() == 0:
-                # fallback: box terlalu kecil utk grid kasar ini, assign ke cell terdekat dgn center box
-                bcx, bcy = (x1 + x2) / 2, (y1 + y2) / 2
-                dist = (cx - bcx) ** 2 + (cy - bcy) ** 2
-                inside = dist == dist.min()
+        x1, y1, x2, y2 = boxes.unbind(-1)  # masing-masing (n,)
+        x1 = x1.view(n, 1, 1); y1 = y1.view(n, 1, 1)
+        x2 = x2.view(n, 1, 1); y2 = y2.view(n, 1, 1)
 
-            cls_target[b, 0][inside] = 1.0
-            fg_mask[b][inside] = True
+        cx_b = cx.unsqueeze(0)  # (1, grid_h, grid_w)
+        cy_b = cy.unsqueeze(0)
 
-            # target jarak (l,t,r,b) ternormalisasi ke satuan stride, utk cell yg foreground
-            l = (cx[inside] - x1) / stride
-            t = (cy[inside] - y1) / stride
-            r = (x2 - cx[inside]) / stride
-            bt = (y2 - cy[inside]) / stride
-            reg_target[b, 0][inside] = l.clamp(0, reg_max - 1.01)
-            reg_target[b, 1][inside] = t.clamp(0, reg_max - 1.01)
-            reg_target[b, 2][inside] = r.clamp(0, reg_max - 1.01)
-            reg_target[b, 3][inside] = bt.clamp(0, reg_max - 1.01)
+        # --- Vektorisasi PENUH atas semua n box sekaligus (broadcast) ---
+        inside = (cx_b >= x1) & (cx_b <= x2) & (cy_b >= y1) & (cy_b <= y2)  # (n, grid_h, grid_w)
+
+        # Fallback untuk box yang lebih kecil dari 1 cell grid
+        no_inside = inside.sum(dim=(1, 2)) == 0  # (n,)
+        if no_inside.any():
+            bcx, bcy = (x1 + x2) / 2, (y1 + y2) / 2
+            dist = (cx_b - bcx) ** 2 + (cy_b - bcy) ** 2  # (n, grid_h, grid_w)
+            flat_dist = dist.view(n, -1)
+            argmin_idx = flat_dist.argmin(dim=1)
+            fallback = torch.zeros_like(inside)
+            fallback.view(n, -1)[torch.arange(n, device=device), argmin_idx] = True
+            inside = torch.where(no_inside.view(n, 1, 1), fallback, inside)
+
+        # Hitung (l,t,r,b) utk SEMUA box sekaligus, seluruh grid
+        l = (cx_b - x1) / stride
+        t = (cy_b - y1) / stride
+        r = (x2 - cx_b) / stride
+        bt = (y2 - cy_b) / stride
+
+        # --- Resolusi overlap: box dengan AREA TERKECIL menang di cell yang sama ---
+        # (catatan: ini sedikit beda semantik dari versi loop asli yang "box terakhir dalam urutan menang",
+        #  tapi "smallest-area-wins" adalah heuristik standar dan lebih masuk akal utk overlap)
+        area = ((x2 - x1) * (y2 - y1)).view(n, 1, 1).expand(n, grid_h, grid_w)
+        area_masked = torch.where(inside, area, torch.full_like(area, float("inf")))
+        owner = area_masked.argmin(dim=0)              # (grid_h, grid_w)
+        has_owner = torch.isfinite(area_masked.amin(dim=0))  # (grid_h, grid_w)
+
+        cls_target[b, 0] = has_owner.float()
+        fg_mask[b] = has_owner
+
+        idx = owner.unsqueeze(0)
+        l_sel = torch.gather(l, 0, idx).squeeze(0)
+        t_sel = torch.gather(t, 0, idx).squeeze(0)
+        r_sel = torch.gather(r, 0, idx).squeeze(0)
+        bt_sel = torch.gather(bt, 0, idx).squeeze(0)
+
+        reg_target[b, 0][has_owner] = l_sel[has_owner].clamp(0, reg_max - 1.01)
+        reg_target[b, 1][has_owner] = t_sel[has_owner].clamp(0, reg_max - 1.01)
+        reg_target[b, 2][has_owner] = r_sel[has_owner].clamp(0, reg_max - 1.01)
+        reg_target[b, 3][has_owner] = bt_sel[has_owner].clamp(0, reg_max - 1.01)
 
     return cls_target, reg_target, fg_mask
 
