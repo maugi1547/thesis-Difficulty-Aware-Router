@@ -142,16 +142,48 @@ class DualBranchDetectionModel(DetectionModel):
     def init_criterion(self):
         return DualBranchDetectionLoss(self)
 
+"""
+OPSI C — Soft-mixture router objective dengan EMA offset (tanpa freeze, tanpa BCE target)
+============================================================================
+
+Menggantikan gate_value_loss lama (BCEWithLogits terhadap sigmoid(diff/temperature))
+dengan objective linear ala DynamicDet:
+
+    p_i = sigmoid(gate_logit_i)
+    L_router_i = (1 - p_i) * (loss_A_i.detach() - offset/2) + p_i * (loss_B_i.detach() + offset/2)
+
+di mana `offset` adalah EMA berjalan dari (loss_A_i - loss_B_i), BUKAN raw diff per-batch,
+supaya sinyal yang dikejar gate lebih stabil (meredam "moving target problem").
+
+Gradient efektif ke gate_logit_i: dL/dgate_logit_i ∝ -(loss_A_i - loss_B_i - offset)
+— sampel di mana P2 (Branch A) jauh lebih baik dari Branch B (relatif thd offset)
+akan mendorong p_i naik (P2 dinyalakan); sebaliknya mendorong p_i turun.
+
+CATATAN PENTING:
+- loss_A_i, loss_B_i di-detach() SEBELUM dipakai di sini, sehingga gradient dari
+  L_router TIDAK ikut mengalir ke bobot Branch A/B/backbone/neck. Update bobot
+  branch tetap murni dari `loss_A_sum + branch_b_weight * loss_B_sum` seperti biasa.
+- offset (EMA) mengoreksi bias sistematis akibat perbedaan kecepatan konvergen
+  Branch A vs B (temuan Anda sebelumnya), sehingga gate tidak selalu bias ke satu
+  arah, tapi merespons DEVIASI RELATIF dari level sistematis saat itu.
+- compute_router_loss (sparsity) TIDAK diubah di sini — tetap jalan seperti biasa
+  (nanti bisa didekopling terpisah sesuai diskusi Opsi A, tapi itu perubahan lain).
+"""
 
 class DualBranchDetectionLoss:
     """
-        Wrapper yang membungkus 2 instance v8DetectionLoss — satu untuk Detect_A
-        (4 skala, termasuk router penalty), satu untuk Detect_B (3 skala, TANPA
-        router penalty supaya tidak dobel-hitung).
-        """
+    Wrapper yang membungkus 2 instance v8DetectionLoss — satu untuk Detect_A
+    (4 skala, termasuk router penalty), satu untuk Detect_B (3 skala, TANPA
+    router penalty supaya tidak dobel-hitung).
+
+    Versi ini menggunakan OPSI C untuk gate training signal: soft-mixture
+    objective dengan EMA offset, bukan BCE terhadap target sigmoid+temperature.
+    """
+
     def __init__(self, model):
         raw_model = model.module if hasattr(model, "module") else model
 
+        # --- Loss A: dapat router penalty (compute_router_loss aktif) ---
         self.loss_A = v8DetectionLoss(model)
         self.loss_A.stride = raw_model.detect_A.stride
         self.loss_A.nc = raw_model.detect_A.nc
@@ -161,6 +193,7 @@ class DualBranchDetectionLoss:
         self.loss_A.assigner.num_classes = raw_model.detect_A.nc
         self.loss_A._compute_router_penalty = True
 
+        # --- Loss B: TANPA router penalty (cegah double-count) ---
         self.loss_B = v8DetectionLoss(model)
         self.loss_B.stride = raw_model.detect_B.stride
         self.loss_B.nc = raw_model.detect_B.nc
@@ -172,19 +205,32 @@ class DualBranchDetectionLoss:
 
         self.branch_b_weight = getattr(raw_model, "branch_b_loss_weight", 0.7)
 
-        # --- Hyperparameter gate_value_loss ---
+        # --- Hyperparameter gate routing (OPSI C) ---
         self.gate_value_weight = getattr(raw_model, "gate_value_loss_weight", 0.5)
-        # temperature: seberapa "tajam" soft target bereaksi terhadap selisih loss_B - loss_A.
-        # Semakin KECIL temperature, semakin TAJAM (mendekati target biner keras).
-        # Semakin BESAR temperature, semakin HALUS/netral (target mendekati 0.5 utk selisih kecil).
+
+        # Momentum EMA untuk offset. 0.99 = offset berubah pelan, sangat stabil.
+        # Kalau ingin offset lebih responsif terhadap perubahan training dinamis,
+        # bisa diturunkan (mis. 0.9), tapi risiko lebih noisy.
+        self.offset_momentum = getattr(raw_model, "gate_offset_momentum", 0.99)
+
+        # Dipertahankan untuk kompatibilitas mundur (tidak dipakai di jalur Opsi C,
+        # tapi bisa diaktifkan lagi kalau mau A/B test vs BCE lama).
         self.gate_value_temperature = getattr(raw_model, "gate_value_temperature", 0.15)
+        self.use_bce_gate_loss = getattr(raw_model, "use_bce_gate_loss", False)  # default: pakai Opsi C
 
         self._raw_model = raw_model
         self._router_cache = None
 
-        # simpan default utk logging kalau belum aktif (mis. masih warmup)
+        # State EMA offset — di-registrasi sebagai buffer biasa (bukan nn.Parameter,
+        # karena tidak dioptimasi via gradient, hanya diupdate manual tiap step).
+        self._offset_initialized = False
+        self.running_diff_mean = torch.tensor(0.0)
+
+        # Logging state
         self._last_gate_value_loss = torch.tensor(0.0)
-        self._last_target_gate_mean = torch.tensor(0.0)
+        self._last_target_gate_mean = torch.tensor(0.0)  # dipertahankan utk kompatibilitas logging lama
+        self._last_offset = torch.tensor(0.0)
+        self._last_mean_p = torch.tensor(0.0)
 
     def _find_router(self):
         if self._router_cache is not None:
@@ -195,25 +241,35 @@ class DualBranchDetectionLoss:
                 return m
         return None
 
+    def _update_offset(self, batch_diff_mean: torch.Tensor):
+        """EMA update untuk running_diff_mean. batch_diff_mean HARUS sudah detached."""
+        if self.running_diff_mean.device != batch_diff_mean.device:
+            self.running_diff_mean = self.running_diff_mean.to(batch_diff_mean.device)
+
+        if not self._offset_initialized:
+            # Inisialisasi langsung ke nilai batch pertama, hindari bias awal dari 0.0
+            # saat loss_A/loss_B masih jauh dari skala matang.
+            self.running_diff_mean = batch_diff_mean.clone()
+            self._offset_initialized = True
+        else:
+            m = self.offset_momentum
+            self.running_diff_mean = m * self.running_diff_mean + (1.0 - m) * batch_diff_mean
+
     def __call__(self, preds, batch):
         det_A, det_B = preds
 
-        t0 = time.perf_counter()
         loss_A_sum, loss_A_items = self.loss_A(det_A, batch)
-        t1 = time.perf_counter()
         loss_B_sum, loss_B_items = self.loss_B(det_B, batch)
-        t2 = time.perf_counter()
 
         total_loss = loss_A_sum + self.branch_b_weight * loss_B_sum
         combined_items = torch.cat([loss_A_items, loss_B_items[:3]])
 
-        # --- BACA weight TERKINI dari raw_model, bukan self.gate_value_weight statis ---
         current_gate_value_weight = getattr(self._raw_model, "gate_value_loss_weight", 0.0)
 
         router = self._find_router()
         is_warmup = getattr(router, "_is_warmup", True) if router is not None else True
 
-        if (
+        can_compute_gate_loss = (
             router is not None
             and self._raw_model.training
             and not is_warmup
@@ -221,41 +277,66 @@ class DualBranchDetectionLoss:
             and hasattr(router, "_last_gate_logit_per_sample")
             and hasattr(self.loss_A, "_last_per_sample_loss")
             and hasattr(self.loss_B, "_last_per_sample_loss")
-        ):
-            per_sample_loss_A = self.loss_A._last_per_sample_loss
-            per_sample_loss_B = self.loss_B._last_per_sample_loss
-            gate_logit = router._last_gate_logit_per_sample
+        )
 
-            diff = (per_sample_loss_B - per_sample_loss_A).detach()
-            target_gate = torch.sigmoid(diff / self.gate_value_temperature)
+        if can_compute_gate_loss:
+            # Selalu detach di titik ini — memastikan gradient gate TIDAK bocor
+            # ke bobot Branch A/B lewat jalur ini (branch weight update tetap murni
+            # dari loss_A_sum + branch_b_weight * loss_B_sum di atas).
+            per_sample_loss_A = self.loss_A._last_per_sample_loss.detach()
+            per_sample_loss_B = self.loss_B._last_per_sample_loss.detach()
+            gate_logit = router._last_gate_logit_per_sample  # (B,) — TIDAK di-detach, ini yang mau dilatih
 
-            gate_value_loss = F.binary_cross_entropy_with_logits(gate_logit, target_gate)
+            batch_diff = per_sample_loss_A - per_sample_loss_B  # (B,)
+            batch_diff_mean = batch_diff.mean().detach()
+
+            # Update EMA offset SEBELUM dipakai di step ini (pakai offset dari step
+            # sebelumnya untuk menghitung loss step ini, supaya tidak "curang" memakai
+            # info batch saat ini untuk mengoreksi batch saat ini juga).
+            offset = self.running_diff_mean.clone()
+            self._update_offset(batch_diff_mean)
+
+            if self.use_bce_gate_loss:
+                # --- Jalur lama (BCE), dipertahankan untuk A/B testing ---
+                diff = batch_diff.neg()  # loss_B - loss_A, sesuai konvensi lama
+                target_gate = torch.sigmoid(diff / self.gate_value_temperature)
+                gate_value_loss = F.binary_cross_entropy_with_logits(gate_logit, target_gate)
+                mean_p = torch.sigmoid(gate_logit).mean().detach()
+            else:
+                # --- OPSI C: soft-mixture objective dengan EMA offset ---
+                p = torch.sigmoid(gate_logit)  # (B,) — p tinggi = pilih Branch A (P2 ON)
+
+                # L_router_i = (1-p_i)*(loss_B_i + offset/2) + p_i*(loss_A_i - offset/2)
+                # (Branch A/P2 "dihadiahi" -offset/2, Branch B "dihukum" +offset/2,
+                #  mengoreksi bias sistematis loss_B yang secara struktural lebih kecil)
+                weighted_loss = (1.0 - p) * (per_sample_loss_B + offset / 2.0) \
+                                + p * (per_sample_loss_A - offset / 2.0)
+                gate_value_loss = weighted_loss.mean()
+                mean_p = p.mean().detach()
 
             batch_size = combined_items.new_tensor(gate_logit.shape[0])
             total_loss = total_loss + current_gate_value_weight * gate_value_loss * batch_size
 
-            # --- TAMBAHAN: simpan ke ROUTER, bukan cuma ke self, supaya compute_router_loss bisa baca ---
-            router.last_target_gate_mean = target_gate.mean().detach()
-            router.last_gate_value_loss = gate_value_loss.detach()
-            router.last_gate_value_weight_active = torch.tensor(current_gate_value_weight)
+            if router is not None:
+                router.last_target_gate_mean = mean_p
+                router.last_gate_value_loss = gate_value_loss.detach()
+                router.last_gate_value_weight_active = torch.tensor(current_gate_value_weight)
+                router.last_gate_offset = offset  # baru: expose offset utk logging/debug
 
             self._last_gate_value_loss = gate_value_loss.detach()
-            self._last_target_gate_mean = target_gate.mean().detach()
+            self._last_target_gate_mean = mean_p
+            self._last_offset = offset
+            self._last_mean_p = mean_p
         else:
             zero = torch.tensor(0.0, device=combined_items.device)
             if router is not None:
                 router.last_target_gate_mean = zero
                 router.last_gate_value_loss = zero
                 router.last_gate_value_weight_active = zero
+                router.last_gate_offset = zero
             self._last_gate_value_loss = zero
             self._last_target_gate_mean = zero
-
-        # --- Tambahkan profiling di akhir, SETELAH semua logic lain ---
-        if not hasattr(self, 'debug_counter_profile'):
-            self.debug_counter_profile = 0
-        self.debug_counter_profile += 1
-        
-        if self.debug_counter_profile % 50 == 0:
-            print(f"loss_A: {(t1-t0)*1000:.1f}ms | loss_B: {(t2-t1)*1000:.1f}ms")
+            self._last_offset = zero
+            self._last_mean_p = zero
 
         return total_loss, combined_items.detach()
