@@ -751,7 +751,7 @@ class v8DetectionLoss:
         val_data = [
             current_epoch, current_batch, f"{val_lambda:.4f}",
             f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}",
-            f"{val_gv_target:.6f}", f"{val_gv_loss:.6f}", f"{val_gv_weight:.4f}", f"{val_gv_offset:.4f}"  # <-- TAMBAHAN kolom
+            f"{val_gv_target:.6f}", f"{val_gv_loss:.6f}", f"{val_gv_weight:.4f}", f"{val_gv_offset:.4f}",  # <-- TAMBAHAN kolom
         ]
 
         self.model.router_buffer.append(val_data)
