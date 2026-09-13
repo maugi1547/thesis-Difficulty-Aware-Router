@@ -733,15 +733,17 @@ class v8DetectionLoss:
         gv_target_mean = getattr(router, 'last_target_gate_mean', None)
         gv_loss = getattr(router, 'last_gate_value_loss', None)
         gv_weight_active = getattr(router, 'last_gate_value_weight_active', None)
+        gv_offset = getattr(router, 'last_gate_offset', None) 
 
         val_gv_target = gv_target_mean.item() if isinstance(gv_target_mean, torch.Tensor) else (gv_target_mean or 0.0)
         val_gv_loss = gv_loss.item() if isinstance(gv_loss, torch.Tensor) else (gv_loss or 0.0)
         val_gv_weight = gv_weight_active.item() if isinstance(gv_weight_active, torch.Tensor) else (gv_weight_active or 0.0)
+        val_gv_offset = gv_offset.item() if isinstance(gv_offset,torch.Tensor) else (gv_offset or 0.0)
 
         if self.debug_counter % 100 == 0:
             print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
                 f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f} | "
-                f"GV_Target: {val_gv_target:.4f} | GV_Loss: {val_gv_loss:.4f} | GV_Weight: {val_gv_weight:.3f}")
+                f"GV_Target: {val_gv_target:.4f} | GV_Loss: {val_gv_loss:.4f} | GV_Weight: {val_gv_weight:.3f} | GV_Offset: {val_gv_offset:.3f}")
 
         if not hasattr(self.model, 'router_buffer'):
             self.model.router_buffer = []
@@ -749,7 +751,7 @@ class v8DetectionLoss:
         val_data = [
             current_epoch, current_batch, f"{val_lambda:.4f}",
             f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}",
-            f"{val_gv_target:.6f}", f"{val_gv_loss:.6f}", f"{val_gv_weight:.4f}"  # <-- TAMBAHAN kolom
+            f"{val_gv_target:.6f}", f"{val_gv_loss:.6f}", f"{val_gv_weight:.4f}", f"{val_gv_offset:.4f}"  # <-- TAMBAHAN kolom
         ]
 
         self.model.router_buffer.append(val_data)
