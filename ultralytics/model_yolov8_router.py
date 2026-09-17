@@ -280,41 +280,75 @@ class DualBranchDetectionLoss:
         )
 
         if can_compute_gate_loss:
-            # Selalu detach di titik ini — memastikan gradient gate TIDAK bocor
-            # ke bobot Branch A/B lewat jalur ini (branch weight update tetap murni
-            # dari loss_A_sum + branch_b_weight * loss_B_sum di atas).
-            per_sample_loss_A = self.loss_A._last_per_sample_loss.detach()
-            per_sample_loss_B = self.loss_B._last_per_sample_loss.detach()
-            gate_logit = router._last_gate_logit_per_sample  # (B,) — TIDAK di-detach, ini yang mau dilatih
+            # --- PILIH SUMBER SINYAL: 'total' | 'small' | 'hybrid' ---
+            gate_signal_mode = getattr(self._raw_model, 'gate_signal_mode', 'small')
 
-            batch_diff = per_sample_loss_A - per_sample_loss_B  # (B,)
-            batch_diff_mean = batch_diff.mean().detach()
+            if gate_signal_mode == 'small':
+                per_sample_loss_A = self.loss_A._last_per_sample_loss_small.detach()
+                per_sample_loss_B = self.loss_B._last_per_sample_loss_small.detach()
+                valid_A = self.loss_A._last_small_obj_count > 0
+                valid_B = self.loss_B._last_small_obj_count > 0
+                valid_mask = valid_A & valid_B
 
-            # Update EMA offset SEBELUM dipakai di step ini (pakai offset dari step
-            # sebelumnya untuk menghitung loss step ini, supaya tidak "curang" memakai
-            # info batch saat ini untuk mengoreksi batch saat ini juga).
-            offset = self.running_diff_mean.clone()
-            self._update_offset(batch_diff_mean)
+            elif gate_signal_mode == 'hybrid':
+                w_s = getattr(self._raw_model, 'gate_weight_small', 0.7)
+                w_m = getattr(self._raw_model, 'gate_weight_medium', 0.2)
+                w_l = getattr(self._raw_model, 'gate_weight_large', 0.1)
+                per_sample_loss_A = (
+                    w_s * self.loss_A._last_per_sample_loss_small
+                    + w_m * self.loss_A._last_per_sample_loss_medium
+                    + w_l * self.loss_A._last_per_sample_loss_large
+                ).detach()
+                per_sample_loss_B = (
+                    w_s * self.loss_B._last_per_sample_loss_small
+                    + w_m * self.loss_B._last_per_sample_loss_medium
+                    + w_l * self.loss_B._last_per_sample_loss_large
+                ).detach()
+                valid_mask = torch.ones_like(per_sample_loss_A, dtype=torch.bool)
 
-            if self.use_bce_gate_loss:
-                # --- Jalur lama (BCE), dipertahankan untuk A/B testing ---
-                diff = batch_diff.neg()  # loss_B - loss_A, sesuai konvensi lama
-                target_gate = torch.sigmoid(diff / self.gate_value_temperature)
-                gate_value_loss = F.binary_cross_entropy_with_logits(gate_logit, target_gate)
-                mean_p = torch.sigmoid(gate_logit).mean().detach()
+            else:  # 'total' — perilaku lama
+                per_sample_loss_A = self.loss_A._last_per_sample_loss.detach()
+                per_sample_loss_B = self.loss_B._last_per_sample_loss.detach()
+                valid_mask = torch.ones_like(per_sample_loss_A, dtype=torch.bool)
+
+            gate_logit = router._last_gate_logit_per_sample  # (B,) TIDAK di-detach
+
+            # ==========================================================
+            # SATU jalur perhitungan: masking diterapkan SEBELUM apa pun,
+            # supaya offset & loss sama-sama hanya melihat sampel valid.
+            # ==========================================================
+            if valid_mask.sum() == 0:
+                zero = torch.tensor(0.0, device=combined_items.device)
+                gate_value_loss = zero
+                mean_p = zero
+                offset = self.running_diff_mean.clone()
+                n_valid = 0
             else:
-                # --- OPSI C: soft-mixture objective dengan EMA offset ---
-                p = torch.sigmoid(gate_logit)  # (B,) — p tinggi = pilih Branch A (P2 ON)
+                gate_logit_v = gate_logit[valid_mask]
+                loss_A_v = per_sample_loss_A[valid_mask]
+                loss_B_v = per_sample_loss_B[valid_mask]
+                n_valid = int(valid_mask.sum().item())
 
-                # L_router_i = (1-p_i)*(loss_B_i + offset/2) + p_i*(loss_A_i - offset/2)
-                # (Branch A/P2 "dihadiahi" -offset/2, Branch B "dihukum" +offset/2,
-                #  mengoreksi bias sistematis loss_B yang secara struktural lebih kecil)
-                weighted_loss = (1.0 - p) * (per_sample_loss_B + offset / 2.0) \
-                                + p * (per_sample_loss_A - offset / 2.0)
-                gate_value_loss = weighted_loss.mean()
-                mean_p = p.mean().detach()
+                # offset dari step SEBELUMNYA, di-update SEKALI saja
+                offset = self.running_diff_mean.clone()
+                self._update_offset((loss_A_v - loss_B_v).mean().detach())
 
-            batch_size = combined_items.new_tensor(gate_logit.shape[0])
+                if self.use_bce_gate_loss:
+                    # jalur lama (BCE) — kini juga menghormati valid_mask
+                    diff = (loss_B_v - loss_A_v)
+                    target_gate = torch.sigmoid(diff / self.gate_value_temperature)
+                    gate_value_loss = F.binary_cross_entropy_with_logits(gate_logit_v, target_gate)
+                    mean_p = torch.sigmoid(gate_logit_v).mean().detach()
+                else:
+                    # OPSI C: soft-mixture dengan EMA offset
+                    p = torch.sigmoid(gate_logit_v)
+                    weighted_loss = (1.0 - p) * (loss_B_v + offset / 2.0) \
+                                    + p * (loss_A_v - offset / 2.0)
+                    gate_value_loss = weighted_loss.mean()
+                    mean_p = p.mean().detach()
+
+            # scaling pakai jumlah sampel VALID (0 kalau tidak ada -> gate loss mati)
+            batch_size = combined_items.new_tensor(float(n_valid))
             total_loss = total_loss + current_gate_value_weight * gate_value_loss * batch_size
 
             if router is not None:

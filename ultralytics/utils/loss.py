@@ -471,11 +471,21 @@ class v8DetectionLoss:
         # gate_value_loss di DualBranchDetectionLoss. Di-detach karena ini
         # HANYA sinyal/target, tidak boleh ikut backward loss deteksi ini sendiri.
         # =====================================================================
-
         per_image_target_sum = target_scores.sum(dim=[1, 2]).clamp(min=1.0)  # (B,)
 
         cls_loss_per_anchor = self.bce(pred_scores, target_scores.to(dtype))  # (B, num_anchors, nc)
         cls_loss_per_image = cls_loss_per_anchor.sum(dim=[1, 2]) / per_image_target_sum  # (B,)
+
+        # --- Threshold area (piksel, skala input model — target_bboxes SUDAH skala asli) ---
+        SMALL_AREA_THRESH = getattr(self, 'small_area_thresh', 32.0 * 32.0)
+        MEDIUM_AREA_THRESH = getattr(self, 'medium_area_thresh', 96.0 * 96.0)
+
+        # Inisialisasi output per-strata
+        box_loss_per_image = torch.zeros(batch_size, device=self.device)
+        loss_small = torch.zeros(batch_size, device=self.device)
+        loss_medium = torch.zeros(batch_size, device=self.device)
+        loss_large = torch.zeros(batch_size, device=self.device)
+        count_small = torch.zeros(batch_size, device=self.device)
 
         if fg_mask.sum():
             weight = target_scores.sum(-1)[fg_mask]  # (n_fg_total,)
@@ -483,15 +493,77 @@ class v8DetectionLoss:
             box_loss_raw = (1.0 - iou) * weight  # (n_fg_total,)
 
             batch_idx_expanded = torch.arange(batch_size, device=self.device).view(-1, 1).expand_as(fg_mask)[fg_mask]
-            box_loss_per_image = torch.zeros(batch_size, device=self.device)
+
+            # --- versi lama (dipertahankan, untuk kompatibilitas & perbandingan) ---
             box_loss_per_image.scatter_add_(0, batch_idx_expanded, box_loss_raw)
             box_loss_per_image = box_loss_per_image / per_image_target_sum
+
+            # =================================================================
+            # BARU: hitung AREA dari target_bbox yang ter-assign ke tiap anchor fg
+            # target_bboxes: (B, num_anchors, 4) format xyxy, SKALA PIKSEL ASLI
+            # (perhatikan: bbox_loss() di atas membaginya dgn stride_tensor, tapi
+            #  target_bboxes di sini masih versi belum dibagi -- inilah yang kita mau)
+            # =================================================================
+            fg_boxes = target_bboxes[fg_mask]  # (n_fg_total, 4) xyxy piksel
+            box_w = (fg_boxes[:, 2] - fg_boxes[:, 0]).clamp(min=0)
+            box_h = (fg_boxes[:, 3] - fg_boxes[:, 1]).clamp(min=0)
+            fg_areas = box_w * box_h  # (n_fg_total,)
+
+            # --- cls loss per anchor FOREGROUND (bisa diatribusikan ke ukuran objek) ---
+            cls_loss_fg = cls_loss_per_anchor.sum(dim=-1)[fg_mask]  # (n_fg_total,)
+
+            # --- gabungkan box + cls jadi satu skor kualitas per-anchor ---
+            combined_fg_loss = box_loss_raw * self.hyp.box + cls_loss_fg * self.hyp.cls  # (n_fg_total,)
+
+            # --- mask strata ---
+            mask_small = fg_areas < SMALL_AREA_THRESH
+            mask_medium = (fg_areas >= SMALL_AREA_THRESH) & (fg_areas < MEDIUM_AREA_THRESH)
+            mask_large = fg_areas >= MEDIUM_AREA_THRESH
+
+            def _stratified_mean(mask):
+                """
+                Rata-rata combined_fg_loss per-gambar, HANYA dari anchor di strata `mask`.
+                Dinormalisasi dgn JUMLAH BOBOT DI STRATA ITU (bukan total gambar) --
+                inilah yang membuat gambar padat vs sepi jadi comparable.
+                Gambar tanpa objek di strata ini -> 0.0.
+                """
+                if mask.sum() == 0:
+                    return (torch.zeros(batch_size, device=self.device),
+                            torch.zeros(batch_size, device=self.device))
+
+                idx = batch_idx_expanded[mask]
+                vals = combined_fg_loss[mask]
+                wts = weight[mask]
+
+                sum_vals = torch.zeros(batch_size, device=self.device)
+                sum_wts = torch.zeros(batch_size, device=self.device)
+                cnt = torch.zeros(batch_size, device=self.device)
+
+                sum_vals.scatter_add_(0, idx, vals)
+                sum_wts.scatter_add_(0, idx, wts)
+                cnt.scatter_add_(0, idx, torch.ones_like(vals))
+
+                # normalisasi per-strata (bukan per-total-gambar)
+                return sum_vals / sum_wts.clamp(min=1e-6), cnt
+
+            loss_small, count_small = _stratified_mean(mask_small)
+            loss_medium, _ = _stratified_mean(mask_medium)
+            loss_large, _ = _stratified_mean(mask_large)
+
         else:
             box_loss_per_image = torch.zeros(batch_size, device=self.device)
 
+        # --- versi lama: TETAP dipertahankan (kompatibilitas mundur) ---
         self._last_per_sample_loss = (
             box_loss_per_image * self.hyp.box + cls_loss_per_image * self.hyp.cls
         ).detach()  # (B,)
+
+        # --- BARU: versi size-stratified ---
+        self._last_per_sample_loss_small = loss_small.detach()    # (B,)
+        self._last_per_sample_loss_medium = loss_medium.detach()  # (B,)
+        self._last_per_sample_loss_large = loss_large.detach()    # (B,)
+        self._last_small_obj_count = count_small.detach()         # (B,) utk masking/valid-check
+
         # =====================================================================
 
         loss[0] *= self.hyp.box  # box gain

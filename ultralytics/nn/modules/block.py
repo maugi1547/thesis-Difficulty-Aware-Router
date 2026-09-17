@@ -3367,6 +3367,42 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         entropy, conf, dfl_var = self._compute_stats(cls_logits, reg_logits)
         return entropy, conf, dfl_var, cls_logits, reg_logits  # <-- tambahkan cls_logits, reg_logits
 
+    def _topk_spatial_pool(self, z: torch.Tensor, k: int = 10, alpha: float = 0.7) -> torch.Tensor:
+        """
+        Agregasi spasial top-k, menggantikan global average pooling polos.
+
+        Mempertahankan sinyal dari lokasi spasial "paling menonjol" (kandidat
+        objek kecil) alih-alih menenggelamkannya dalam rata-rata seluruh grid.
+        Formula identik dengan _topk_mean yang sudah dipakai proxy branch Anda,
+        supaya jalur gate dan jalur proxy konsisten secara statistik.
+
+        Args:
+            z: (B, C, H, W) feature map hasil squeeze_p3 + squeeze_p2
+            k: jumlah lokasi spasial teratas yang diambil (default 10, sama dgn
+            K=10 di _compute_stats proxy branch Anda)
+            alpha: bobot komponen top-k vs mean global (0.7/0.3, sama dgn proxy)
+
+        Returns:
+            (B, C, 1, 1) — shape identik dengan output mean(dim=[2,3], keepdim=True)
+            yang digantikan, jadi classifier di bawahnya TIDAK perlu diubah.
+        """
+        B, C, H, W = z.shape
+        spatial_size = H * W
+
+        # Guard: kalau grid lebih kecil dari k, fallback ke mean biasa
+        # (mencegah error saat imgsz kecil / arsitektur berubah)
+        k_eff = min(k, spatial_size)
+
+        z_flat = z.view(B, C, spatial_size)                    # (B, C, H*W)
+
+        topk_vals, _ = torch.topk(z_flat, k=k_eff, dim=-1)     # (B, C, k_eff)
+        topk_mean = topk_vals.mean(dim=-1)                      # (B, C)
+        global_mean = z_flat.mean(dim=-1)                       # (B, C)
+
+        pooled = alpha * topk_mean + (1.0 - alpha) * global_mean  # (B, C)
+
+        return pooled.view(B, C, 1, 1)                          # (B, C, 1, 1)
+    
     def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
         f_p3_up = self.upsample(f_p3)
         f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
@@ -3386,7 +3422,8 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         z_p3 = self.squeeze_p3(f_p3.detach())
         z_p2 = self.squeeze_p2(f_p2_back.detach())
         z_fused = z_p3 + z_p2
-        z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
+        z_pool = self._topk_spatial_pool(z_fused, k=getattr(self, 'gate_topk', 10), 
+                                         alpha=getattr(self, 'gate_topk_alpha', 0.7),)
 
         logits_raw = self.classifier(z_pool)
         logits_fp32 = logits_raw.view(B, 2).float()
@@ -3460,7 +3497,8 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         z_p3 = self.squeeze_p3(f_p3.detach())
         z_p2 = self.squeeze_p2(f_p2_back.detach())
         z_fused = z_p3 + z_p2
-        z_pool = z_fused.mean(dim=[2, 3], keepdim=True)
+        z_pool = self._topk_spatial_pool(z_fused, k=getattr(self, 'gate_topk', 10), 
+                                                 alpha=getattr(self, 'gate_topk_alpha', 0.7),)
         logits_raw = self.classifier(z_pool)
         logits_fp32 = logits_raw.view(B, 2).float()
         logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
