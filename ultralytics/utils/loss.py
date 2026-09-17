@@ -705,17 +705,41 @@ class v8DetectionLoss:
         # ==========================================================
         # 5. HITUNG RELATIVE PENALTY (GLOBAL SPARSITY)
         # ==========================================================
+        # target_activation: ISI DARI HASIL measure_natural_equilibrium.py, bukan angka heuristik geometris.
+        # Contoh: kalau natural equilibrium checkpoint
+        # Anda menunjukkan mean_p=0.42, set:
+        #     model.router_target_activation = 0.42
+        # dari scheduler/training script Anda (attribute di raw_model, sama seperti router_penalty_lambda).
+        target_activation = getattr(raw_model, 'router_target_activation', 0.35)
+
+        # Floor pengaman keras (lihat penjelasan patch v1) — jangan biarkan target
+        # efektif jatuh di bawah ini apa pun yang terjadi.
+        min_activation_floor = getattr(raw_model, 'router_min_activation_floor', 0.05)
+        target_activation = max(target_activation, min_activation_floor)
+
+        # --- BAND TOLERANSI: lebar zona "aman" di sekitar target, tidak dihukum ---
+        # Default 0.10 = target 0.42 berarti rentang [0.32, 0.52] tidak kena penalti
+        # sama sekali; compute_router_loss baru "bicara" kalau rata-rata aktivasi
+        # keluar dari rentang ini. Di dalam band, keputusan SEPENUHNYA didikte oleh
+        # gate_value_loss (sinyal per-sampel), bukan sinyal populasi ini.
+        activation_tolerance = getattr(raw_model, 'router_activation_tolerance', 0.10)
+
+        lower_bound = max(0.0, target_activation - activation_tolerance)
+        upper_bound = min(1.0, target_activation + activation_tolerance)
+
+        # Penalti simetris tapi HANYA di luar band (mengganti relu satu-sisi lama
+        # DAN diff^2 presisi dari patch v1):
+        excess_above = torch.relu(p2_active_prob - upper_bound)
+        excess_below = torch.relu(lower_bound - p2_active_prob)
+        relative_penalty = excess_above ** 2 + excess_below ** 2
+
+        relative_penalty = torch.nan_to_num(relative_penalty, nan=0.0)
+
+        # --- p2_running_avg tetap dihitung, HANYA utk logging/perbandingan ---
         if not hasattr(self, 'p2_running_avg'):
             self.p2_running_avg = p2_active_prob.detach().clone().float()
-
-        momentum = getattr(self, 'momentum', 0.95) 
-        
+        momentum = getattr(self, 'momentum', 0.95)
         self.p2_running_avg = (momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach())
-        relative_diff = p2_active_prob - self.p2_running_avg
-        relative_penalty = torch.relu(relative_diff) ** 2
-        
-        # Pengaman L_rel dari NaN
-        relative_penalty = torch.nan_to_num(relative_penalty, nan=0.0)
 
         # ==========================================================
         # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE) - ANTI NaN
@@ -775,7 +799,12 @@ class v8DetectionLoss:
         # ==========================================================
         # 7. HITUNG TOTAL HYBRID ROUTER LOSS
         # ==========================================================
-        alpha = getattr(self, 'alpha', 0.5) 
+        alpha = getattr(self, 'alpha', 0.25) # <-- turun dari 0.5 ke 0.25
+        # Alasan: dengan band toleransi, relative_penalty seharusnya jarang aktif
+        # (hanya saat rata-rata benar-benar melenceng jauh dari target). Bobot
+        # alpha yang lebih rendah memastikan saat penalti INI aktif, ia tidak
+        # membanjiri sinyal difficulty_weight yang berbasis kesulitan per-sampel.
+
         hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
         
         # 🚨 PERBAIKAN 5: Pastikan final dikembalikan ke tipe asal (FP16)

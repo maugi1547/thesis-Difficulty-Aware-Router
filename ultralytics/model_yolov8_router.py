@@ -291,19 +291,34 @@ class DualBranchDetectionLoss:
                 valid_mask = valid_A & valid_B
 
             elif gate_signal_mode == 'hybrid':
-                w_s = getattr(self._raw_model, 'gate_weight_small', 0.7)
-                w_m = getattr(self._raw_model, 'gate_weight_medium', 0.2)
-                w_l = getattr(self._raw_model, 'gate_weight_large', 0.1)
-                per_sample_loss_A = (
-                    w_s * self.loss_A._last_per_sample_loss_small
-                    + w_m * self.loss_A._last_per_sample_loss_medium
-                    + w_l * self.loss_A._last_per_sample_loss_large
-                ).detach()
-                per_sample_loss_B = (
-                    w_s * self.loss_B._last_per_sample_loss_small
-                    + w_m * self.loss_B._last_per_sample_loss_medium
-                    + w_l * self.loss_B._last_per_sample_loss_large
-                ).detach()
+                raw_w_s, raw_w_m, raw_w_l = 0.7, 0.2, 0.1
+                # Ganti bobot tetap dengan normalisasi dinamis per-gambar
+                has_small_a = (self.loss_A._last_small_obj_count > 0).float()
+                has_medium_a = (self.loss_A._last_medium_obj_count > 0).float()  # perlu tambah tracking count_medium juga
+                has_large_a = (self.loss_A._last_large_obj_count > 0).float()
+
+                active_w_sum_a = raw_w_s * has_small_a + raw_w_m * has_medium_a + raw_w_l * has_large_a
+                active_w_sum_a = active_w_sum_a.clamp(min=1e-6)
+
+                per_sample_loss_A = ((
+                    raw_w_s * has_small_a * self.loss_A._last_per_sample_loss_small 
+                    + raw_w_m * has_medium_a * self.loss_A._last_per_sample_loss_medium 
+                    + raw_w_l * has_large_a * self.loss_A._last_per_sample_loss_large
+                ) / active_w_sum_a).detach()
+
+                has_small_b = (self.loss_B._last_small_obj_count > 0).float()
+                has_medium_b = (self.loss_B._last_medium_obj_count > 0).float()  
+                has_large_b = (self.loss_B._last_large_obj_count > 0).float()
+
+                active_w_sum_b = raw_w_s * has_small_b + raw_w_m * has_medium_b + raw_w_l * has_large_b
+                active_w_sum_b = active_w_sum_b.clamp(min=1e-6)
+
+                per_sample_loss_B = ((
+                    raw_w_s * has_small_b * self.loss_B._last_per_sample_loss_small 
+                    + raw_w_m * has_medium_b * self.loss_B._last_per_sample_loss_medium 
+                    + raw_w_l * has_large_b * self.loss_B._last_per_sample_loss_large
+                ) / active_w_sum_b).detach()
+
                 valid_mask = torch.ones_like(per_sample_loss_A, dtype=torch.bool)
 
             else:  # 'total' — perilaku lama
