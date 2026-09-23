@@ -563,7 +563,7 @@ class v8DetectionLoss:
         self._last_per_sample_loss_medium = loss_medium.detach()  # (B,)
         self._last_per_sample_loss_large = loss_large.detach()    # (B,)
         self._last_small_obj_count = count_small.detach()         # (B,) utk masking/valid-check
-
+        
         # =====================================================================
 
         loss[0] *= self.hyp.box  # box gain
