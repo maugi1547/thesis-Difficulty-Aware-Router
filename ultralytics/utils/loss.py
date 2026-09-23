@@ -547,12 +547,17 @@ class v8DetectionLoss:
                 return sum_vals / sum_wts.clamp(min=1e-6), cnt
 
             loss_small, count_small = _stratified_mean(mask_small)
-            loss_medium, _ = _stratified_mean(mask_medium)
-            loss_large, _ = _stratified_mean(mask_large)
+            loss_medium, count_medium = _stratified_mean(mask_medium)
+            loss_large, count_large = _stratified_mean(mask_large)
 
         else:
             box_loss_per_image = torch.zeros(batch_size, device=self.device)
-
+            loss_small = torch.zeros(batch_size, device=self.device)
+            loss_medium = torch.zeros(batch_size, device=self.device)
+            loss_large = torch.zeros(batch_size, device=self.device)
+            count_small = torch.zeros(batch_size, device=self.device)
+            count_medium = torch.zeros(batch_size, device=self.device)
+            count_large = torch.zeros(batch_size, device=self.device)
         # --- versi lama: TETAP dipertahankan (kompatibilitas mundur) ---
         self._last_per_sample_loss = (
             box_loss_per_image * self.hyp.box + cls_loss_per_image * self.hyp.cls
@@ -563,8 +568,9 @@ class v8DetectionLoss:
         self._last_per_sample_loss_medium = loss_medium.detach()  # (B,)
         self._last_per_sample_loss_large = loss_large.detach()    # (B,)
         self._last_small_obj_count = count_small.detach()         # (B,) utk masking/valid-check
-        
-        # =====================================================================
+        self._last_medium_obj_count = count_medium.detach()   # <-- TAMBAHAN
+        self._last_large_obj_count = count_large.detach()
+                # =====================================================================
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
