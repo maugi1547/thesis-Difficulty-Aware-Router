@@ -5,11 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import csv
-import os
-import time
+from torch import nn
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -116,7 +113,6 @@ class BboxLoss(nn.Module):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
-
     def forward(
         self,
         pred_dist: torch.Tensor,
@@ -196,27 +192,21 @@ class KeypointLoss(nn.Module):
 
 
 def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, reg_max, device):
-    """
-    gt_bboxes: (B, N, 4) xyxy dalam skala pixel gambar penuh
-    gt_labels: (B, N, 1)
-    mask_gt:   (B, N, 1) — 1 kalau GT valid
-    grid_h, grid_w: resolusi grid proxy (setelah pooling, sama dgn P3_pooled)
-    stride: stride efektif grid ini (biasanya 32, sama seperti P5)
-    reg_max: jumlah bin DFL (ikut config Detect Anda)
+    """gt_bboxes: (B, N, 4) xyxy dalam skala pixel gambar penuh gt_labels: (B, N, 1) mask_gt: (B, N, 1) — 1 kalau GT
+    valid grid_h, grid_w: resolusi grid proxy (setelah pooling, sama dgn P3_pooled) stride: stride efektif grid ini
+    (biasanya 32, sama seperti P5) reg_max: jumlah bin DFL (ikut config Detect Anda).
 
-    Return:
-    cls_target: (B, 1, grid_h, grid_w)     — 1 di cell yang overlap GT, 0 lainnya
-    reg_target: (B, 4, grid_h, grid_w)     — jarak (l,t,r,b) dari cell center ke box, dalam satuan stride
-    fg_mask:    (B, grid_h, grid_w)        — cell mana yang dihitung utk reg loss
+    Returns:
+        cls_target: (B, 1, grid_h, grid_w) — 1 di cell yang overlap GT, 0 lainnya
+        reg_target: (B, 4, grid_h, grid_w) — jarak (l,t,r,b) dari cell center ke box, dalam satuan stride
+        fg_mask: (B, grid_h, grid_w) — cell mana yang dihitung utk reg loss
     """
     B = gt_bboxes.shape[0]
     cls_target = torch.zeros(B, 1, grid_h, grid_w, device=device)
     reg_target = torch.zeros(B, 4, grid_h, grid_w, device=device)
     fg_mask = torch.zeros(B, grid_h, grid_w, dtype=torch.bool, device=device)
 
-    yv, xv = torch.meshgrid(
-        torch.arange(grid_h, device=device), torch.arange(grid_w, device=device), indexing="ij"
-    )
+    yv, xv = torch.meshgrid(torch.arange(grid_h, device=device), torch.arange(grid_w, device=device), indexing="ij")
     cx = (xv + 0.5) * stride  # (grid_h, grid_w)
     cy = (yv + 0.5) * stride
 
@@ -228,8 +218,10 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
             continue
 
         x1, y1, x2, y2 = boxes.unbind(-1)  # masing-masing (n,)
-        x1 = x1.view(n, 1, 1); y1 = y1.view(n, 1, 1)
-        x2 = x2.view(n, 1, 1); y2 = y2.view(n, 1, 1)
+        x1 = x1.view(n, 1, 1)
+        y1 = y1.view(n, 1, 1)
+        x2 = x2.view(n, 1, 1)
+        y2 = y2.view(n, 1, 1)
 
         cx_b = cx.unsqueeze(0)  # (1, grid_h, grid_w)
         cy_b = cy.unsqueeze(0)
@@ -256,10 +248,10 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
 
         # --- Resolusi overlap: box dengan AREA TERKECIL menang di cell yang sama ---
         # (catatan: ini sedikit beda semantik dari versi loop asli yang "box terakhir dalam urutan menang",
-        #  tapi "smallest-area-wins" adalah heuristik standar dan lebih masuk akal utk overlap)
+        #  tapi "smallest-area-wins" adalah heuristik standard dan lebih masuk akal utk overlap)
         area = ((x2 - x1) * (y2 - y1)).view(n, 1, 1).expand(n, grid_h, grid_w)
         area_masked = torch.where(inside, area, torch.full_like(area, float("inf")))
-        owner = area_masked.argmin(dim=0)              # (grid_h, grid_w)
+        owner = area_masked.argmin(dim=0)  # (grid_h, grid_w)
         has_owner = torch.isfinite(area_masked.amin(dim=0))  # (grid_h, grid_w)
 
         cls_target[b, 0] = has_owner.float()
@@ -278,13 +270,12 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
 
     return cls_target, reg_target, fg_mask
 
+
 def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz, device):
-    """
-    router: instance UltraLightWeightDifficultyAwareRouter (utk ambil reg_max, num_classes)
-    cls_logits, reg_logits: dari router._last_proxy_cls_logits / _last_proxy_reg_logits
-                            (disimpan saat forward training, lihat perubahan #3 di bawah)
-    batch: dict batch dari trainer (punya batch_idx, cls, bboxes dlm format ternormalisasi)
-    imgsz: (H, W) ukuran gambar input model saat ini
+    """router: instance UltraLightWeightDifficultyAwareRouter (utk ambil reg_max, num_classes) cls_logits, reg_logits:
+    dari router._last_proxy_cls_logits / _last_proxy_reg_logits (disimpan saat forward training, lihat perubahan #3
+    di bawah) batch: dict batch dari trainer (punya batch_idx, cls, bboxes dlm format ternormalisasi) imgsz: (H, W)
+    ukuran gambar input model saat ini.
     """
     B, _, grid_h, grid_w = cls_logits.shape
     reg_max = router.reg_max
@@ -308,6 +299,7 @@ def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz,
             if n := matches.sum():
                 out[j, :n] = targets[matches, 1:]
         from ultralytics.utils.ops import xywh2xyxy
+
         out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         gt_labels, gt_bboxes = out.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
@@ -356,7 +348,7 @@ class v8DetectionLoss:
     def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         # --- TAMBAHKAN BARIS INI ---
-        self.model = model 
+        self.model = model
         # ---------------------------
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -380,10 +372,9 @@ class v8DetectionLoss:
         # INISIALISASI di __init__ DetectionLoss / BboxLoss
         # (tambahkan baris ini ke __init__ class yang relevan)
         # =========================================================
-        self.alpha = 0.5          # bobot relative_penalty vs difficulty_weight
-        self.momentum = 0.99      # EMA untuk running average aktivasi P2
+        self.alpha = 0.5  # bobot relative_penalty vs difficulty_weight
+        self.momentum = 0.99  # EMA untuk running average aktivasi P2
         # p2_running_avg diinisialisasi lazy saat pertama kali dipakai
-
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -477,8 +468,8 @@ class v8DetectionLoss:
         cls_loss_per_image = cls_loss_per_anchor.sum(dim=[1, 2]) / per_image_target_sum  # (B,)
 
         # --- Threshold area (piksel, skala input model — target_bboxes SUDAH skala asli) ---
-        SMALL_AREA_THRESH = getattr(self, 'small_area_thresh', 32.0 * 32.0)
-        MEDIUM_AREA_THRESH = getattr(self, 'medium_area_thresh', 96.0 * 96.0)
+        SMALL_AREA_THRESH = getattr(self, "small_area_thresh", 32.0 * 32.0)
+        MEDIUM_AREA_THRESH = getattr(self, "medium_area_thresh", 96.0 * 96.0)
 
         # Inisialisasi output per-strata
         box_loss_per_image = torch.zeros(batch_size, device=self.device)
@@ -521,15 +512,12 @@ class v8DetectionLoss:
             mask_large = fg_areas >= MEDIUM_AREA_THRESH
 
             def _stratified_mean(mask):
-                """
-                Rata-rata combined_fg_loss per-gambar, HANYA dari anchor di strata `mask`.
-                Dinormalisasi dgn JUMLAH BOBOT DI STRATA ITU (bukan total gambar) --
-                inilah yang membuat gambar padat vs sepi jadi comparable.
-                Gambar tanpa objek di strata ini -> 0.0.
+                """Rata-rata combined_fg_loss per-gambar, HANYA dari anchor di strata `mask`. Dinormalisasi dgn JUMLAH
+                BOBOT DI STRATA ITU (bukan total gambar) -- inilah yang membuat gambar padat vs sepi
+                jadi comparable. Gambar tanpa objek di strata ini -> 0.0.
                 """
                 if mask.sum() == 0:
-                    return (torch.zeros(batch_size, device=self.device),
-                            torch.zeros(batch_size, device=self.device))
+                    return (torch.zeros(batch_size, device=self.device), torch.zeros(batch_size, device=self.device))
 
                 idx = batch_idx_expanded[mask]
                 vals = combined_fg_loss[mask]
@@ -559,10 +547,10 @@ class v8DetectionLoss:
         ).detach()  # (B,)
 
         # --- BARU: versi size-stratified ---
-        self._last_per_sample_loss_small = loss_small.detach()    # (B,)
+        self._last_per_sample_loss_small = loss_small.detach()  # (B,)
         self._last_per_sample_loss_medium = loss_medium.detach()  # (B,)
-        self._last_per_sample_loss_large = loss_large.detach()    # (B,)
-        self._last_small_obj_count = count_small.detach()         # (B,) utk masking/valid-check
+        self._last_per_sample_loss_large = loss_large.detach()  # (B,)
+        self._last_small_obj_count = count_small.detach()  # (B,) utk masking/valid-check
 
         # =====================================================================
 
@@ -574,10 +562,10 @@ class v8DetectionLoss:
         loss = self.compute_router_loss(loss)
         # --- TAMBAHAN: proxy supervision loss ---
         # --- TAMBAHKAN GUARD: proxy supervision loss cuma perlu dihitung SEKALI ---
-        if getattr(self, '_compute_router_penalty', True):  # reuse flag yang sama: True hanya di loss_A
+        if getattr(self, "_compute_router_penalty", True):  # reuse flag yang sama: True hanya di loss_A
             loss = self.compute_proxy_supervision_loss_wrapper(loss, batch, feats[0].shape[2:])
         else:
-            # Pastikan tetap extend ke 5 elemen konsisten, isi proxy=0 di loss_B
+            # Pastikan tetap extend ke 5 element konsisten, isi proxy=0 di loss_B
             if loss.shape[0] == 4:
                 proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
                 loss = torch.cat([loss, proxy_slot])
@@ -585,9 +573,8 @@ class v8DetectionLoss:
         return loss.sum() * batch_size, loss.detach()
         # ---------------------------------------------------------------
 
-
     def compute_proxy_supervision_loss_wrapper(self, loss, batch, feat_shape):
-         # Selalu extend ke 5 elemen dulu, TERLEPAS dari training/eval
+        # Selalu extend ke 5 element dulu, TERLEPAS dari training/eval
         if loss.shape[0] == 4:
             proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
             loss = torch.cat([loss, proxy_slot])
@@ -597,9 +584,14 @@ class v8DetectionLoss:
 
         router = None
         from ultralytics.utils.torch_utils import unwrap_model
+
         raw_model = unwrap_model(self.model)
         for m in raw_model.modules():
-            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter', 'UltraLightWeightDifficultyAwareRouter']:
+            if m.__class__.__name__ in [
+                "DifficultyAwareRouter",
+                "LightWeightDifficultyAwareRouter",
+                "UltraLightWeightDifficultyAwareRouter",
+            ]:
                 router = m
                 break
 
@@ -611,12 +603,7 @@ class v8DetectionLoss:
         imgsz = (feat_shape[0] * stride_p3, feat_shape[1] * stride_p3)
 
         proxy_cls_loss, proxy_reg_loss = compute_proxy_supervision_loss(
-            router,
-            router._last_proxy_cls_logits,
-            router._last_proxy_reg_logits,
-            batch,
-            imgsz,
-            self.device
+            router, router._last_proxy_cls_logits, router._last_proxy_reg_logits, batch, imgsz, self.device
         )
 
         proxy_weight = getattr(self.model, "proxy_supervision_weight", 0.1)  # bobot kecil, ini cuma auxiliary
@@ -633,7 +620,7 @@ class v8DetectionLoss:
     # ============================================================
     # FILE: tambahan di ultralytics/utils/loss.py
     # Bagian router loss — ditambahkan di akhir __call__
-    # setelah loss deteksi standar dihitung.
+    # setelah loss deteksi standard dihitung.
     # ============================================================
     #
     # Letakkan kode ini di dalam class DetectionLoss.__call__()
@@ -647,18 +634,16 @@ class v8DetectionLoss:
     #   # p2_running_avg diinisialisasi lazy saat pertama dipakai
     # ============================================================
     def compute_router_loss(self, loss: torch.Tensor) -> torch.Tensor:
-        """
-        Hitung router penalty dan tambahkan ke index [3] dari tensor loss.
-        """
-        # Selalu pastikan ukuran loss konsisten (5 elemen: box,cls,dfl,router,proxy slot)
+        """Hitung router penalty dan tambahkan ke index [3] dari tensor loss."""
+        # Selalu pastikan ukuran loss konsisten (5 element: box,cls,dfl,router,proxy slot)
         if loss.shape[0] == 3:
             loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
 
         if not self.model.training:
-            return loss   # ukuran tetap 4, isi router=0 (tidak dihitung saat eval, itu wajar)
+            return loss  # ukuran tetap 4, isi router=0 (tidak dihitung saat eval, itu wajar)
 
         # --- TAMBAHKAN GUARD INI ---
-        if not getattr(self, '_compute_router_penalty', True):
+        if not getattr(self, "_compute_router_penalty", True):
             if loss.shape[0] == 3:
                 loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
             return loss
@@ -666,15 +651,20 @@ class v8DetectionLoss:
 
         router = None
         from ultralytics.utils.torch_utils import unwrap_model
+
         raw_model = unwrap_model(self.model)
-        
+
         for m in raw_model.modules():
-            if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter','UltraLightWeightDifficultyAwareRouter']:
+            if m.__class__.__name__ in [
+                "DifficultyAwareRouter",
+                "LightWeightDifficultyAwareRouter",
+                "UltraLightWeightDifficultyAwareRouter",
+            ]:
                 router = m
                 break
 
         if router is None:
-            if not hasattr(self, '_router_warned'):
+            if not hasattr(self, "_router_warned"):
                 print("\n[WARNING] compute_router_loss: DifficultyAwareRouter TIDAK DITEMUKAN di model!\n")
                 self._router_warned = True
             return loss
@@ -684,20 +674,22 @@ class v8DetectionLoss:
             router_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
             loss = torch.cat([loss, router_slot])
 
-        target_lambda = getattr(raw_model, 'router_penalty_lambda', 0.0)
-        val_for_loss = getattr(router, 'loss_prob', None)
-        val_for_log = getattr(router, 'current_activation_prob', val_for_loss)
+        target_lambda = getattr(raw_model, "router_penalty_lambda", 0.0)
+        val_for_loss = getattr(router, "loss_prob", None)
+        val_for_log = getattr(router, "current_activation_prob", val_for_loss)
 
         if val_for_loss is None:
-            return loss 
+            return loss
 
         # 🚨 PERBAIKAN 1: Pastikan P2_prob selalu dalam bentuk Float32
-        p2_active_prob = val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
-        p2_active_prob = p2_active_prob.float() 
-        
+        p2_active_prob = (
+            val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
+        )
+        p2_active_prob = p2_active_prob.float()
+
         p2_log_prob = val_for_log.item() if torch.is_tensor(val_for_log) else float(val_for_log)
 
-        is_warmup = getattr(router, '_is_warmup', False)
+        is_warmup = getattr(router, "_is_warmup", False)
         if is_warmup:
             loss[3] = torch.tensor(0.0, device=loss.device, requires_grad=True)
             return loss
@@ -710,11 +702,11 @@ class v8DetectionLoss:
         # Anda menunjukkan mean_p=0.42, set:
         #     model.router_target_activation = 0.42
         # dari scheduler/training script Anda (attribute di raw_model, sama seperti router_penalty_lambda).
-        target_activation = getattr(raw_model, 'router_target_activation', 0.35)
+        target_activation = getattr(raw_model, "router_target_activation", 0.35)
 
         # Floor pengaman keras (lihat penjelasan patch v1) — jangan biarkan target
         # efektif jatuh di bawah ini apa pun yang terjadi.
-        min_activation_floor = getattr(raw_model, 'router_min_activation_floor', 0.05)
+        min_activation_floor = getattr(raw_model, "router_min_activation_floor", 0.05)
         target_activation = max(target_activation, min_activation_floor)
 
         # --- BAND TOLERANSI: lebar zona "aman" di sekitar target, tidak dihukum ---
@@ -722,7 +714,7 @@ class v8DetectionLoss:
         # sama sekali; compute_router_loss baru "bicara" kalau rata-rata aktivasi
         # keluar dari rentang ini. Di dalam band, keputusan SEPENUHNYA didikte oleh
         # gate_value_loss (sinyal per-sampel), bukan sinyal populasi ini.
-        activation_tolerance = getattr(raw_model, 'router_activation_tolerance', 0.10)
+        activation_tolerance = getattr(raw_model, "router_activation_tolerance", 0.10)
 
         lower_bound = max(0.0, target_activation - activation_tolerance)
         upper_bound = min(1.0, target_activation + activation_tolerance)
@@ -731,59 +723,59 @@ class v8DetectionLoss:
         # DAN diff^2 presisi dari patch v1):
         excess_above = torch.relu(p2_active_prob - upper_bound)
         excess_below = torch.relu(lower_bound - p2_active_prob)
-        relative_penalty = excess_above ** 2 + excess_below ** 2
+        relative_penalty = excess_above**2 + excess_below**2
 
         relative_penalty = torch.nan_to_num(relative_penalty, nan=0.0)
 
         # --- p2_running_avg tetap dihitung, HANYA utk logging/perbandingan ---
-        if not hasattr(self, 'p2_running_avg'):
+        if not hasattr(self, "p2_running_avg"):
             self.p2_running_avg = p2_active_prob.detach().clone().float()
-        momentum = getattr(self, 'momentum', 0.95)
-        self.p2_running_avg = (momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach())
+        momentum = getattr(self, "momentum", 0.95)
+        self.p2_running_avg = momentum * self.p2_running_avg + (1 - momentum) * p2_active_prob.detach()
 
         # ==========================================================
         # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE) - ANTI NaN
         # ==========================================================
-        # Default aman jika terjadi kegagalan sistem
+        # Default aman jika terjadi kegagalan system
         difficulty_weight = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
-        
+
         try:
-            entropy = getattr(router, 'last_entropy', None)
-            conf    = getattr(router, 'last_conf', None)
-            var     = getattr(router, 'last_var', None)
+            entropy = getattr(router, "last_entropy", None)
+            conf = getattr(router, "last_conf", None)
+            var = getattr(router, "last_var", None)
 
             if all(v is not None for v in [entropy, conf, var]):
                 # 🚨 PERBAIKAN 2: Paksa murni ke FP32 untuk mencegah overflow
                 entropy_f = entropy.detach().float()
-                conf_f    = conf.detach().float()
-                var_f     = var.detach().float()
-                
+                conf_f = conf.detach().float()
+                var_f = var.detach().float()
+
                 # Sabuk pengaman 1: netralisir jika ternyata input sudah NaN
                 entropy_f = torch.nan_to_num(entropy_f, nan=0.0)
-                conf_f    = torch.nan_to_num(conf_f, nan=0.0)
-                var_f     = torch.nan_to_num(var_f, nan=0.0)
+                conf_f = torch.nan_to_num(conf_f, nan=0.0)
+                var_f = torch.nan_to_num(var_f, nan=0.0)
 
                 diff_score = entropy_f + var_f - conf_f
                 batch_d_mean = diff_score.mean()
 
-                if not hasattr(self, 'diff_run_mean'):
+                if not hasattr(self, "diff_run_mean"):
                     self.diff_run_mean = batch_d_mean.clone()
                     self.diff_run_var = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
 
                 self.diff_run_mean = self.diff_run_mean.float()
                 self.diff_run_var = self.diff_run_var.float()
 
-                self.diff_run_mean = (momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean)
-                
+                self.diff_run_mean = momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean
+
                 # 🚨 PERBAIKAN 3: Hitung Variance dengan aman di FP32
                 curr_var = (batch_d_mean - self.diff_run_mean) ** 2
-                self.diff_run_var = (momentum * self.diff_run_var + (1 - momentum) * curr_var)
+                self.diff_run_var = momentum * self.diff_run_var + (1 - momentum) * curr_var
 
                 # Batas min dinaikkan ke 1e-4 agar root(var) benar-benar jauh dari 0
-                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4) 
-                
+                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4)
+
                 diff_score_norm = (diff_score - self.diff_run_mean) / d_std_global
-                
+
                 # 🚨 PERBAIKAN 4: Sabuk Pengaman Z-Score sebelum Eksponensial!
                 # Jika nilai Z sangat ekstrem (misal -30), exp(30) akan menjadi Inf.
                 # Kita pasung nilai Z-score di ambang wajar [-10.0, 10.0]
@@ -793,20 +785,20 @@ class v8DetectionLoss:
                 # Hitung diskon/hukuman akhir
                 difficulty_weight = torch.exp(-diff_score_norm).clamp(0.1, 2.0).mean()
 
-        except Exception as e:
-            pass 
+        except Exception:
+            pass
 
         # ==========================================================
         # 7. HITUNG TOTAL HYBRID ROUTER LOSS
         # ==========================================================
-        alpha = getattr(self, 'alpha', 0.25) # <-- turun dari 0.5 ke 0.25
+        alpha = getattr(self, "alpha", 0.25)  # <-- turun dari 0.5 ke 0.25
         # Alasan: dengan band toleransi, relative_penalty seharusnya jarang aktif
         # (hanya saat rata-rata benar-benar melenceng jauh dari target). Bobot
         # alpha yang lebih rendah memastikan saat penalti INI aktif, ia tidak
         # membanjiri sinyal difficulty_weight yang berbasis kesulitan per-sampel.
 
-        hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
-        
+        hybrid_weight = alpha * relative_penalty + (1 - alpha) * difficulty_weight
+
         # 🚨 PERBAIKAN 5: Pastikan final dikembalikan ke tipe asal (FP16)
         final_router_loss = target_lambda * p2_active_prob * hybrid_weight
         loss[3] = final_router_loss.to(loss.dtype)
@@ -814,12 +806,12 @@ class v8DetectionLoss:
         # ==========================================================
         # 8. DEBUGGING LOG (TERMINAL) & MEMORY BUFFERING (CSV)
         # ==========================================================
-        if not hasattr(self, 'debug_counter'):
+        if not hasattr(self, "debug_counter"):
             self.debug_counter = 0
 
         self.debug_counter += 1
 
-        TOTAL_BATCHES = getattr(self.model, 'total_batches', 324)
+        TOTAL_BATCHES = getattr(self.model, "total_batches", 324)
 
         current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 4
         current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
@@ -831,33 +823,46 @@ class v8DetectionLoss:
         val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
         # --- TAMBAHAN: ambil nilai gate_value dari router ---
-        gv_target_mean = getattr(router, 'last_target_gate_mean', None)
-        gv_loss = getattr(router, 'last_gate_value_loss', None)
-        gv_weight_active = getattr(router, 'last_gate_value_weight_active', None)
-        gv_offset = getattr(router, 'last_gate_offset', None) 
+        gv_target_mean = getattr(router, "last_target_gate_mean", None)
+        gv_loss = getattr(router, "last_gate_value_loss", None)
+        gv_weight_active = getattr(router, "last_gate_value_weight_active", None)
+        gv_offset = getattr(router, "last_gate_offset", None)
 
         val_gv_target = gv_target_mean.item() if isinstance(gv_target_mean, torch.Tensor) else (gv_target_mean or 0.0)
         val_gv_loss = gv_loss.item() if isinstance(gv_loss, torch.Tensor) else (gv_loss or 0.0)
-        val_gv_weight = gv_weight_active.item() if isinstance(gv_weight_active, torch.Tensor) else (gv_weight_active or 0.0)
-        val_gv_offset = gv_offset.item() if isinstance(gv_offset,torch.Tensor) else (gv_offset or 0.0)
+        val_gv_weight = (
+            gv_weight_active.item() if isinstance(gv_weight_active, torch.Tensor) else (gv_weight_active or 0.0)
+        )
+        val_gv_offset = gv_offset.item() if isinstance(gv_offset, torch.Tensor) else (gv_offset or 0.0)
 
         if self.debug_counter % 100 == 0:
-            print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
+            print(
+                f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
                 f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f} | "
-                f"GV_Target: {val_gv_target:.4f} | GV_Loss: {val_gv_loss:.4f} | GV_Weight: {val_gv_weight:.3f} | GV_Offset: {val_gv_offset:.3f}")
+                f"GV_Target: {val_gv_target:.4f} | GV_Loss: {val_gv_loss:.4f} | GV_Weight: {val_gv_weight:.3f} | GV_Offset: {val_gv_offset:.3f}"
+            )
 
-        if not hasattr(self.model, 'router_buffer'):
+        if not hasattr(self.model, "router_buffer"):
             self.model.router_buffer = []
 
         val_data = [
-            current_epoch, current_batch, f"{val_lambda:.4f}",
-            f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}",
-            f"{val_gv_target:.6f}", f"{val_gv_loss:.6f}", f"{val_gv_weight:.4f}", f"{val_gv_offset:.4f}",  # <-- TAMBAHAN kolom
+            current_epoch,
+            current_batch,
+            f"{val_lambda:.4f}",
+            f"{val_p2_prob:.6f}",
+            f"{val_rel:.6f}",
+            f"{val_diff:.6f}",
+            f"{val_final_l3:.6f}",
+            f"{val_gv_target:.6f}",
+            f"{val_gv_loss:.6f}",
+            f"{val_gv_weight:.4f}",
+            f"{val_gv_offset:.4f}",  # <-- TAMBAHAN kolom
         ]
 
         self.model.router_buffer.append(val_data)
 
         return loss
+
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
