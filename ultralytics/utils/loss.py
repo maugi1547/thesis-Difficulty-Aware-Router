@@ -547,8 +547,8 @@ class v8DetectionLoss:
                 return sum_vals / sum_wts.clamp(min=1e-6), cnt
 
             loss_small, count_small = _stratified_mean(mask_small)
-            loss_medium, count_medium = _stratified_mean(mask_medium)
-            loss_large, count_large = _stratified_mean(mask_large)
+            loss_medium, count_medium = _stratified_mean(mask_medium) 
+            loss_large, count_large = _stratified_mean(mask_large) 
 
         else:
             box_loss_per_image = torch.zeros(batch_size, device=self.device)

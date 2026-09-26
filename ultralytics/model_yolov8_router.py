@@ -240,20 +240,34 @@ class DualBranchDetectionLoss:
                 self._router_cache = m
                 return m
         return None
-
+    
     def _update_offset(self, batch_diff_mean: torch.Tensor):
-        """EMA update untuk running_diff_mean. batch_diff_mean HARUS sudah detached."""
+        """
+        VERSI ROBUST: clip nilai sebelum EMA update, mencegah outlier tunggal
+        merusak offset secara permanen.
+        """
         if self.running_diff_mean.device != batch_diff_mean.device:
             self.running_diff_mean = self.running_diff_mean.to(batch_diff_mean.device)
-
+ 
+        # --- LAPIS PERTAHANAN 1: clip nilai ekstrem sebelum masuk EMA ---
+        # Batas ini SEHARUSNYA jauh lebih besar dari fluktuasi normal offset
+        # Anda (yang biasanya di rentang -0.05 s.d 0.1 dari data historis),
+        # tapi cukup ketat utk memblokir lonjakan seperti -5.53 kemarin.
+        clip_range = getattr(self, 'offset_clip_range', 1.0)
+        batch_diff_mean_clipped = torch.clamp(batch_diff_mean, -clip_range, clip_range)
+ 
         if not self._offset_initialized:
-            # Inisialisasi langsung ke nilai batch pertama, hindari bias awal dari 0.0
-            # saat loss_A/loss_B masih jauh dari skala matang.
-            self.running_diff_mean = batch_diff_mean.clone()
+            self.running_diff_mean = batch_diff_mean_clipped.clone()
             self._offset_initialized = True
         else:
             m = self.offset_momentum
-            self.running_diff_mean = m * self.running_diff_mean + (1.0 - m) * batch_diff_mean
+            self.running_diff_mean = m * self.running_diff_mean + (1.0 - m) * batch_diff_mean_clipped
+ 
+        # --- LAPIS PERTAHANAN 2 (tambahan): safety net di level offset itu sendiri ---
+        # Kalau entah bagaimana offset TETAP keluar rentang wajar (mis. akibat
+        # beberapa batch beruntun ekstrem di arah yang sama, bukan cuma 1 outlier),
+        # clamp juga hasil akhirnya sbg pengaman terakhir sebelum dipakai di loss.
+        self.running_diff_mean = torch.clamp(self.running_diff_mean, -clip_range, clip_range)
 
     def __call__(self, preds, batch):
         det_A, det_B = preds
@@ -346,7 +360,7 @@ class DualBranchDetectionLoss:
 
                 # offset dari step SEBELUMNYA, di-update SEKALI saja
                 offset = self.running_diff_mean.clone()
-                self._update_offset((loss_A_v - loss_B_v).mean().detach())
+                self._update_offset((loss_A_v - loss_B_v).median().detach())
 
                 if self.use_bce_gate_loss:
                     # jalur lama (BCE) — kini juga menghormati valid_mask
