@@ -380,7 +380,12 @@ class v8DetectionLoss:
         # INISIALISASI di __init__ DetectionLoss / BboxLoss
         # (tambahkan baris ini ke __init__ class yang relevan)
         # =========================================================
-        self.alpha = 0.5          # bobot relative_penalty vs difficulty_weight
+        # [AUDIT-FIX 2026-10 #2] Dulu di-set 0.5 di sini, sehingga default 0.25 di
+        # compute_router_loss tidak pernah berlaku (variabel tertimpa). Sekarang satu
+        # sumber nilai: self.alpha (default 0.25 sesuai niat patch band), bisa di-override
+        # via raw_model.router_hybrid_alpha. Run Opsi C sebelumnya EFEKTIF memakai 0.5 --
+        # set model.router_hybrid_alpha = 0.5 untuk mereproduksinya.
+        self.alpha = 0.25         # bobot relative_penalty vs difficulty_weight
         self.momentum = 0.99      # EMA untuk running average aktivasi P2
         # p2_running_avg diinisialisasi lazy saat pertama kali dipakai
 
@@ -522,29 +527,31 @@ class v8DetectionLoss:
 
             def _stratified_mean(mask):
                 """
-                Rata-rata combined_fg_loss per-gambar, HANYA dari anchor di strata `mask`.
-                Dinormalisasi dgn JUMLAH BOBOT DI STRATA ITU (bukan total gambar) --
-                inilah yang membuat gambar padat vs sepi jadi comparable.
-                Gambar tanpa objek di strata ini -> 0.0.
+                Rata-rata loss per-anchor-fg per-gambar, HANYA dari anchor di strata `mask`.
+                Gambar tanpa anchor di strata ini -> 0.0 (count=0, dipakai utk valid_mask).
+
+                [AUDIT-FIX 2026-10 #1] Versi lama: sum(box*w + cls) / sum(w), clamp 1e-6.
+                Suku cls TIDAK dibobot w tapi tetap dibagi sum(w) -> teramplifikasi 1/sum(w)
+                (sum(w) dari TAL bisa ~0 utk objek kecil -> sampai 1e6x). Kemungkinan kuat
+                penyebab GV_Loss=9254 / offset -5.53. Sekarang: rata-rata TAK berbobot per
+                anchor, (1-CIoU)*box + cls_fg*cls, dibagi jumlah anchor (>=1).
+                Trade-off: anchor dgn alignment rendah dihitung sama rata; skala GV_Loss
+                tidak bisa dibandingkan langsung dgn run sebelum fix ini.
                 """
                 if mask.sum() == 0:
                     return (torch.zeros(batch_size, device=self.device),
                             torch.zeros(batch_size, device=self.device))
 
                 idx = batch_idx_expanded[mask]
-                vals = combined_fg_loss[mask]
-                wts = weight[mask]
+                vals = (1.0 - iou[mask]) * self.hyp.box + cls_loss_fg[mask] * self.hyp.cls
 
                 sum_vals = torch.zeros(batch_size, device=self.device)
-                sum_wts = torch.zeros(batch_size, device=self.device)
                 cnt = torch.zeros(batch_size, device=self.device)
 
                 sum_vals.scatter_add_(0, idx, vals)
-                sum_wts.scatter_add_(0, idx, wts)
                 cnt.scatter_add_(0, idx, torch.ones_like(vals))
 
-                # normalisasi per-strata (bukan per-total-gambar)
-                return sum_vals / sum_wts.clamp(min=1e-6), cnt
+                return sum_vals / cnt.clamp(min=1.0), cnt
 
             loss_small, count_small = _stratified_mean(mask_small)
             loss_medium, count_medium = _stratified_mean(mask_medium) 
@@ -805,7 +812,7 @@ class v8DetectionLoss:
         # ==========================================================
         # 7. HITUNG TOTAL HYBRID ROUTER LOSS
         # ==========================================================
-        alpha = getattr(self, 'alpha', 0.25) # <-- turun dari 0.5 ke 0.25
+        alpha = float(getattr(raw_model, 'router_hybrid_alpha', self.alpha))  # [AUDIT-FIX #2]
         # Alasan: dengan band toleransi, relative_penalty seharusnya jarang aktif
         # (hanya saat rata-rata benar-benar melenceng jauh dari target). Bobot
         # alpha yang lebih rendah memastikan saat penalti INI aktif, ia tidak

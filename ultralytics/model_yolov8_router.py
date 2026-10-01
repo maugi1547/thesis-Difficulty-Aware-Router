@@ -150,7 +150,10 @@ Menggantikan gate_value_loss lama (BCEWithLogits terhadap sigmoid(diff/temperatu
 dengan objective linear ala DynamicDet:
 
     p_i = sigmoid(gate_logit_i)
-    L_router_i = (1 - p_i) * (loss_A_i.detach() - offset/2) + p_i * (loss_B_i.detach() + offset/2)
+    L_router_i = p_i * (loss_A_i.detach() - offset/2) + (1 - p_i) * (loss_B_i.detach() + offset/2)
+    (p_i = P(P2 aktif / Branch A). [AUDIT-FIX #M1: docstring lama tertukar; kode sudah benar.])
+    Implementasi sejak AUDIT-FIX #3: gate_value_loss = mean(p_i * clamp(loss_A_i - loss_B_i - offset)),
+    gradien identik dgn rumus di atas selama selisih di dalam clip, tapi terbatas di luar itu.
 
 di mana `offset` adalah EMA berjalan dari (loss_A_i - loss_B_i), BUKAN raw diff per-batch,
 supaya sinyal yang dikejar gate lebih stabil (meredam "moving target problem").
@@ -370,10 +373,16 @@ class DualBranchDetectionLoss:
                     mean_p = torch.sigmoid(gate_logit_v).mean().detach()
                 else:
                     # OPSI C: soft-mixture dengan EMA offset
+                    # [AUDIT-FIX 2026-10 #3] Versi lama:
+                    #   (1-p)*(loss_B + off/2) + p*(loss_A - off/2)
+                    # -> dL/dp = loss_A - loss_B - off, TIDAK terbatas (clip hanya di offset).
+                    # Sekarang advantage di-clip -> gradien sama di dalam clip, terbatas di luar.
+                    # Catatan: NILAI gate_value_loss (kolom GV_Loss) berubah makna -> tidak
+                    # bisa dibandingkan langsung dgn run sebelum fix ini.
+                    clip_adv = getattr(self, 'gate_adv_clip', getattr(self, 'offset_clip_range', 1.0))
                     p = torch.sigmoid(gate_logit_v)
-                    weighted_loss = (1.0 - p) * (loss_B_v + offset / 2.0) \
-                                    + p * (loss_A_v - offset / 2.0)
-                    gate_value_loss = weighted_loss.mean()
+                    adv = (loss_A_v - loss_B_v - offset).clamp(-clip_adv, clip_adv).detach()
+                    gate_value_loss = (p * adv).mean()
                     mean_p = p.mean().detach()
 
             # scaling pakai jumlah sampel VALID (0 kalau tidak ada -> gate loss mati)
