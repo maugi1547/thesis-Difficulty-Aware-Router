@@ -197,6 +197,16 @@ class KeypointLoss(nn.Module):
 
 def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, reg_max, device):
     """
+    Bangun target sederhana untuk cabang proxy router (grid kasar 20x20).
+
+    Ini BUKAN assigner TAL seperti Detect asli. Aturannya sengaja sederhana dan
+    deterministik karena proxy hanya sinyal bantu ketidakpastian:
+      - sel = foreground jika PUSAT sel berada di dalam box GT;
+      - box yang terlalu kecil sehingga tidak memuat pusat sel mana pun di-assign ke
+        sel terdekat dengan pusat box (agar objek kecil tetap punya target);
+      - bila beberapa box berebut sel yang sama, box dengan AREA TERKECIL menang
+        (memprioritaskan objek kecil, yang memang menjadi alasan adanya P2).
+
     gt_bboxes: (B, N, 4) xyxy dalam skala pixel gambar penuh
     gt_labels: (B, N, 1)
     mask_gt:   (B, N, 1) — 1 kalau GT valid
@@ -208,6 +218,9 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
     cls_target: (B, 1, grid_h, grid_w)     — 1 di cell yang overlap GT, 0 lainnya
     reg_target: (B, 4, grid_h, grid_w)     — jarak (l,t,r,b) dari cell center ke box, dalam satuan stride
     fg_mask:    (B, grid_h, grid_w)        — cell mana yang dihitung utk reg loss
+
+    Catatan: gt_labels diterima demi keseragaman signature tetapi tidak dipakai,
+    karena proxy bekerja sebagai objectness (1 kelas). Tidak ada efek samping.
     """
     B = gt_bboxes.shape[0]
     cls_target = torch.zeros(B, 1, grid_h, grid_w, device=device)
@@ -217,10 +230,13 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
     yv, xv = torch.meshgrid(
         torch.arange(grid_h, device=device), torch.arange(grid_w, device=device), indexing="ij"
     )
+    # Koordinat piksel pusat tiap sel (+0.5 = tengah sel).
     cx = (xv + 0.5) * stride  # (grid_h, grid_w)
     cy = (yv + 0.5) * stride
 
     for b in range(B):  # loop batch tetap ada (murah, cuma B=8x), TAPI loop per-box DIHAPUS
+        # Loop per-box versi lama memakan ~1.2–1.9 detik/batch pada VisDrone (~59 objek
+        # per gambar) karena overhead kernel launch per box; versi broadcast ini ~49 ms.
         valid = mask_gt[b, :, 0].bool()
         boxes = gt_bboxes[b][valid]  # (n, 4)
         n = boxes.shape[0]
@@ -246,6 +262,7 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
             argmin_idx = flat_dist.argmin(dim=1)
             fallback = torch.zeros_like(inside)
             fallback.view(n, -1)[torch.arange(n, device=device), argmin_idx] = True
+            # Hanya box yang tidak punya sel sama sekali yang memakai fallback.
             inside = torch.where(no_inside.view(n, 1, 1), fallback, inside)
 
         # Hitung (l,t,r,b) utk SEMUA box sekaligus, seluruh grid
@@ -257,6 +274,8 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
         # --- Resolusi overlap: box dengan AREA TERKECIL menang di cell yang sama ---
         # (catatan: ini sedikit beda semantik dari versi loop asli yang "box terakhir dalam urutan menang",
         #  tapi "smallest-area-wins" adalah heuristik standar dan lebih masuk akal utk overlap)
+        # Trik: area box di luar sel diganti +inf, lalu argmin per sel = pemilik sel;
+        # sel tanpa pemilik terdeteksi dari min yang tetap +inf.
         area = ((x2 - x1) * (y2 - y1)).view(n, 1, 1).expand(n, grid_h, grid_w)
         area_masked = torch.where(inside, area, torch.full_like(area, float("inf")))
         owner = area_masked.argmin(dim=0)              # (grid_h, grid_w)
@@ -265,12 +284,15 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
         cls_target[b, 0] = has_owner.float()
         fg_mask[b] = has_owner
 
+        # Ambil jarak l/t/r/b milik box pemilik untuk setiap sel.
         idx = owner.unsqueeze(0)
         l_sel = torch.gather(l, 0, idx).squeeze(0)
         t_sel = torch.gather(t, 0, idx).squeeze(0)
         r_sel = torch.gather(r, 0, idx).squeeze(0)
         bt_sel = torch.gather(bt, 0, idx).squeeze(0)
 
+        # Clamp ke [0, reg_max - 1.01]: jarak negatif (sel fallback di luar box) jadi 0,
+        # dan batas atas < reg_max-1 supaya bin kanan (floor+1) masih valid untuk DFL.
         reg_target[b, 0][has_owner] = l_sel[has_owner].clamp(0, reg_max - 1.01)
         reg_target[b, 1][has_owner] = t_sel[has_owner].clamp(0, reg_max - 1.01)
         reg_target[b, 2][has_owner] = r_sel[has_owner].clamp(0, reg_max - 1.01)
@@ -280,11 +302,20 @@ def build_proxy_targets(gt_bboxes, gt_labels, mask_gt, grid_h, grid_w, stride, r
 
 def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz, device):
     """
+    Hitung loss supervisi cabang proxy router terhadap GT.
+
+    Tujuan: membuat statistik ketidakpastian proxy (entropy/conf/var) bermakna —
+    tanpa supervisi, cabang proxy hanya menghasilkan angka acak. Loss ini hanya
+    melatih layer proxy, karena input proxy (P3) sudah di-detach di router.
+
     router: instance UltraLightWeightDifficultyAwareRouter (utk ambil reg_max, num_classes)
     cls_logits, reg_logits: dari router._last_proxy_cls_logits / _last_proxy_reg_logits
                             (disimpan saat forward training, lihat perubahan #3 di bawah)
     batch: dict batch dari trainer (punya batch_idx, cls, bboxes dlm format ternormalisasi)
     imgsz: (H, W) ukuran gambar input model saat ini
+
+    Returns:
+        (proxy_cls_loss, proxy_reg_loss) — keduanya skalar, belum diberi bobot.
     """
     B, _, grid_h, grid_w = cls_logits.shape
     reg_max = router.reg_max
@@ -313,6 +344,9 @@ def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz,
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
     # Stride grid proxy: imgsz[0] / grid_h (biasanya = 32 kalau proxy di resolusi P5-like)
+    # Karena stride diturunkan dari imgsz yang sama yang dipakai untuk menskalakan GT,
+    # target tetap konsisten walaupun imgsz yang dikirim pemanggil keliru skalanya
+    # (lihat catatan stride_p3 di compute_proxy_supervision_loss_wrapper).
     stride = imgsz[0] / grid_h
 
     cls_target, reg_target, fg_mask = build_proxy_targets(
@@ -335,6 +369,8 @@ def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz,
 
         reg_logits_fg = reg_logits.permute(0, 2, 3, 1)[fg_mask]  # (n_fg, reg_max)
 
+        # Distribution Focal Loss: target kontinu dipecah ke dua bin terdekat (floor dan
+        # floor+1) dengan bobot interpolasi linear — sama dengan DFLoss di Detect.
         target_left = reg_target_fg.long()
         target_right = target_left + 1
         weight_left = target_right.float() - reg_target_fg
@@ -351,12 +387,34 @@ def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz,
 
 
 class v8DetectionLoss:
-    """Criterion class for computing training losses for YOLOv8 object detection."""
+    """
+    Criterion class for computing training losses for YOLOv8 object detection.
+
+    Versi termodifikasi untuk router. Selain loss deteksi standar Ultralytics
+    (box/CIoU, cls/BCE, DFL), kelas ini:
+      1. Menyimpan loss PER-GAMBAR (total dan per strata ukuran objek) sebagai sinyal
+         pelatihan gate di DualBranchDetectionLoss (hanya dibaca, di-detach).
+      2. Menghitung router penalty / sparsity (loss[3]) lewat compute_router_loss.
+      3. Menghitung proxy supervision loss (loss[4]) lewat
+         compute_proxy_supervision_loss_wrapper.
+    Poin 2 dan 3 hanya aktif pada instance dengan _compute_router_penalty = True
+    (loss_A di DualBranchDetectionLoss), supaya tidak dihitung dua kali.
+
+    Vektor loss yang dikembalikan selalu 5 elemen: [box, cls, dfl, router, proxy].
+    """
 
     def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
-        """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
+        """
+        Initialize v8DetectionLoss with model parameters and task-aligned assignment settings.
+
+        Catatan: stride/nc/no/reg_max diambil dari model.model[-1] (Detect TERAKHIR =
+        Detect_B). Untuk Branch A, DualBranchDetectionLoss menimpa atribut ini setelah
+        konstruksi.
+        """
         # --- TAMBAHKAN BARIS INI ---
-        self.model = model 
+        # Referensi ke model disimpan untuk membaca flag training, mencari router,
+        # membaca hyperparameter dari scheduler, dan menulis router_buffer (CSV).
+        self.model = model
         # ---------------------------
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -391,7 +449,14 @@ class v8DetectionLoss:
 
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
-        """Preprocess targets by converting to tensor format and scaling coordinates."""
+        """
+        Preprocess targets by converting to tensor format and scaling coordinates.
+
+        (Bawaan Ultralytics.) Mengubah daftar target datar [batch_idx, cls, x, y, w, h]
+        (ternormalisasi 0..1) menjadi tensor ber-padding (B, max_obj, 5) berisi
+        [cls, x1, y1, x2, y2] dalam piksel. Baris padding bernilai 0 dan dikenali lewat
+        mask_gt (jumlah koordinat > 0).
+        """
         nl, ne = targets.shape
         if nl == 0:
             out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
@@ -408,7 +473,12 @@ class v8DetectionLoss:
         return out
 
     def bbox_decode(self, anchor_points: torch.Tensor, pred_dist: torch.Tensor) -> torch.Tensor:
-        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        """
+        Decode predicted object bounding box coordinates from anchor points and distribution.
+
+        (Bawaan Ultralytics.) Distribusi DFL per sisi -> nilai harapan jarak (softmax @ proj)
+        -> box xyxy dalam satuan stride (belum dikali stride).
+        """
         if self.use_dfl:
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
@@ -417,7 +487,23 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        """
+        Calculate the sum of the loss for box, cls and dfl multiplied by batch size.
+
+        Args:
+            preds: list feature map mentah satu Detect head (4 skala untuk A, 3 untuk B),
+                   atau tuple (decoded, raw) saat eval — yang dipakai elemen raw.
+            batch: dict batch Ultralytics.
+
+        Returns:
+            (loss.sum() * batch_size, loss.detach()) dengan loss = [box, cls, dfl, router, proxy].
+
+        Efek samping (setiap panggilan, training maupun eval):
+            self._last_per_sample_loss, _last_per_sample_loss_{small,medium,large},
+            _last_{small,medium,large}_obj_count — sinyal per-gambar untuk gate.
+            Ditambah efek samping compute_router_loss (statistik EMA, router_buffer)
+            bila instance ini adalah loss_A dan model sedang training.
+        """
         loss = torch.zeros(4, device=self.device)  # box, cls, dfl, router
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -429,6 +515,7 @@ class v8DetectionLoss:
 
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
+        # imgsz = resolusi skala pertama x stride pertama (A: 160*4, B: 80*8 -> keduanya 640).
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
@@ -443,6 +530,9 @@ class v8DetectionLoss:
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
+        # Task-Aligned Assigner berjalan INDEPENDEN per branch (instance loss_A dan loss_B
+        # punya assigner sendiri) dan bergantung pada prediksi saat ini -> anchor positif
+        # Branch A dan B bisa berbeda untuk gambar yang sama (sumber noise sinyal gate).
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
@@ -476,12 +566,20 @@ class v8DetectionLoss:
         # gate_value_loss di DualBranchDetectionLoss. Di-detach karena ini
         # HANYA sinyal/target, tidak boleh ikut backward loss deteksi ini sendiri.
         # =====================================================================
+        # Normalisasi per gambar meniru normalisasi batch di atas (dibagi jumlah
+        # target_scores), dengan clamp(min=1) agar gambar tanpa/sedikit objek tidak
+        # membagi dengan angka mendekati 0.
         per_image_target_sum = target_scores.sum(dim=[1, 2]).clamp(min=1.0)  # (B,)
 
+        # BCE dihitung ulang tanpa reduksi supaya bisa dijumlah per gambar.
+        # Catatan: penjumlahan mencakup SEMUA anchor (termasuk background); Branch A
+        # punya ~4x lebih banyak anchor (34.000 vs 8.400 pada 640x640), sehingga massa
+        # loss background-nya tidak setara dengan Branch B.
         cls_loss_per_anchor = self.bce(pred_scores, target_scores.to(dtype))  # (B, num_anchors, nc)
         cls_loss_per_image = cls_loss_per_anchor.sum(dim=[1, 2]) / per_image_target_sum  # (B,)
 
         # --- Threshold area (piksel, skala input model — target_bboxes SUDAH skala asli) ---
+        # Ambang mengikuti konvensi COCO: small < 32^2, medium < 96^2, large >= 96^2.
         SMALL_AREA_THRESH = getattr(self, 'small_area_thresh', 32.0 * 32.0)
         MEDIUM_AREA_THRESH = getattr(self, 'medium_area_thresh', 96.0 * 96.0)
 
@@ -497,6 +595,8 @@ class v8DetectionLoss:
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).squeeze(-1)
             box_loss_raw = (1.0 - iou) * weight  # (n_fg_total,)
 
+            # Indeks gambar untuk setiap anchor fg, supaya loss per-anchor bisa
+            # dijumlahkan per gambar dengan scatter_add_.
             batch_idx_expanded = torch.arange(batch_size, device=self.device).view(-1, 1).expand_as(fg_mask)[fg_mask]
 
             # --- versi lama (dipertahankan, untuk kompatibilitas & perbandingan) ---
@@ -518,6 +618,8 @@ class v8DetectionLoss:
             cls_loss_fg = cls_loss_per_anchor.sum(dim=-1)[fg_mask]  # (n_fg_total,)
 
             # --- gabungkan box + cls jadi satu skor kualitas per-anchor ---
+            # Catatan: sejak AUDIT-FIX #1 variabel ini tidak lagi dipakai oleh
+            # _stratified_mean (yang kini menghitung ulang tanpa bobot w).
             combined_fg_loss = box_loss_raw * self.hyp.box + cls_loss_fg * self.hyp.cls  # (n_fg_total,)
 
             # --- mask strata ---
@@ -537,6 +639,10 @@ class v8DetectionLoss:
                 anchor, (1-CIoU)*box + cls_fg*cls, dibagi jumlah anchor (>=1).
                 Trade-off: anchor dgn alignment rendah dihitung sama rata; skala GV_Loss
                 tidak bisa dibandingkan langsung dgn run sebelum fix ini.
+
+                Returns: (loss_per_gambar (B,), jumlah_anchor_fg_per_gambar (B,)).
+                Catatan: "count" menghitung ANCHOR fg (tiap objek biasanya punya beberapa),
+                bukan jumlah objek, walau disimpan sebagai *_obj_count.
                 """
                 if mask.sum() == 0:
                     return (torch.zeros(batch_size, device=self.device),
@@ -554,10 +660,12 @@ class v8DetectionLoss:
                 return sum_vals / cnt.clamp(min=1.0), cnt
 
             loss_small, count_small = _stratified_mean(mask_small)
-            loss_medium, count_medium = _stratified_mean(mask_medium) 
-            loss_large, count_large = _stratified_mean(mask_large) 
+            loss_medium, count_medium = _stratified_mean(mask_medium)
+            loss_large, count_large = _stratified_mean(mask_large)
 
         else:
+            # Tidak ada anchor fg di seluruh batch (mis. semua gambar tanpa objek):
+            # semua sinyal per-gambar = 0 dan count = 0 (mode 'small' akan melewati batch ini).
             box_loss_per_image = torch.zeros(batch_size, device=self.device)
             loss_small = torch.zeros(batch_size, device=self.device)
             loss_medium = torch.zeros(batch_size, device=self.device)
@@ -566,6 +674,8 @@ class v8DetectionLoss:
             count_medium = torch.zeros(batch_size, device=self.device)
             count_large = torch.zeros(batch_size, device=self.device)
         # --- versi lama: TETAP dipertahankan (kompatibilitas mundur) ---
+        # Sinyal 'total' (yang dipakai versi hasil final KITTI): box + cls per gambar,
+        # dengan gain yang sama seperti loss deteksi (hyp.box, hyp.cls).
         self._last_per_sample_loss = (
             box_loss_per_image * self.hyp.box + cls_loss_per_image * self.hyp.cls
         ).detach()  # (B,)
@@ -587,6 +697,8 @@ class v8DetectionLoss:
         loss = self.compute_router_loss(loss)
         # --- TAMBAHAN: proxy supervision loss ---
         # --- TAMBAHKAN GUARD: proxy supervision loss cuma perlu dihitung SEKALI ---
+        # (output proxy berasal dari router yang sama untuk kedua branch; tanpa guard,
+        #  loss proxy terhitung dua kali dan training VisDrone melambat drastis.)
         if getattr(self, '_compute_router_penalty', True):  # reuse flag yang sama: True hanya di loss_A
             loss = self.compute_proxy_supervision_loss_wrapper(loss, batch, feats[0].shape[2:])
         else:
@@ -595,11 +707,25 @@ class v8DetectionLoss:
                 proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
                 loss = torch.cat([loss, proxy_slot])
 
+        # Konvensi Ultralytics: loss dijumlah lalu dikali batch_size (gradien setara jumlah per gambar).
         return loss.sum() * batch_size, loss.detach()
         # ---------------------------------------------------------------
 
 
     def compute_proxy_supervision_loss_wrapper(self, loss, batch, feat_shape):
+        """
+        Tambahkan proxy supervision loss sebagai komponen ke-5 (loss[4]).
+
+        Args:
+            loss: tensor loss 4 elemen [box, cls, dfl, router].
+            batch: dict batch Ultralytics.
+            feat_shape: (H, W) feature map skala PERTAMA head ini (feats[0]).
+
+        Returns:
+            tensor loss 5 elemen. loss[4] = proxy_weight * (cls + reg) saat training,
+            0 saat eval atau bila router/logit proxy tidak tersedia.
+        Hanya dipanggil dari instance dengan _compute_router_penalty = True (loss_A).
+        """
          # Selalu extend ke 5 elemen dulu, TERLEPAS dari training/eval
         if loss.shape[0] == 4:
             proxy_slot = torch.zeros(1, device=loss.device, dtype=loss.dtype)
@@ -620,6 +746,10 @@ class v8DetectionLoss:
             return loss
 
         # imgsz asli (bukan feat_shape) — feat_shape itu resolusi grid P3, imgsz = feat_shape[0]*stride_P3
+        # Catatan audit: wrapper ini dipanggil dari loss_A, di mana feats[0] adalah P2
+        # (160x160, stride 4), bukan P3. Hasilnya imgsz = 1280 (seharusnya 640). Target
+        # proxy TETAP benar karena GT dan stride grid proxy sama-sama diturunkan dari
+        # imgsz ini (keduanya terskala 2x dan saling meniadakan).
         stride_p3 = 8  # sesuaikan dgn stride P3 di model Anda
         imgsz = (feat_shape[0] * stride_p3, feat_shape[1] * stride_p3)
 
@@ -658,12 +788,39 @@ class v8DetectionLoss:
     #   self.alpha        = 0.5    # bobot relative vs difficulty
     #   self.momentum     = 0.99   # EMA running average aktivasi
     #   # p2_running_avg diinisialisasi lazy saat pertama dipakai
+    # (Catatan: nilai alpha di blok komentar lama ini sudah tidak berlaku; nilai
+    #  aktual ada di __init__ di atas, 0.25 sejak AUDIT-FIX #2.)
     # ============================================================
     def compute_router_loss(self, loss: torch.Tensor) -> torch.Tensor:
         """
         Hitung router penalty dan tambahkan ke index [3] dari tensor loss.
+
+        Router penalty = penalti SPARSITY: mendorong rata-rata probabilitas P2 aktif
+        (router.loss_prob) turun, supaya gate tidak selalu menyalakan P2.
+
+            loss[3] = lambda * p2_active_prob * (alpha * relative_penalty
+                                                  + (1 - alpha) * difficulty_weight)
+
+        - lambda (router_penalty_lambda) dijadwalkan scheduler (0 di fase awal).
+        - relative_penalty: penalti kuadrat bila aktivasi keluar band [target ± tolerance].
+        - difficulty_weight: pengali dari statistik proxy; batch yang "lebih sulit"
+          mendapat penalti lebih kecil (P2 lebih boleh aktif).
+        Catatan: karena difficulty_weight >= 0.1 selalu, loss ini naik monoton terhadap
+        p2_active_prob; band toleransi hanya menambah tekanan di luar band, tidak
+        menghilangkan tekanan di dalamnya.
+
+        Args:
+            loss: tensor [box, cls, dfl, router] (router = 0 sebelum fungsi ini).
+        Returns:
+            tensor loss dengan loss[3] terisi (0 saat eval, warmup, atau di loss_B).
+
+        Efek samping (training, loss_A, setelah warmup): memperbarui p2_running_avg,
+        diff_run_mean, diff_run_var, debug_counter, dan menambah satu baris ke
+        self.model.router_buffer (di-flush ke CSV oleh callback akhir epoch).
         """
         # Selalu pastikan ukuran loss konsisten (5 elemen: box,cls,dfl,router,proxy slot)
+        # (Catatan: loss dibuat dengan 4 elemen di __call__, jadi cek == 3 di fungsi ini
+        #  tidak pernah benar; dipertahankan dari versi lama.)
         if loss.shape[0] == 3:
             loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
 
@@ -671,6 +828,8 @@ class v8DetectionLoss:
             return loss   # ukuran tetap 4, isi router=0 (tidak dihitung saat eval, itu wajar)
 
         # --- TAMBAHKAN GUARD INI ---
+        # loss_B tidak menghitung penalty: penalty bergantung pada router (bukan branch),
+        # jadi cukup dihitung sekali di loss_A agar tidak dobel.
         if not getattr(self, '_compute_router_penalty', True):
             if loss.shape[0] == 3:
                 loss = torch.cat([loss, torch.zeros(1, device=loss.device, dtype=loss.dtype)])
@@ -680,7 +839,7 @@ class v8DetectionLoss:
         router = None
         from ultralytics.utils.torch_utils import unwrap_model
         raw_model = unwrap_model(self.model)
-        
+
         for m in raw_model.modules():
             if m.__class__.__name__ in ['DifficultyAwareRouter', 'LightWeightDifficultyAwareRouter','UltraLightWeightDifficultyAwareRouter']:
                 router = m
@@ -698,16 +857,18 @@ class v8DetectionLoss:
             loss = torch.cat([loss, router_slot])
 
         target_lambda = getattr(raw_model, 'router_penalty_lambda', 0.0)
+        # val_for_loss: probabilitas aktif deterministik dengan gradien (jalur optimasi).
+        # val_for_log : proporsi keputusan keras dari sampel Gumbel (hanya untuk CSV).
         val_for_loss = getattr(router, 'loss_prob', None)
         val_for_log = getattr(router, 'current_activation_prob', val_for_loss)
 
         if val_for_loss is None:
-            return loss 
+            return loss
 
         # 🚨 PERBAIKAN 1: Pastikan P2_prob selalu dalam bentuk Float32
         p2_active_prob = val_for_loss if torch.is_tensor(val_for_loss) else torch.tensor(float(val_for_loss), device=loss.device)
-        p2_active_prob = p2_active_prob.float() 
-        
+        p2_active_prob = p2_active_prob.float()
+
         p2_log_prob = val_for_log.item() if torch.is_tensor(val_for_log) else float(val_for_log)
 
         is_warmup = getattr(router, '_is_warmup', False)
@@ -723,6 +884,8 @@ class v8DetectionLoss:
         # Anda menunjukkan mean_p=0.42, set:
         #     model.router_target_activation = 0.42
         # dari scheduler/training script Anda (attribute di raw_model, sama seperti router_penalty_lambda).
+        # TODO: verifikasi -- script training saat ini TIDAK men-set router_target_activation,
+        # sehingga default 0.35 yang berlaku. Apakah 0.35 memang target yang diinginkan?
         target_activation = getattr(raw_model, 'router_target_activation', 0.35)
 
         # Floor pengaman keras (lihat penjelasan patch v1) — jangan biarkan target
@@ -735,6 +898,8 @@ class v8DetectionLoss:
         # sama sekali; compute_router_loss baru "bicara" kalau rata-rata aktivasi
         # keluar dari rentang ini. Di dalam band, keputusan SEPENUHNYA didikte oleh
         # gate_value_loss (sinyal per-sampel), bukan sinyal populasi ini.
+        # (Koreksi: yang bebas penalti di dalam band hanya suku relative_penalty;
+        #  suku difficulty_weight di bawah tetap memberi tekanan turun di seluruh rentang.)
         activation_tolerance = getattr(raw_model, 'router_activation_tolerance', 0.10)
 
         lower_bound = max(0.0, target_activation - activation_tolerance)
@@ -757,9 +922,14 @@ class v8DetectionLoss:
         # ==========================================================
         # 6. HITUNG DIFFICULTY WEIGHT (LOCAL INTELLIGENCE) - ANTI NaN
         # ==========================================================
+        # Ide: z-score "skor kesulitan" batch ini terhadap rata-rata berjalan, lalu
+        # difficulty_weight = exp(-z) di-clamp [0.1, 2]. Batch lebih sulit dari biasanya
+        # (z > 0) -> weight < 1 -> penalty sparsity lebih ringan -> P2 lebih boleh aktif.
+        # Catatan: statistik dari router sudah berupa rata-rata BATCH (skalar), jadi
+        # pembobotan ini per-batch, bukan per-gambar.
         # Default aman jika terjadi kegagalan sistem
         difficulty_weight = torch.tensor(1.0, device=loss.device, dtype=torch.float32)
-        
+
         try:
             entropy = getattr(router, 'last_entropy', None)
             conf    = getattr(router, 'last_conf', None)
@@ -770,12 +940,16 @@ class v8DetectionLoss:
                 entropy_f = entropy.detach().float()
                 conf_f    = conf.detach().float()
                 var_f     = var.detach().float()
-                
+
                 # Sabuk pengaman 1: netralisir jika ternyata input sudah NaN
                 entropy_f = torch.nan_to_num(entropy_f, nan=0.0)
                 conf_f    = torch.nan_to_num(conf_f, nan=0.0)
                 var_f     = torch.nan_to_num(var_f, nan=0.0)
 
+                # TODO: verifikasi -- router.last_conf adalah UNCERTAINTY (1 - prob, tinggi =
+                # tidak yakin), sama arah dengan entropy dan var. Mengurangkannya di sini
+                # berarti ketidakpastian kelas yang lebih tinggi MENURUNKAN skor kesulitan.
+                # Apakah tanda minus ini disengaja (mis. dulu conf berarti keyakinan)?
                 diff_score = entropy_f + var_f - conf_f
                 batch_d_mean = diff_score.mean()
 
@@ -787,16 +961,16 @@ class v8DetectionLoss:
                 self.diff_run_var = self.diff_run_var.float()
 
                 self.diff_run_mean = (momentum * self.diff_run_mean + (1 - momentum) * batch_d_mean)
-                
+
                 # 🚨 PERBAIKAN 3: Hitung Variance dengan aman di FP32
                 curr_var = (batch_d_mean - self.diff_run_mean) ** 2
                 self.diff_run_var = (momentum * self.diff_run_var + (1 - momentum) * curr_var)
 
                 # Batas min dinaikkan ke 1e-4 agar root(var) benar-benar jauh dari 0
-                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4) 
-                
+                d_std_global = torch.sqrt(self.diff_run_var).clamp(min=1e-4)
+
                 diff_score_norm = (diff_score - self.diff_run_mean) / d_std_global
-                
+
                 # 🚨 PERBAIKAN 4: Sabuk Pengaman Z-Score sebelum Eksponensial!
                 # Jika nilai Z sangat ekstrem (misal -30), exp(30) akan menjadi Inf.
                 # Kita pasung nilai Z-score di ambang wajar [-10.0, 10.0]
@@ -807,7 +981,9 @@ class v8DetectionLoss:
                 difficulty_weight = torch.exp(-diff_score_norm).clamp(0.1, 2.0).mean()
 
         except Exception as e:
-            pass 
+            # Kegagalan statistik tidak boleh menghentikan training: difficulty_weight
+            # kembali ke default 1.0 (penalty sparsity tanpa modulasi kesulitan).
+            pass
 
         # ==========================================================
         # 7. HITUNG TOTAL HYBRID ROUTER LOSS
@@ -819,21 +995,29 @@ class v8DetectionLoss:
         # membanjiri sinyal difficulty_weight yang berbasis kesulitan per-sampel.
 
         hybrid_weight = (alpha * relative_penalty + (1 - alpha) * difficulty_weight)
-        
+
         # 🚨 PERBAIKAN 5: Pastikan final dikembalikan ke tipe asal (FP16)
+        # Gradien mengalir hanya lewat p2_active_prob (difficulty_weight sudah detached);
+        # relative_penalty juga bergantung pada p2_active_prob.
         final_router_loss = target_lambda * p2_active_prob * hybrid_weight
         loss[3] = final_router_loss.to(loss.dtype)
 
         # ==========================================================
         # 8. DEBUGGING LOG (TERMINAL) & MEMORY BUFFERING (CSV)
         # ==========================================================
+        # Ditulis ke list di memori (router_buffer), bukan langsung ke file, supaya
+        # tidak ada I/O disk tiap batch; callback akhir epoch yang menulis ke CSV.
         if not hasattr(self, 'debug_counter'):
             self.debug_counter = 0
 
         self.debug_counter += 1
 
+        # total_batches di-set oleh scheduler (len(train_loader)); 324 hanya fallback.
         TOTAL_BATCHES = getattr(self.model, 'total_batches', 324)
 
+        # TODO: verifikasi -- offset "+ 4" pada label epoch. debug_counter baru mulai
+        # setelah warmup (epoch 11 pada scheduler saat ini), sehingga label CSV =
+        # epoch sebenarnya - 7. Apakah +4 sisa dari masa warmup berakhir di epoch 4?
         current_epoch = ((self.debug_counter - 1) // TOTAL_BATCHES) + 4
         current_batch = ((self.debug_counter - 1) % TOTAL_BATCHES) + 1
 
@@ -844,10 +1028,12 @@ class v8DetectionLoss:
         val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
         # --- TAMBAHAN: ambil nilai gate_value dari router ---
+        # Nilai-nilai ini ditulis DualBranchDetectionLoss SETELAH loss_A selesai, jadi
+        # yang terbaca di sini adalah nilai dari step SEBELUMNYA (tertinggal 1 step).
         gv_target_mean = getattr(router, 'last_target_gate_mean', None)
         gv_loss = getattr(router, 'last_gate_value_loss', None)
         gv_weight_active = getattr(router, 'last_gate_value_weight_active', None)
-        gv_offset = getattr(router, 'last_gate_offset', None) 
+        gv_offset = getattr(router, 'last_gate_offset', None)
 
         val_gv_target = gv_target_mean.item() if isinstance(gv_target_mean, torch.Tensor) else (gv_target_mean or 0.0)
         val_gv_loss = gv_loss.item() if isinstance(gv_loss, torch.Tensor) else (gv_loss or 0.0)
@@ -862,6 +1048,7 @@ class v8DetectionLoss:
         if not hasattr(self.model, 'router_buffer'):
             self.model.router_buffer = []
 
+        # Urutan kolom (11) harus sama dengan header CSV di callback on_train_epoch_end.
         val_data = [
             current_epoch, current_batch, f"{val_lambda:.4f}",
             f"{val_p2_prob:.6f}", f"{val_rel:.6f}", f"{val_diff:.6f}", f"{val_final_l3:.6f}",
