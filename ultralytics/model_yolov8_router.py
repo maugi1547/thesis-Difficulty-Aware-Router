@@ -463,11 +463,16 @@ class DualBranchDetectionLoss:
         Efek samping (hanya saat training & setelah warmup):
             - memperbarui EMA offset (self.running_diff_mean),
             - menulis statistik logging ke router (last_target_gate_mean,
-              last_gate_value_loss, last_gate_value_weight_active, last_gate_offset)
-              yang dibaca compute_router_loss untuk CSV pada step BERIKUTNYA
-              (compute_router_loss berjalan di dalam self.loss_A, sebelum blok ini).
+              last_gate_value_loss, last_gate_value_weight_active, last_gate_offset),
+              lalu melengkapi kolom GV baris CSV step INI (_flush_pending_log).
         """
         det_A, det_B = preds
+
+        # [AUDIT-FIX 2026-10 #6] Beri tahu compute_router_loss bahwa print debug & kolom GV
+        # CSV akan dilengkapi di akhir fungsi ini (setelah gate loss step ini dihitung).
+        _router_for_log = self._find_router()
+        if _router_for_log is not None:
+            _router_for_log._defer_debug_print = True
 
         # Urutan penting: loss_A dihitung lebih dulu. Di dalamnya compute_router_loss
         # dan proxy supervision ikut berjalan (flag _compute_router_penalty=True).
@@ -641,4 +646,47 @@ class DualBranchDetectionLoss:
             self._last_offset = zero
             self._last_mean_p = zero
 
+        self._flush_pending_log(router)
+
         return total_loss, combined_items.detach()
+
+    def _flush_pending_log(self, router):
+        """
+        [AUDIT-FIX 2026-10 #6] Lengkapi kolom GV pada baris CSV milik step ini.
+
+        Masalah lama: compute_router_loss (dipanggil di dalam loss_A) menulis baris CSV
+        SEBELUM gate loss step ini dihitung, sehingga kolom GV_Target/GV_Loss/GV_Weight/
+        GV_Offset berisi nilai step SEBELUMNYA (tertinggal 1 step).
+        Solusi: compute_router_loss menyimpan referensi baris tersebut di
+        router._pending_csv_row; fungsi ini menimpa kolom 7-10 secara in-place (list yang
+        sama dengan yang ada di router_buffer) dan mencetak debug yang ditunda.
+
+        Tidak mempengaruhi loss/gradien — murni logging.
+        Efek samping: mengubah isi baris terakhir router_buffer; mengosongkan
+        router._pending_csv_row dan router._pending_debug_print.
+        """
+        if router is None:
+            return
+        row = getattr(router, '_pending_csv_row', None)
+        if row is None:
+            return
+        router._pending_csv_row = None
+
+        def _to_float(v):
+            if isinstance(v, torch.Tensor):
+                return v.item()
+            return float(v) if v is not None else 0.0
+
+        gv_target = _to_float(getattr(router, 'last_target_gate_mean', None))
+        gv_loss = _to_float(getattr(router, 'last_gate_value_loss', None))
+        gv_weight = _to_float(getattr(router, 'last_gate_value_weight_active', None))
+        gv_offset = _to_float(getattr(router, 'last_gate_offset', None))
+
+        # Format sama persis dengan val_data di compute_router_loss.
+        row[7:11] = [f"{gv_target:.6f}", f"{gv_loss:.6f}", f"{gv_weight:.4f}", f"{gv_offset:.4f}"]
+
+        if getattr(router, '_pending_debug_print', False):
+            router._pending_debug_print = False
+            print(f"\n   [LOSS DEBUG] Epoch {row[0]} | Batch {row[1]} | Lmbda: {float(row[2]):.2f} | "
+                f"P2_Prob: {float(row[3]):.4f} | Diff_W: {float(row[5]):.4f} | Final_L3: {float(row[6]):.4f} | "
+                f"GV_Target: {gv_target:.4f} | GV_Loss: {gv_loss:.4f} | GV_Weight: {gv_weight:.3f} | GV_Offset: {gv_offset:.3f}")

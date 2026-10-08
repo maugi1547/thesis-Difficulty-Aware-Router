@@ -3226,6 +3226,35 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
     1. 100% Fully Convolutional (Tanpa nn.Linear).
     2. Dimensi 4D dipertahankan dari awal hingga akhir (Tanpa Flatten memory).
     3. Bebas AdaptiveAvgPool2d (Menggunakan Native Spatial Mean).
+       (Catatan: sejak versi ini pooling gate memakai top-k spasial, lihat
+        _topk_spatial_pool — tetap operasi native topk/mean, bukan AdaptiveAvgPool2d.)
+
+    Peran modul di dalam graf (layer 16 di yolov8-p2-router.yaml):
+        input  : x = [P3_neck (layer 15, stride 8), P2_backbone (layer 2, stride 4)]
+        output : fitur C2f-P2 (stride 4) yang diteruskan ke Branch A dan Detect_A.
+
+    Modul ini memuat TIGA bagian yang tugasnya berbeda:
+      1. Jalur gate (squeeze_p3, squeeze_p2, classifier): menghasilkan 2 logit
+         [skip P2, aktifkan P2] per gambar. Murah dan TensorRT-friendly karena
+         jalur inilah yang ikut di Stage 1 deployment.
+      2. Cabang proxy (proxy_*), HANYA training: kepala deteksi mini di resolusi kasar
+         yang menghasilkan statistik ketidakpastian (entropy/conf/var) untuk
+         memodulasi sparsity penalty (difficulty_weight di compute_router_loss).
+      3. Expert (upsample + C2f-P2): komputasi P2 yang sebenarnya; inilah bagian
+         yang di-skip pada deployment ketika gate = 0.
+
+    Konvensi indeks logit: indeks 1 = "P2 aktif" (Branch A), indeks 0 = "skip P2"
+    (Branch B). gate_logit = logit[1] - logit[0].
+
+    State yang ditulis modul ini dan dibaca dari luar:
+        _is_warmup                       <- diset scheduler (script training).
+        loss_prob                        -> compute_router_loss (sparsity, punya gradien).
+        current_activation_prob          -> logging (P2_Prob_Real) & monitor validasi.
+        last_entropy / last_conf / last_var -> difficulty_weight di compute_router_loss.
+        _last_gate_logit_per_sample      -> gate_value_loss di DualBranchDetectionLoss.
+        _last_proxy_cls_logits / _last_proxy_reg_logits -> proxy supervision loss.
+        calib_T / calib_b                <- diset setelah kalibrasi post-hoc; sejak AUDIT-FIX #9
+                                            tersimpan di state_dict/checkpoint (lihat property calib_T).
     """
     def __init__(
         self,
@@ -3238,6 +3267,19 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         reg_max: int = 16,
         warmup_epochs: int = 5,
     ):
+        """
+        Args (nilai aktual untuk YOLOv8n diisi oleh parse_model di tasks.py):
+            c_p3: channel P3_neck (64 untuk skala n).
+            c_p2: channel P2 dari backbone (32 untuk skala n).
+            c2f_out: channel output C2f-P2 (128 di YAML x width 0.25 = 32).
+            n_bottleneck: jumlah bottleneck C2f-P2 (setelah penskalaan depth).
+            shortcut: residual di bottleneck C2f.
+            num_classes: jumlah kelas cabang proxy. YAML tidak mengisinya, jadi default 1
+                -> proxy bekerja sebagai "objectness" (ada objek / tidak), bukan klasifikasi
+                Person/Vehicle.
+            reg_max: jumlah bin distribusi jarak cabang proxy (mengikuti DFL Detect, 16).
+            warmup_epochs: hanya dipakai set_epoch() (lihat catatan di sana).
+        """
         super().__init__()
         self.c_p3 = c_p3
         self.c_p2 = c_p2
@@ -3245,22 +3287,32 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         self.num_classes = num_classes
         self.reg_max = reg_max
         self.warmup_epochs = warmup_epochs
-        
+
+        # Temperatur Gumbel-softmax yang dapat dipelajari (tau = softplus(param) + 0.1).
+        # Catatan: hasil Gumbel tidak dipakai oleh loss mana pun di versi ini (lihat forward),
+        # sehingga parameter ini tidak menerima gradien dan nilainya tetap 1.5.
+        # TODO: verifikasi -- apakah tau_param/Gumbel sengaja dipertahankan (mis. untuk
+        # kompatibilitas checkpoint lama) atau sisa versi lama yang bisa dihapus di versi berikutnya?
         self.tau_param = nn.Parameter(torch.tensor(1.5))
 
         # =========================================================================
         # 1. JALUR UTAMA INFERENSI (MURNI CONVOLUTION & COMPUTE-BOUND)
         # =========================================================================
-        hidden_dim = max(c_p3 // 4, 16) 
-        
+        hidden_dim = max(c_p3 // 4, 16)
+
         # Kompresi P3 (Stride 4)
+        # Conv kernel=stride=4: tiap blok 4x4 diringkas jadi 1 piksel tanpa overlap.
+        # P3 (80x80 untuk input 640) -> 20x20.
         self.squeeze_p3 = nn.Sequential(
             nn.Conv2d(c_p3, hidden_dim, kernel_size=4, stride=4, padding=0, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.SiLU()
         )
-        
+
         # Kompresi P2 (Stride 8)
+        # P2 (160x160) -> 20x20 dengan kernel=stride=8. Stride berbeda dipilih supaya
+        # KEDUA peta berakhir di grid 20x20 yang sama, sehingga bisa dijumlahkan langsung
+        # (z_p3 + z_p2) tanpa upsample/interpolasi tambahan.
         self.squeeze_p2 = nn.Sequential(
             nn.Conv2d(c_p2, hidden_dim, kernel_size=8, stride=8, padding=0, bias=False),
             nn.BatchNorm2d(hidden_dim),
@@ -3270,32 +3322,52 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         # 🚨 PERBAIKAN 1 & 2: PENGGANTI LINEAR DAN ADAPTIVE POOLING 🚨
         # Menggunakan Pointwise Convolution (Conv 1x1) untuk menggantikan nn.Linear.
         # Ini memungkinkan TensorRT melakukan Kernel Fusion secara sempurna tanpa memutus graf 4D.
+        # [AUDIT-FIX 2026-10 #8] BatchNorm2d -> GroupNorm(1, C).
+        # Masalah lama: BatchNorm2d bekerja pada tensor (B, C, 1, 1), sehingga statistik
+        # training dihitung ANTAR-GAMBAR dalam batch -> logit gate satu gambar ikut
+        # dipengaruhi gambar lain (dan beda perilaku train vs eval), serta error bila batch
+        # berisi 1 gambar. GroupNorm dengan 1 grup menormalisasi antar-channel PER GAMBAR
+        # (setara LayerNorm untuk vektor C x 1 x 1): tidak bergantung batch, tidak punya
+        # running stats, perilaku train = eval, dan didukung ONNX/TensorRT.
+        # Konsekuensi: arsitektur berubah -> checkpoint lama tetap bisa dimuat (weight/bias
+        # bentuknya sama), tapi classifier gate perlu DILATIH ULANG agar bermakna.
         self.classifier = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(hidden_dim // 2),
+            nn.GroupNorm(1, hidden_dim // 2),
             nn.SiLU(),
             nn.Conv2d(hidden_dim // 2, 2, kernel_size=1, stride=1, padding=0, bias=True)
         )
-        
+
         # Inisialisasi bias (Layer Conv terakhir memiliki bias)
-        nn.init.constant_(self.classifier[-1].bias[0], -1.0) 
-        nn.init.constant_(self.classifier[-1].bias[1],  1.0) 
+        # Bias awal [-1, +1] -> gate_logit awal ≈ +2 -> sigmoid ≈ 0.88: gate mulai dengan
+        # kecenderungan kuat "P2 aktif".
+        # TODO: verifikasi -- alasan memulai dari bias "P2 aktif" (agar sparsity penalty
+        # menurunkan aktivasi dari atas, bukan menaikkannya dari nol?) perlu dikonfirmasi.
+        nn.init.constant_(self.classifier[-1].bias[0], -1.0)
+        nn.init.constant_(self.classifier[-1].bias[1],  1.0)
 
         # =========================================================================
         # 2. AUXILIARY BRANCH (HANYA TRAINING)
         # =========================================================================
+        # P3 80x80 -> 20x20 (stride efektif 32). MaxPool (bukan AvgPool) mempertahankan
+        # aktivasi puncak lokal sehingga respons objek kecil tidak tenggelam dalam rata-rata.
+        # TODO: verifikasi -- apakah alasan pemilihan MaxPool memang seperti di atas?
         self.proxy_pool = nn.MaxPool2d(kernel_size=4, stride=4)
-        hidden_c = max(c_p3 // 8, 16) 
+        hidden_c = max(c_p3 // 8, 16)
 
         self.proxy_stem = nn.Sequential(
             nn.Conv2d(c_p3, hidden_c, kernel_size=1, bias=True),
             nn.SiLU()
         )
+        # Depthwise 3x3 (groups=hidden_c) + pointwise 1x1: pola head ringan ala
+        # MobileNet, cukup untuk sinyal bantu tanpa menambah banyak parameter.
         self.proxy_cls = nn.Sequential(
             nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
             nn.SiLU(),
-            nn.Conv2d(hidden_c, num_classes, kernel_size=1, bias=True) 
+            nn.Conv2d(hidden_c, num_classes, kernel_size=1, bias=True)
         )
+        # Keterbatasan yang sudah diketahui: output reg_max channel TOTAL (satu distribusi
+        # "jarak rata-rata"), bukan 4 x reg_max per sisi seperti DFL di Detect asli.
         self.proxy_reg_dist = nn.Sequential(
             nn.Conv2d(hidden_c, hidden_c, kernel_size=3, padding=1, groups=hidden_c, bias=True),
             nn.SiLU(),
@@ -3305,52 +3377,157 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         # =========================================================================
         # 3. EXPERT MODULE (C2f P2 Asli)
         # =========================================================================
+        # Sama dengan blok neck P2 di YOLOv8-P2 standar: upsample P3 ke resolusi P2,
+        # concat dengan P2 backbone, lalu C2f. Ditempatkan di dalam router supaya
+        # "komputasi P2 yang bisa di-skip" terkumpul di satu modul (memudahkan export
+        # Stage 2A lewat compute_expert_only).
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
         self.c2f_p2 = C2f(c_p3 + c_p2, c2f_out, n=n_bottleneck, shortcut=shortcut)
 
         # =========================================================================
         # 4. TRACKING STATE
         # =========================================================================
+        # Semua di bawah adalah atribut Python biasa (bukan buffer/parameter), jadi
+        # TIDAK tersimpan di state_dict/checkpoint. Nilainya diisi ulang saat forward
+        # atau oleh scheduler. (calib_T/calib_b berbeda: lihat buffer kalibrasi di bawah.)
         self.current_epoch = 0
         self._is_warmup = True
         self.current_activation_prob = torch.tensor(0.0)
         self.loss_prob = torch.tensor(0.0)
-        
+
         self.last_entropy = torch.tensor(0.0)
         self.last_conf = torch.tensor(0.0)
         self.last_var = torch.tensor(0.0)
+
+        # =========================================================================
+        # 5. BUFFER KALIBRASI GATE  [AUDIT-FIX 2026-10 #9]
+        # =========================================================================
+        # Masalah lama: calib_T/calib_b adalah atribut Python biasa -> tidak tersimpan di
+        # state_dict, hilang setiap model dibangun ulang + load weights (penyebab bug
+        # activation rate 14.3% sebelumnya).
+        # Solusi: disimpan sebagai buffer INTEGER dalam satuan mikro (nilai x 1e6).
+        # Kenapa integer, bukan float:
+        #   - checkpoint Ultralytics disimpan dengan .half(); buffer float akan dibulatkan
+        #     ke FP16 (mis. 1.3483 -> 1.3486) dan bisa membalik keputusan gate di dekat
+        #     threshold. Buffer integer tidak disentuh .half().
+        #   - ModelEMA hanya meng-update tensor floating point, jadi nilai kalibrasi tidak
+        #     ikut "dirata-rata" EMA.
+        # Akses tetap lewat router.calib_T / router.calib_b (property di bawah), sehingga
+        # skrip lama yang menulis `router.calib_T = 1.3483` tetap berfungsi.
+        self.register_buffer("_calib_T_micro", torch.tensor(1_000_000, dtype=torch.int64))
+        self.register_buffer("_calib_b_micro", torch.tensor(0, dtype=torch.int64))
+
+    # -------------------------------------------------------------------------
+    # KALIBRASI GATE (persisten di state_dict)  [AUDIT-FIX 2026-10 #9]
+    # -------------------------------------------------------------------------
+    @property
+    def calib_T(self) -> float:
+        """
+        Faktor skala kalibrasi Platt untuk logit gate (default 1.0 = tanpa kalibrasi).
+
+        Dibaca dari buffer integer _calib_T_micro. Untuk objek router dari checkpoint
+        versi lama (di-pickle sebelum buffer ini ada), fallback ke atribut lama
+        `calib_T` di __dict__ bila pernah diset, atau 1.0.
+        Returns: float Python (di-.item() supaya hasil perkalian identik dengan versi lama
+        yang memakai float, dan menjadi konstanta saat export ONNX).
+        """
+        buf = self._buffers.get("_calib_T_micro")
+        if buf is None:
+            return self.__dict__.get("calib_T", 1.0)
+        return buf.item() / 1e6
+
+    @calib_T.setter
+    def calib_T(self, value):
+        """Simpan calib_T dengan presisi 1e-6. Efek samping: mengubah buffer _calib_T_micro."""
+        buf = self._buffers.get("_calib_T_micro")
+        if buf is None:
+            self.__dict__["calib_T"] = float(value)
+        else:
+            buf.fill_(int(round(float(value) * 1e6)))
+
+    @property
+    def calib_b(self) -> float:
+        """Bias kalibrasi Platt untuk logit gate (default 0.0). Lihat calib_T."""
+        buf = self._buffers.get("_calib_b_micro")
+        if buf is None:
+            return self.__dict__.get("calib_b", 0.0)
+        return buf.item() / 1e6
+
+    @calib_b.setter
+    def calib_b(self, value):
+        """Simpan calib_b dengan presisi 1e-6. Efek samping: mengubah buffer _calib_b_micro."""
+        buf = self._buffers.get("_calib_b_micro")
+        if buf is None:
+            self.__dict__["calib_b"] = float(value)
+        else:
+            buf.fill_(int(round(float(value) * 1e6)))
 
     # -------------------------------------------------------------------------
     # FUNGSI-FUNGSI STATISTIK (HANYA DIPANGGIL SAAT TRAINING)
     # -------------------------------------------------------------------------
     def set_epoch(self, epoch: int):
+        """
+        Set epoch saat ini dan status warmup (warmup bila epoch < warmup_epochs).
+
+        Efek samping: mengubah self.current_epoch dan self._is_warmup.
+        Catatan: di pipeline saat ini scheduler (ideal_curriculum_scheduler) menulis
+        _is_warmup secara langsung (warmup berakhir setelah epoch 10), sehingga
+        method ini dan warmup_epochs=5 tidak berpengaruh.
+        TODO: verifikasi -- apakah set_epoch() masih dipanggil di skrip lain?
+        """
         self.current_epoch = epoch
         self._is_warmup = (epoch < self.warmup_epochs)
 
     def _topk_mean(self, t4d: torch.Tensor, B: int, K: int) -> torch.Tensor:
+        """
+        Ringkas peta (B, 1, H, W) menjadi skalar per gambar:
+        0.7 * rata-rata K nilai tertinggi + 0.3 * rata-rata seluruh peta.
+
+        Kenapa bukan mean biasa: ketidakpastian yang relevan untuk objek kecil
+        terkonsentrasi di sedikit lokasi; mean global akan menenggelamkannya.
+        Komponen 0.3 * mean menjaga konteks global dan meredam noise satu-dua sel.
+
+        Returns: (B, 1).
+        Catatan: tidak ada guard K > H*W (aman untuk grid proxy 20x20 = 400 sel).
+        """
         flat = t4d.view(B, 1, -1)
         topk, _ = torch.topk(flat, k=K, dim=-1)
         return 0.7 * topk.mean(dim=-1) + 0.3 * flat.mean(dim=-1)
 
     def _compute_stats(self, cls_logits: torch.Tensor, reg_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        eps = 1e-6 
+        """
+        Hitung tiga sinyal ketidakpastian dari output cabang proxy.
+
+        Args:
+            cls_logits: (B, num_classes, h, w) logit klasifikasi/objectness proxy.
+            reg_logits: (B, reg_max, h, w) logit distribusi jarak proxy.
+
+        Returns (masing-masing (B, 1)):
+            avg_entropy: entropi prediksi kelas (tinggi = ragu antara ada/tidak ada objek).
+            avg_conf   : 1 - probabilitas tertinggi (tinggi = TIDAK yakin). Walau bernama
+                         "conf", besaran ini adalah UNcertainty.
+            dfl_var    : varians distribusi jarak (tinggi = lokalisasi box tidak pasti).
+        """
+        eps = 1e-6
         B = cls_logits.shape[0]
-        K = 10 
+        K = 10
 
         if self.num_classes == 1:
+            # Objectness biner: entropi Bernoulli. clamp eps mencegah log(0) = -inf.
             prob = torch.sigmoid(cls_logits)
             prob_safe = prob.clamp(min=eps, max=1.0 - eps)
             entropy_map = -(prob_safe * torch.log(prob_safe) + (1 - prob_safe) * torch.log(1 - prob_safe))
             unc_conf = 1 - prob
         else:
             prob = torch.softmax(cls_logits, dim=1)
-            prob_safe = prob.clamp(min=eps, max=1.0 - eps) 
+            prob_safe = prob.clamp(min=eps, max=1.0 - eps)
             entropy_map = -(prob_safe * torch.log(prob_safe)).sum(dim=1, keepdim=True)
             unc_conf = 1 - prob.max(dim=1, keepdim=True).values
 
         avg_entropy = self._topk_mean(entropy_map, B, K)
         avg_conf    = self._topk_mean(unc_conf, B, K)
 
+        # Varians distribusi diskret atas bin 0..reg_max-1: E[(y - E[y])^2].
         dist_prob = F.softmax(reg_logits, dim=1)
         bins = torch.arange(self.reg_max, device=cls_logits.device, dtype=cls_logits.dtype).view(1, self.reg_max, 1, 1)
         y_hat   = (dist_prob * bins).sum(dim=1, keepdim=True)
@@ -3360,6 +3537,18 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         return avg_entropy, avg_conf, dfl_var
 
     def _get_uncertainty_signals(self, f_p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Jalankan cabang proxy pada P3 dan kembalikan statistik + logit mentahnya.
+
+        Args:
+            f_p3: P3_neck (B, c_p3, 80, 80). Pemanggil (forward) sudah mengirim versi
+                  .detach() supaya proxy loss tidak mengubah backbone/neck.
+
+        Returns:
+            entropy, conf, dfl_var : (B, 1) statistik ketidakpastian.
+            cls_logits, reg_logits : logit mentah grid 20x20, disimpan forward() untuk
+                                     proxy supervision loss (loss.py).
+        """
         f_p3_pooled = self.proxy_pool(f_p3)
         stem_out = self.proxy_stem(f_p3_pooled)
         cls_logits = self.proxy_cls(stem_out)
@@ -3375,6 +3564,10 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         objek kecil) alih-alih menenggelamkannya dalam rata-rata seluruh grid.
         Formula identik dengan _topk_mean yang sudah dipakai proxy branch Anda,
         supaya jalur gate dan jalur proxy konsisten secara statistik.
+
+        Catatan versi: checkpoint hasil final KITTI dilatih dengan mean spasial biasa
+        (z_fused.mean(dim=[2,3])). Memuat checkpoint itu ke kode ini tidak error
+        (tidak ada parameter baru), tetapi keputusan gate-nya akan berbeda.
 
         Args:
             z: (B, C, H, W) feature map hasil squeeze_p3 + squeeze_p2
@@ -3402,8 +3595,18 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         pooled = alpha * topk_mean + (1.0 - alpha) * global_mean  # (B, C)
 
         return pooled.view(B, C, 1, 1)                          # (B, C, 1, 1)
-    
+
     def compute_expert(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
+        """
+        Komputasi P2 yang sebenarnya (bagian yang di-skip saat deployment bila gate = 0).
+
+        Args:
+            f_p3: P3_neck (B, c_p3, 80, 80) — TIDAK di-detach, karena fitur ini adalah
+                  jalur deteksi Branch A dan harus meneruskan gradien ke neck/backbone.
+            f_p2_back: P2 backbone (B, c_p2, 160, 160).
+        Returns:
+            (B, c2f_out, 160, 160) fitur P2 untuk Branch A.
+        """
         f_p3_up = self.upsample(f_p3)
         f_fused = torch.cat([f_p3_up, f_p2_back], dim=1)
         return self.c2f_p2(f_fused)
@@ -3412,6 +3615,24 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
     # FORWARD PASS UTAMA
     # -------------------------------------------------------------------------
     def forward(self, x: list) -> torch.Tensor:
+        """
+        Forward router di dalam graf YOLO.
+
+        Args:
+            x: [P3_neck, P2_backbone] sesuai 'from: [-1, 2]' di YAML.
+
+        Returns:
+            Fitur C2f-P2 (B, c2f_out, 160, 160) — SELALU dihitung penuh, baik saat
+            training maupun eval. Gate tidak pernah mengalikan/menolkan fitur ini di
+            PyTorch; ia hanya dihitung dan dilaporkan. Skip nyata hanya terjadi pada
+            deployment TensorRT 3-engine.
+
+        Efek samping:
+            training: menulis last_entropy/last_conf/last_var, _last_proxy_cls_logits,
+                      _last_proxy_reg_logits, _last_gate_logit_per_sample, loss_prob,
+                      current_activation_prob.
+            eval    : menulis current_activation_prob (kecuali saat tracing/export).
+        """
         f_p3 = x[0]
         f_p2_back = x[1]
         B = f_p3.shape[0]
@@ -3419,14 +3640,23 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         # =====================================================================
         # 1. JALUR UTAMA — hitung logit gate (dipakai KEDUA cabang training/eval)
         # =====================================================================
+        # .detach() pada input gate: gate adalah "pengamat". Loss yang melatih gate
+        # (gate_value_loss, router penalty) hanya boleh mengubah bobot router, bukan
+        # backbone/neck — kalau tidak, backbone bisa terdorong mengubah fiturnya demi
+        # memudahkan keputusan gate, dengan mengorbankan kualitas deteksi.
         z_p3 = self.squeeze_p3(f_p3.detach())
         z_p2 = self.squeeze_p2(f_p2_back.detach())
         z_fused = z_p3 + z_p2
-        z_pool = self._topk_spatial_pool(z_fused, k=getattr(self, 'gate_topk', 10), 
+        # gate_topk / gate_topk_alpha: atribut opsional (bisa diset dari luar), default 10 / 0.7.
+        z_pool = self._topk_spatial_pool(z_fused, k=getattr(self, 'gate_topk', 10),
                                          alpha=getattr(self, 'gate_topk_alpha', 0.7),)
 
         logits_raw = self.classifier(z_pool)
+        # .float(): keputusan gate dihitung di FP32 walau training memakai AMP (FP16),
+        # supaya threshold dan sigmoid tidak terpengaruh presisi rendah.
         logits_fp32 = logits_raw.view(B, 2).float()
+        # Soft-clip logit ke (-5, 5) dengan tanh: mencegah logit meledak/saturasi penuh,
+        # sehingga gate_logit (selisih) terbatas di (-10, 10) dan gradien tidak mati.
         logits_safe = 5.0 * torch.tanh(logits_fp32 / 5.0)
         tau = F.softplus(self.tau_param.float()) + 0.1
 
@@ -3439,26 +3669,40 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         # =====================================================================
         if self.training:
             entropy, conf, dfl_var, cls_logits, reg_logits = self._get_uncertainty_signals(f_p3.detach())
+            # Statistik di-rata-rata per BATCH dan di-detach: dipakai compute_router_loss
+            # hanya sebagai pengali (difficulty_weight), bukan jalur gradien.
             self.last_entropy = entropy.mean().detach()
             self.last_conf = conf.mean().detach()
             self.last_var = dfl_var.mean().detach()
+            # Logit proxy TIDAK di-detach: proxy supervision loss melatih cabang proxy lewat ini.
             self._last_proxy_cls_logits = cls_logits
             self._last_proxy_reg_logits = reg_logits
 
+            # Gumbel-softmax: sampel acak "keputusan" gate. Di versi ini hanya dipakai
+            # untuk statistik current_activation_prob (lihat cabang non-warmup di bawah).
             soft_fp32 = F.gumbel_softmax(logits_safe, tau=tau, hard=False, dim=1)
             soft = soft_fp32.to(f_p3.dtype)
 
             # logit biner mentah per-sample, dipakai gate_value_loss (BCEWithLogits)
+            # Selisih dua logit softmax = logit biner setara: softmax([l0, l1])[1] = sigmoid(l1 - l0).
+            # (Di jalur Opsi C, sigmoid dari nilai ini adalah p = P(P2 aktif).)
             self._last_gate_logit_per_sample = logits_safe[:, 1] - logits_safe[:, 0]  # shape (B,)
 
             if self._is_warmup:
+                # Selama warmup gate dianggap selalu aktif. loss_prob konstan 1.0 (tanpa
+                # gradien yang berarti) karena compute_router_loss juga mengembalikan 0
+                # saat warmup; hard_warmup tidak dipakai lebih lanjut.
                 hard_warmup = torch.zeros_like(soft)
                 hard_warmup[:, 1] = 1.0
                 self.loss_prob = torch.tensor(1.0, device=f_p3.device, requires_grad=True)
                 self.current_activation_prob = torch.tensor(1.0, device=f_p3.device)
             else:
                 hard = torch.zeros_like(soft).scatter_(1, soft.argmax(dim=1, keepdim=True), 1.0)
+                # loss_prob: rata-rata probabilitas P2 aktif (deterministik, dengan gradien)
+                # -> sinyal yang dihukum oleh sparsity penalty di compute_router_loss.
                 self.loss_prob = F.softmax(logits_safe, dim=1)[:, 1].mean()
+                # current_activation_prob: proporsi keputusan keras dari sampel Gumbel ->
+                # hanya untuk logging (stokastik, bukan threshold 0.5 deterministik).
                 self.current_activation_prob = hard[:, 1].mean().detach()
 
             # SELALU return P2 feature penuh — gate TIDAK memodulasi fitur ini
@@ -3474,6 +3718,10 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
         else:
             raw_logit_diff = logits_safe[:, 1] - logits_safe[:, 0]  # shape (B,)
 
+            # Kalibrasi Platt (logit * T + b) di-fit post-hoc pada data validasi agar
+            # threshold 0.5 sesuai target. Default (1.0, 0.0) = tanpa kalibrasi.
+            # Sejak AUDIT-FIX #9 nilainya ikut tersimpan di checkpoint (buffer integer),
+            # jadi cukup diset sekali sebelum checkpoint disimpan.
             calib_T = getattr(self, "calib_T", 1.0)
             calib_b = getattr(self, "calib_b", 0.0)
             calibrated_logit = raw_logit_diff * calib_T + calib_b
@@ -3481,6 +3729,8 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
 
             gate_mask = (probs_gate1 > 0.50).float().view(B, 1, 1, 1).to(f_p3.dtype)
 
+            # Dilewati saat tracing (export ONNX) supaya operasi logging tidak ikut
+            # terekam ke graf export.
             if not torch.jit.is_tracing():
                 self.current_activation_prob = gate_mask.mean().detach()
 
@@ -3492,12 +3742,22 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
     #    Belum dipakai sekarang, tapi sudah konsisten dgn kalibrasi yang sama
     # =====================================================================
     def compute_gate_only(self, f_p3: torch.Tensor, f_p2_back: torch.Tensor) -> torch.Tensor:
-        """Dipanggil khusus saat export Stage 1 — TIDAK memanggil compute_expert()."""
+        """
+        Dipanggil khusus saat export Stage 1 — TIDAK memanggil compute_expert().
+
+        Logikanya HARUS identik baris-per-baris dengan jalur gate di forward() mode
+        eval (squeeze -> pooling -> classifier -> tanh clip -> selisih logit ->
+        kalibrasi -> sigmoid -> threshold 0.5). Setiap perubahan di forward() wajib
+        disalin ke sini, jika tidak keputusan gate TensorRT akan berbeda dari PyTorch.
+
+        Returns:
+            (B,) float 0/1 — 1 = jalankan Stage 2A (P2), 0 = Stage 2B.
+        """
         B = f_p3.shape[0]
         z_p3 = self.squeeze_p3(f_p3.detach())
         z_p2 = self.squeeze_p2(f_p2_back.detach())
         z_fused = z_p3 + z_p2
-        z_pool = self._topk_spatial_pool(z_fused, k=getattr(self, 'gate_topk', 10), 
+        z_pool = self._topk_spatial_pool(z_fused, k=getattr(self, 'gate_topk', 10),
                                                  alpha=getattr(self, 'gate_topk_alpha', 0.7),)
         logits_raw = self.classifier(z_pool)
         logits_fp32 = logits_raw.view(B, 2).float()

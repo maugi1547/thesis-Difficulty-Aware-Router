@@ -344,9 +344,8 @@ def compute_proxy_supervision_loss(router, cls_logits, reg_logits, batch, imgsz,
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
     # Stride grid proxy: imgsz[0] / grid_h (biasanya = 32 kalau proxy di resolusi P5-like)
-    # Karena stride diturunkan dari imgsz yang sama yang dipakai untuk menskalakan GT,
-    # target tetap konsisten walaupun imgsz yang dikirim pemanggil keliru skalanya
-    # (lihat catatan stride_p3 di compute_proxy_supervision_loss_wrapper).
+    # Stride diturunkan dari imgsz yang sama yang dipakai untuk menskalakan GT, sehingga
+    # GT dan pusat sel grid selalu berada di sistem koordinat yang sama.
     stride = imgsz[0] / grid_h
 
     cls_target, reg_target, fg_mask = build_proxy_targets(
@@ -572,11 +571,31 @@ class v8DetectionLoss:
         per_image_target_sum = target_scores.sum(dim=[1, 2]).clamp(min=1.0)  # (B,)
 
         # BCE dihitung ulang tanpa reduksi supaya bisa dijumlah per gambar.
-        # Catatan: penjumlahan mencakup SEMUA anchor (termasuk background); Branch A
-        # punya ~4x lebih banyak anchor (34.000 vs 8.400 pada 640x640), sehingga massa
-        # loss background-nya tidak setara dengan Branch B.
         cls_loss_per_anchor = self.bce(pred_scores, target_scores.to(dtype))  # (B, num_anchors, nc)
-        cls_loss_per_image = cls_loss_per_anchor.sum(dim=[1, 2]) / per_image_target_sum  # (B,)
+
+        # [AUDIT-FIX 2026-10 #7] Normalisasi massa BACKGROUND antar-branch.
+        # Masalah: Branch A punya ~4x lebih banyak anchor (34.000 vs 8.400 pada 640x640).
+        # Menjumlahkan BCE seluruh anchor membuat loss_A per gambar membawa ~4x lebih banyak
+        # loss background daripada loss_B, sehingga perbandingan loss_A vs loss_B (sinyal
+        # gate mode 'total') bias secara struktural, bukan karena kualitas deteksi.
+        # Solusi: suku foreground dibiarkan apa adanya; suku background diskalakan dengan
+        # n_ref / n_anchor, di mana n_ref = jumlah anchor pada stride referensi (8/16/32,
+        # yaitu struktur Branch B). Untuk Branch B skalanya = 1 (praktis tidak berubah);
+        # untuk Branch A background-nya diskalakan ~0.25.
+        # Hanya mempengaruhi _last_per_sample_loss (sinyal gate, di-detach); loss deteksi
+        # (loss[1]) TIDAK berubah. Mode 'small'/'hybrid' tidak terpengaruh (fg-only).
+        # Set self.normalize_bg_anchors = False untuk perilaku lama (mis. reproduksi KITTI final).
+        fg_weight = fg_mask.unsqueeze(-1).to(cls_loss_per_anchor.dtype)  # (B, num_anchors, 1)
+        cls_fg_sum = (cls_loss_per_anchor * fg_weight).sum(dim=[1, 2])  # (B,)
+        cls_bg_sum = (cls_loss_per_anchor * (1.0 - fg_weight)).sum(dim=[1, 2])  # (B,)
+        if getattr(self, 'normalize_bg_anchors', True):
+            img_h, img_w = int(imgsz[0].item()), int(imgsz[1].item())
+            ref_strides = getattr(self, 'bg_ref_strides', (8, 16, 32))
+            n_ref = sum((img_h // s) * (img_w // s) for s in ref_strides)
+            bg_scale = n_ref / cls_loss_per_anchor.shape[1]
+        else:
+            bg_scale = 1.0
+        cls_loss_per_image = (cls_fg_sum + bg_scale * cls_bg_sum) / per_image_target_sum  # (B,)
 
         # --- Threshold area (piksel, skala input model — target_bboxes SUDAH skala asli) ---
         # Ambang mengikuti konvensi COCO: small < 32^2, medium < 96^2, large >= 96^2.
@@ -617,10 +636,8 @@ class v8DetectionLoss:
             # --- cls loss per anchor FOREGROUND (bisa diatribusikan ke ukuran objek) ---
             cls_loss_fg = cls_loss_per_anchor.sum(dim=-1)[fg_mask]  # (n_fg_total,)
 
-            # --- gabungkan box + cls jadi satu skor kualitas per-anchor ---
-            # Catatan: sejak AUDIT-FIX #1 variabel ini tidak lagi dipakai oleh
-            # _stratified_mean (yang kini menghitung ulang tanpa bobot w).
-            combined_fg_loss = box_loss_raw * self.hyp.box + cls_loss_fg * self.hyp.cls  # (n_fg_total,)
+            # [AUDIT-FIX 2026-10 #10] Variabel combined_fg_loss (box*w + cls) dihapus: sejak
+            # AUDIT-FIX #1 tidak dipakai lagi; skor per-anchor kini dihitung di _stratified_mean.
 
             # --- mask strata ---
             mask_small = fg_areas < SMALL_AREA_THRESH
@@ -745,13 +762,15 @@ class v8DetectionLoss:
         if router is None or not hasattr(router, "_last_proxy_cls_logits"):
             return loss
 
-        # imgsz asli (bukan feat_shape) — feat_shape itu resolusi grid P3, imgsz = feat_shape[0]*stride_P3
-        # Catatan audit: wrapper ini dipanggil dari loss_A, di mana feats[0] adalah P2
-        # (160x160, stride 4), bukan P3. Hasilnya imgsz = 1280 (seharusnya 640). Target
-        # proxy TETAP benar karena GT dan stride grid proxy sama-sama diturunkan dari
-        # imgsz ini (keduanya terskala 2x dan saling meniadakan).
-        stride_p3 = 8  # sesuaikan dgn stride P3 di model Anda
-        imgsz = (feat_shape[0] * stride_p3, feat_shape[1] * stride_p3)
+        # imgsz asli = resolusi feats[0] x stride skala pertama milik head INI.
+        # [AUDIT-FIX 2026-10 #5] Versi lama memakai konstanta stride_p3 = 8, padahal di loss_A
+        # feats[0] adalah P2 (160x160, stride 4) -> imgsz = 1280 (seharusnya 640). Targetnya
+        # kebetulan tetap benar (GT dan stride grid sama-sama terskala 2x), tapi angka imgsz
+        # salah dan rapuh. Sekarang stride diambil dari self.stride[0] (4 di loss_A, 8 di
+        # loss_B), sama seperti cara __call__ menghitung imgsz. Target proxy identik bit-per-bit
+        # dengan versi lama karena penskalaan 2x pada float adalah operasi eksak.
+        first_stride = int(self.stride[0])
+        imgsz = (feat_shape[0] * first_stride, feat_shape[1] * first_stride)
 
         proxy_cls_loss, proxy_reg_loss = compute_proxy_supervision_loss(
             router,
@@ -817,6 +836,8 @@ class v8DetectionLoss:
         Efek samping (training, loss_A, setelah warmup): memperbarui p2_running_avg,
         diff_run_mean, diff_run_var, debug_counter, dan menambah satu baris ke
         self.model.router_buffer (di-flush ke CSV oleh callback akhir epoch).
+        Baris itu juga disimpan di router._pending_csv_row supaya kolom GV (indeks 7-10)
+        bisa dilengkapi DualBranchDetectionLoss dengan nilai step yang SAMA (AUDIT-FIX #6).
         """
         # Selalu pastikan ukuran loss konsisten (5 elemen: box,cls,dfl,router,proxy slot)
         # (Catatan: loss dibuat dengan 4 elemen di __call__, jadi cek == 3 di fungsi ini
@@ -1028,8 +1049,11 @@ class v8DetectionLoss:
         val_final_l3 = loss[3].item() if isinstance(loss[3], torch.Tensor) else loss[3]
 
         # --- TAMBAHAN: ambil nilai gate_value dari router ---
-        # Nilai-nilai ini ditulis DualBranchDetectionLoss SETELAH loss_A selesai, jadi
-        # yang terbaca di sini adalah nilai dari step SEBELUMNYA (tertinggal 1 step).
+        # Pada titik ini nilai GV di router masih milik step SEBELUMNYA (gate loss baru
+        # dihitung DualBranchDetectionLoss setelah loss_A selesai). Nilai ini hanya
+        # placeholder: [AUDIT-FIX 2026-10 #6] DualBranchDetectionLoss menimpa kolom GV
+        # baris ini dengan nilai step yang sama (lihat _flush_pending_log). Kalau kelas ini
+        # dipakai tanpa DualBranchDetectionLoss, placeholder inilah yang tersimpan.
         gv_target_mean = getattr(router, 'last_target_gate_mean', None)
         gv_loss = getattr(router, 'last_gate_value_loss', None)
         gv_weight_active = getattr(router, 'last_gate_value_weight_active', None)
@@ -1040,7 +1064,9 @@ class v8DetectionLoss:
         val_gv_weight = gv_weight_active.item() if isinstance(gv_weight_active, torch.Tensor) else (gv_weight_active or 0.0)
         val_gv_offset = gv_offset.item() if isinstance(gv_offset,torch.Tensor) else (gv_offset or 0.0)
 
-        if self.debug_counter % 100 == 0:
+        # Bila DualBranchDetectionLoss aktif (_defer_debug_print), print ditunda ke sana
+        # supaya angka GV yang dicetak berasal dari step yang sama.
+        if self.debug_counter % 100 == 0 and not getattr(router, '_defer_debug_print', False):
             print(f"\n   [LOSS DEBUG] Epoch {current_epoch} | Batch {current_batch} | Lmbda: {val_lambda:.2f} | "
                 f"P2_Prob: {val_p2_prob:.4f} | Diff_W: {val_diff:.4f} | Final_L3: {val_final_l3:.4f} | "
                 f"GV_Target: {val_gv_target:.4f} | GV_Loss: {val_gv_loss:.4f} | GV_Weight: {val_gv_weight:.3f} | GV_Offset: {val_gv_offset:.3f}")
@@ -1056,6 +1082,9 @@ class v8DetectionLoss:
         ]
 
         self.model.router_buffer.append(val_data)
+        # [AUDIT-FIX #6] referensi ke list yang sama -> diisi ulang in-place oleh DualBranchDetectionLoss.
+        router._pending_csv_row = val_data
+        router._pending_debug_print = (self.debug_counter % 100 == 0)
 
         return loss
 
