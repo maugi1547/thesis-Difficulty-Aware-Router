@@ -967,11 +967,11 @@ class v8DetectionLoss:
                 conf_f    = torch.nan_to_num(conf_f, nan=0.0)
                 var_f     = torch.nan_to_num(var_f, nan=0.0)
 
-                # TODO: verifikasi -- router.last_conf adalah UNCERTAINTY (1 - prob, tinggi =
-                # tidak yakin), sama arah dengan entropy dan var. Mengurangkannya di sini
-                # berarti ketidakpastian kelas yang lebih tinggi MENURUNKAN skor kesulitan.
-                # Apakah tanda minus ini disengaja (mis. dulu conf berarti keyakinan)?
-                diff_score = entropy_f + var_f - conf_f
+                # [FIX 2026-10-09] router.last_conf adalah UNCERTAINTY (1 - prob, tinggi = tidak
+                # yakin), searah dengan entropy dan var. Tanda minus versi lama adalah salah ketik
+                # (dikonfirmasi penulis): ketiga sinyal ketidakpastian kini DIJUMLAHKAN.
+                # Run sebelum fix ini memakai entropy + var - conf (tidak sebanding langsung).
+                diff_score = entropy_f + var_f + conf_f
                 batch_d_mean = diff_score.mean()
 
                 if not hasattr(self, 'diff_run_mean'):

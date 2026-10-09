@@ -3733,6 +3733,10 @@ class UltraLightWeightDifficultyAwareRouter(nn.Module):
             # terekam ke graf export.
             if not torch.jit.is_tracing():
                 self.current_activation_prob = gate_mask.mean().detach()
+                # [TAHAP0] per-gambar: keputusan (uji konsistensi vs compute_gate_only) dan logit
+                # mentah sebelum kalibrasi (sebaran logit di log validasi)
+                self._last_gate_decision = gate_mask.view(B).detach()
+                self._last_gate_logit_raw = raw_logit_diff.detach()
 
             f_c2f = self.compute_expert(f_p3, f_p2_back)
             return f_c2f
