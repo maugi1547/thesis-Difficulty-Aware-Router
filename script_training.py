@@ -29,8 +29,9 @@ from ultralytics import settings
 from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
 from ultralytics.model_yolov8_router import DualBranchDetectionModel
 
-from router_train_utils import (EpochTimer, make_curriculum_scheduler, make_gate_ranking_check,
-                                make_loss_items_logger, make_router_cfg_applier, make_router_csv_logger)
+from router_train_utils import (EpochTimer, make_activation_stop_rule, make_criterion_cfg_applier,
+                                make_curriculum_scheduler, make_gate_ranking_check, make_loss_items_logger,
+                                make_router_cfg_applier, make_router_csv_logger)
 
 # ==============================================================================
 # KONFIGURASI RUN UTAMA
@@ -41,8 +42,9 @@ BASE_OVERRIDES = dict(
     batch=16, imgsz=640, optimizer="AdamW", lr0=0.002, cos_lr=True, weight_decay=0.0005,
     device=0, workers=4, seed=42, amp=True, verbose=True, save=True,
 )
-FULL_OVERRIDES = {**BASE_OVERRIDES, "epochs": 100, "project": "Tesis_KITTI_Yolov8_nano",
-                  "name": "Skenario3_YOLOv8n_P2_Router_DualBranch", "save_period": 50}
+# save_period=10: epoch50.pt (go/no-go) + titik resume bila sesi Kaggle putus.
+FULL_OVERRIDES = {**BASE_OVERRIDES, "epochs": 100, "project": "/kaggle/working/runs_tahap1",
+                  "name": "M0_seed42", "save_period": 10}
 
 # Fase 1 (1–50): lambda 0; router warmup 1–10; gate_value_weight 0 -> 0.5 di epoch 11–30.
 # Fase 2 (51–80): lambda 0 -> final linear. Fase 3 (81–100): lambda final.
@@ -52,8 +54,10 @@ FULL_SCHED = dict(router_warmup_end=10, gv_start=10, gv_ramp=20, final_gv=0.5,
 # Keputusan 2026-10-09: alpha = 0 -> router_target_activation tidak berpengaruh; sparsity bekerja
 # sebagai harga P2 (c = lambda * Diff_W / gate_value_weight); activation rate deployment dipilih
 # post-hoc (operating_point_sweep.py). Nilai target tetap ditulis supaya konfigurasi eksplisit.
+# gate_signal_mode='total' (rencana, konfigurasi terkunci): 'small' membuang gambar yang objek kecilnya
+# hanya tertangkap P2 (bias seleksi); 'small' diuji sebagai ablasi A5.
 ROUTER_CFG = dict(
-    gate_signal_mode="small",
+    gate_signal_mode="total",
     router_hybrid_alpha=0.0,
     router_target_activation=0.35,
     router_activation_tolerance=0.10,
@@ -61,6 +65,8 @@ ROUTER_CFG = dict(
     branch_b_loss_weight=0.7,
     gate_offset_momentum=0.99,
 )
+# Atribut yang dibaca v8DetectionLoss dari dirinya sendiri (bukan dari model) -> diset ke criterion.
+CRITERION_CFG = dict(normalize_bg_anchors=True)   # ablasi A6: False
 
 
 # ==============================================================================
@@ -188,7 +194,8 @@ def make_branch_b_checker(trainer_ref, interval=10, csv_path=None):
 # BANGUN TRAINER (dipakai run utama DAN smoke test)
 # ==============================================================================
 def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
-                  gate_check_epoch="auto", stop_on_nogo=True):
+                  gate_check_epoch="auto", stop_on_nogo=True, criterion_cfg=CRITERION_CFG,
+                  activation_stop_rule=None):
     """
     Returns (trainer, ctx). ctx berisi objek log yang bisa diperiksa setelah train():
       timer, sched_history, loss_items_cb, paths (semua di trainer.save_dir).
@@ -196,6 +203,7 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
 
     gate_check_epoch: epoch go/no-go ranking gate ("auto" = sched["lam_start"], tepat sebelum
     lambda naik; None = mati). NO-GO + stop_on_nogo -> training berhenti setelah epoch itu.
+    activation_stop_rule: dict untuk make_activation_stop_rule (mis. after_epoch=60), None = mati.
     """
     settings.update({"raytune": False})
     resuming = bool(overrides.get("resume"))
@@ -204,7 +212,8 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
     paths = dict(router_csv=sd / "router_loss_components.csv", loss_items=sd / "loss_items.csv",
                  timing=sd / ("epoch_timing_resume.csv" if resuming else "epoch_timing.csv"), branch_b=sd / "branch_b_metrics.csv",
                  router_cfg=sd / "router_cfg.json", sched=sd / "sched_history.json",
-                 gate_val=sd / "gate_val_stats.csv", gate_check=sd / "gate_check.json")
+                 gate_val=sd / "gate_val_stats.csv", gate_check=sd / "gate_check.json",
+                 criterion_cfg=sd / "criterion_cfg.json")
 
     sched_history, timer = {}, EpochTimer()
     li_store = []
@@ -218,6 +227,7 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
         paths["sched"].write_text(json.dumps({str(k): v for k, v in sched_history.items()}, indent=1))
 
     trainer.add_callback("on_pretrain_routine_end", make_router_cfg_applier(router_cfg, paths["router_cfg"]))
+    trainer.add_callback("on_pretrain_routine_end", make_criterion_cfg_applier(criterion_cfg, paths["criterion_cfg"]))
     trainer.add_callback("on_train_epoch_start", make_curriculum_scheduler(**sched, history=sched_history))
     trainer.add_callback("on_train_epoch_start", timer.on_train_epoch_start)
     trainer.add_callback("on_train_batch_end", li_cb)
@@ -234,15 +244,19 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
         trainer.add_callback("on_fit_epoch_end", make_gate_ranking_check(
             trainer, gate_check_epoch, paths["gate_check"], signal_mode=router_cfg.get("gate_signal_mode", "small"),
             stop_on_nogo=stop_on_nogo))
+    if activation_stop_rule:
+        trainer.add_callback("on_fit_epoch_end", make_activation_stop_rule(paths["gate_val"], **activation_stop_rule))
 
     ctx = dict(timer=timer, sched_history=sched_history, loss_items_cb=li_cb, paths=paths,
-               sched=sched, router_cfg=router_cfg, overrides=overrides, gate_check_epoch=gate_check_epoch)
+               sched=sched, router_cfg=router_cfg, criterion_cfg=criterion_cfg, overrides=overrides,
+               gate_check_epoch=gate_check_epoch)
     return trainer, ctx
 
 
 def main():
     print("🔥 SKENARIO 3: Router-P2 YOLOv8n Dual-Branch (Difficulty-Aware Router)")
-    trainer, ctx = build_trainer(FULL_OVERRIDES, FULL_SCHED, ROUTER_CFG, branch_b_interval=10)
+    trainer, ctx = build_trainer(FULL_OVERRIDES, FULL_SCHED, ROUTER_CFG, branch_b_interval=10,
+                                 activation_stop_rule=dict(after_epoch=60, low=0.05, high=0.95, patience=5))
     trainer.train()
     return trainer, ctx
 

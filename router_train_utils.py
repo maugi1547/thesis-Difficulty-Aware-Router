@@ -599,7 +599,9 @@ def gate_ranking_report(model, loader, device, max_batches=None, signal_mode="sm
         h.remove()
     R = {k: torch.cat(v).numpy() for k, v in rows.items()}
     raw = R["raw"]
+    prob = 1.0 / (1.0 + np.exp(-raw))
     out = dict(n_images=int(len(raw)), logit_mean=float(raw.mean()), logit_std=float(raw.std()),
+               prob_std_uncalibrated=float(prob.std()),
                logit_p10=float(np.percentile(raw, 10)), logit_p90=float(np.percentile(raw, 90)),
                frac_saturated=float((np.abs(raw) > 9.5).mean()),
                activation_uncalibrated=float((raw > 0).mean()))
@@ -616,6 +618,62 @@ def gate_ranking_report(model, loader, device, max_batches=None, signal_mode="sm
     out["reason"] = (f"std={out['logit_std']:.4f} (> {min_std}?), AUC[{key}]={out[key]['auc']:.3f} "
                      f"CI95=[{out[key]['auc_ci'][0]:.3f}, {out[key]['auc_ci'][1]:.3f}] (batas bawah > 0.5?)")
     return out
+
+
+def stop_training(trainer, reason):
+    """
+    Hentikan training dengan rapi setelah epoch ini. final_eval() -> strip_optimizer() membuat
+    last.pt TIDAK bisa di-resume (epoch=-1, optimizer dibuang), jadi salinan utuh disimpan SEKARANG
+    (save_model sudah jalan untuk epoch ini). Returns path salinan.
+    """
+    epoch = trainer.epoch + 1
+    keep = Path(trainer.wdir) / f"last_resumable_epoch{epoch}.pt"
+    # final_eval() memicu on_fit_epoch_end sekali lagi SETELAH last.pt di-strip -> jangan timpa salinan
+    if getattr(trainer, "stop", False) or (Path(trainer.save_dir) / "STOPPED.txt").exists():
+        return str(keep)
+    if Path(trainer.last).exists():
+        shutil.copy(trainer.last, keep)
+    (Path(trainer.save_dir) / "STOPPED.txt").write_text(f"epoch {epoch}: {reason}\nresume: {keep}\n")
+    print(f"⛔ Training dihentikan di epoch {epoch}: {reason}. Untuk lanjut: resume dari {keep}")
+    trainer.stop = True
+    return str(keep)
+
+
+def make_activation_stop_rule(gate_val_csv, after_epoch=60, low=0.05, high=0.95, patience=5):
+    """
+    Aturan berhenti Tahap 1: aktivasi val (EMA, tanpa kalibrasi, dari gate_val_stats.csv) < low atau
+    > high selama `patience` epoch berturut-turut SETELAH `after_epoch`. Dipasang SESUDAH callback yang
+    menulis gate_val_stats.csv (on_val_end -> sudah tertulis saat on_fit_epoch_end).
+    """
+    def cb(trainer):
+        epoch = trainer.epoch + 1
+        if getattr(trainer, "stop", False) or epoch <= after_epoch or not Path(gate_val_csv).exists():
+            return
+        gv = pd.read_csv(gate_val_csv).drop_duplicates("epoch", keep="first").set_index("epoch")
+        win = [e for e in range(epoch - patience + 1, epoch + 1)]
+        if all(e in gv.index and e > after_epoch for e in win):
+            a = gv.loc[win, "act_uncalibrated"]
+            if (a < low).all() or (a > high).all():
+                stop_training(trainer, f"aktivasi val {a.round(3).tolist()} di luar [{low}, {high}] "
+                                       f"selama {patience} epoch (epoch {win[0]}–{win[-1]})")
+    return cb
+
+
+def make_criterion_cfg_applier(criterion_cfg, dump_path=None):
+    """
+    on_pretrain_routine_end (SETELAH router cfg): buat criterion sekarang dan set atribut yang dibaca
+    v8DetectionLoss dari DIRINYA SENDIRI (mis. normalize_bg_anchors), bukan dari model.
+    Model.loss() hanya membuat criterion bila belum ada, jadi criterion ini yang dipakai training.
+    """
+    def apply(trainer):
+        m = trainer.model
+        m.criterion = m.init_criterion()
+        for k, v in criterion_cfg.items():
+            setattr(m.criterion.loss_A, k, v); setattr(m.criterion.loss_B, k, v)
+        if dump_path is not None:
+            Path(dump_path).write_text(json.dumps(criterion_cfg, indent=1))
+        print("🔧 [CRITERION CFG]", criterion_cfg)
+    return apply
 
 
 def make_gate_ranking_check(trainer_ref, at_epoch, out_path, signal_mode="small", stop_on_nogo=True,
@@ -636,12 +694,6 @@ def make_gate_ranking_check(trainer_ref, at_epoch, out_path, signal_mode="small"
         Path(out_path).write_text(json.dumps(rep, indent=1))
         print(f"\n🚦 [GATE CHECK epoch {epoch}] {'GO' if rep['go'] else 'NO-GO'} — {rep['reason']}\n")
         if not rep["go"] and stop_on_nogo:
-            # final_eval() -> strip_optimizer() membuat last.pt TIDAK bisa di-resume (epoch=-1, optimizer
-            # dibuang). Simpan salinan yang masih utuh SEKARANG (save_model sudah jalan untuk epoch ini).
-            keep = Path(trainer.wdir) / f"last_resumable_epoch{epoch}.pt"
-            shutil.copy(trainer.last, keep)
-            rep["resumable_checkpoint"] = str(keep)
+            rep["resumable_checkpoint"] = stop_training(trainer, "gate check NO-GO")
             Path(out_path).write_text(json.dumps(rep, indent=1))
-            print(f"⛔ Training dihentikan (stop_on_nogo=True). Untuk lanjut: resume dari {keep}")
-            trainer.stop = True
     return cb
