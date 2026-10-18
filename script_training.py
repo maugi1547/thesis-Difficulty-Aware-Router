@@ -30,6 +30,7 @@ from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
 from ultralytics.model_yolov8_router import DualBranchDetectionModel
 
 from router_train_utils import (EpochTimer, make_activation_stop_rule, make_criterion_cfg_applier,
+                                make_logit_health_stop_rule, make_auc_stop_rule,
                                 make_curriculum_scheduler, make_gate_ranking_check, make_loss_items_logger,
                                 make_router_cfg_applier, make_router_csv_logger)
 
@@ -44,12 +45,15 @@ BASE_OVERRIDES = dict(
 )
 # save_period=10: epoch50.pt (go/no-go) + titik resume bila sesi Kaggle putus.
 FULL_OVERRIDES = {**BASE_OVERRIDES, "epochs": 100, "project": "/kaggle/working/runs_tahap1",
-                  "name": "M0_seed42", "save_period": 10}
+                  "name": "M0_lam002_seed42", "save_period": 10}
 
 # Fase 1 (1–50): lambda 0; router warmup 1–10; gate_value_weight 0 -> 0.5 di epoch 11–30.
+# Fase 2 (51–80): lambda 0 -> 0.02 linear. Fase 3 (81–100): lambda 0.02.
 # Fase 2 (51–80): lambda 0 -> final linear. Fase 3 (81–100): lambda final.
 FULL_SCHED = dict(router_warmup_end=10, gv_start=10, gv_ramp=20, final_gv=0.5,
-                  lam_start=50, lam_ramp=30, final_lambda=0.04)
+                  lam_start=50, lam_ramp=30, final_lambda=0.02)
+# λ akhir 0.02 (keputusan 2026-10-09 malam). Run pertama λ=0.04 (seed 42) berakhir dengan ranking gate
+# terbalik (AUC 0.417 di epoch 100) dan kini dilaporkan sebagai ablasi.
 
 # Keputusan 2026-10-09: alpha = 0 -> router_target_activation tidak berpengaruh; sparsity bekerja
 # sebagai harga P2 (c = lambda * Diff_W / gate_value_weight); activation rate deployment dipilih
@@ -65,6 +69,11 @@ ROUTER_CFG = dict(
     branch_b_loss_weight=0.7,
     gate_offset_momentum=0.99,
 )
+# Pengaman revisi ke-2 (2026-10-09): AUC ranking gate di val tiap 10 epoch; berhenti bila batas bawah
+# CI <= 0.5 dua pemeriksaan berturut-turut setelah epoch 30. Menggantikan aturan aktivasi (rencana awal)
+# dan aturan std/saturasi logit (revisi ke-1), yang tidak menangkap ranking terbalik di run λ=0.04.
+AUC_STOP_RULE = dict(every=10, after_epoch=30, patience=2)
+
 # Atribut yang dibaca v8DetectionLoss dari dirinya sendiri (bukan dari model) -> diset ke criterion.
 CRITERION_CFG = dict(normalize_bg_anchors=True)   # ablasi A6: False
 
@@ -195,7 +204,7 @@ def make_branch_b_checker(trainer_ref, interval=10, csv_path=None):
 # ==============================================================================
 def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
                   gate_check_epoch="auto", stop_on_nogo=True, criterion_cfg=CRITERION_CFG,
-                  activation_stop_rule=None):
+                  activation_stop_rule=None, health_stop_rule=None, auc_stop_rule=None):
     """
     Returns (trainer, ctx). ctx berisi objek log yang bisa diperiksa setelah train():
       timer, sched_history, loss_items_cb, paths (semua di trainer.save_dir).
@@ -203,7 +212,9 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
 
     gate_check_epoch: epoch go/no-go ranking gate ("auto" = sched["lam_start"], tepat sebelum
     lambda naik; None = mati). NO-GO + stop_on_nogo -> training berhenti setelah epoch itu.
-    activation_stop_rule: dict untuk make_activation_stop_rule (mis. after_epoch=60), None = mati.
+    activation_stop_rule: dict untuk make_activation_stop_rule (aturan rencana lama, untuk alpha > 0), None = mati.
+    health_stop_rule: dict untuk make_logit_health_stop_rule (revisi ke-1, terbukti terlalu longgar), None = mati.
+    auc_stop_rule: dict untuk make_auc_stop_rule (revisi ke-2: AUC ranking tiap N epoch), None = mati.
     """
     settings.update({"raytune": False})
     resuming = bool(overrides.get("resume"))
@@ -213,7 +224,7 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
                  timing=sd / ("epoch_timing_resume.csv" if resuming else "epoch_timing.csv"), branch_b=sd / "branch_b_metrics.csv",
                  router_cfg=sd / "router_cfg.json", sched=sd / "sched_history.json",
                  gate_val=sd / "gate_val_stats.csv", gate_check=sd / "gate_check.json",
-                 criterion_cfg=sd / "criterion_cfg.json")
+                 criterion_cfg=sd / "criterion_cfg.json", auc_monitor=sd / "auc_monitor.csv")
 
     sched_history, timer = {}, EpochTimer()
     li_store = []
@@ -246,6 +257,11 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
             stop_on_nogo=stop_on_nogo))
     if activation_stop_rule:
         trainer.add_callback("on_fit_epoch_end", make_activation_stop_rule(paths["gate_val"], **activation_stop_rule))
+    if health_stop_rule:
+        trainer.add_callback("on_fit_epoch_end", make_logit_health_stop_rule(paths["gate_val"], **health_stop_rule))
+    if auc_stop_rule:
+        trainer.add_callback("on_fit_epoch_end", make_auc_stop_rule(
+            trainer, paths["auc_monitor"], signal_mode=router_cfg.get("gate_signal_mode", "total"), **auc_stop_rule))
 
     ctx = dict(timer=timer, sched_history=sched_history, loss_items_cb=li_cb, paths=paths,
                sched=sched, router_cfg=router_cfg, criterion_cfg=criterion_cfg, overrides=overrides,
@@ -256,7 +272,7 @@ def build_trainer(overrides, sched, router_cfg=ROUTER_CFG, branch_b_interval=10,
 def main():
     print("🔥 SKENARIO 3: Router-P2 YOLOv8n Dual-Branch (Difficulty-Aware Router)")
     trainer, ctx = build_trainer(FULL_OVERRIDES, FULL_SCHED, ROUTER_CFG, branch_b_interval=10,
-                                 activation_stop_rule=dict(after_epoch=60, low=0.05, high=0.95, patience=5))
+                                 auc_stop_rule=AUC_STOP_RULE)
     trainer.train()
     return trainer, ctx
 

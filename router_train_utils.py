@@ -659,6 +659,68 @@ def make_activation_stop_rule(gate_val_csv, after_epoch=60, low=0.05, high=0.95,
     return cb
 
 
+def make_logit_health_stop_rule(gate_val_csv, after_epoch=10, min_std=0.05, max_sat=0.20, patience=2):
+    """
+    Aturan berhenti Tahap 1 versi alpha = 0 (revisi 2026-10-09, menggantikan aturan aktivasi).
+    Dengan alpha = 0 aktivasi deployment dipilih post-hoc lewat persentil, jadi yang harus dijaga
+    adalah PERINGKAT logit: berhenti bila std logit val < min_std ATAU fraksi logit tersaturasi
+    (|z| > 9.5, batas tanh +-10) > max_sat selama `patience` epoch berturut-turut setelah after_epoch
+    (setelah warmup router: selama warmup logit memang hampir konstan).
+    """
+    def cb(trainer):
+        epoch = trainer.epoch + 1
+        if getattr(trainer, "stop", False) or epoch <= after_epoch or not Path(gate_val_csv).exists():
+            return
+        gv = pd.read_csv(gate_val_csv).drop_duplicates("epoch", keep="last").set_index("epoch")
+        if "logit_std" not in gv:
+            return
+        win = list(range(epoch - patience + 1, epoch + 1))
+        if all(e in gv.index and e > after_epoch for e in win):
+            w = gv.loc[win]
+            bad = (w.logit_std < min_std) | (w.frac_saturated > max_sat)
+            if bad.all():
+                stop_training(trainer, f"kesehatan logit gagal epoch {win[0]}–{win[-1]}: std={w.logit_std.round(4).tolist()} "
+                                       f"(min {min_std}), saturasi={w.frac_saturated.round(3).tolist()} (maks {max_sat})")
+    return cb
+
+
+def make_auc_stop_rule(trainer_ref, out_csv, every=10, after_epoch=30, patience=2, signal_mode="total",
+                       max_batches=None):
+    """
+    Pengaman Tahap 1 revisi ke-2 (2026-10-09, setelah run M0 seed 42 λ=0.04: AUC epoch 100 = 0.417,
+    terbalik). Tiap `every` epoch: gate_ranking_report pada model EMA di val -> baris ke out_csv
+    (epoch, AUC, CI, std logit, aktivasi). Berhenti bila batas bawah CI 95% AUC <= 0.5 pada
+    `patience` pemeriksaan berturut-turut dengan epoch > after_epoch. Pemeriksaan <= after_epoch
+    tetap dicatat (informatif). Biaya: +-1 menit per pemeriksaan di T4.
+    """
+    def cb(trainer):
+        epoch = trainer.epoch + 1
+        # Catatan: JANGAN pakai trainer.stop sebagai guard — Ultralytics men-set stop=True di epoch terakhir
+        # sebelum on_fit_epoch_end, sehingga pemeriksaan epoch 100 terlewat (bug di run M0_lam002_seed42).
+        if epoch % every != 0 or (Path(trainer.save_dir) / "STOPPED.txt").exists():
+            return
+        hist = pd.read_csv(out_csv) if Path(out_csv).exists() else pd.DataFrame()
+        if not hist.empty and epoch in set(hist.epoch):
+            return                                   # final_eval memicu callback lagi -> jangan dobel
+        device = next(trainer.model.parameters()).device
+        rep = gate_ranking_report(trainer.ema.ema, trainer.test_loader, device, max_batches=max_batches,
+                                  signal_mode=signal_mode)
+        key = rep["decision_signal"]
+        row = dict(epoch=epoch, auc=rep[key]["auc"], auc_lo=rep[key]["auc_ci"][0], auc_hi=rep[key]["auc_ci"][1],
+                   logit_std=rep["logit_std"], logit_mean=rep["logit_mean"],
+                   act_uncalibrated=rep["activation_uncalibrated"],
+                   auc_small=rep.get("small", {}).get("auc", np.nan))
+        hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+        hist.to_csv(out_csv, index=False)
+        print(f"\n📊 [AUC CHECK epoch {epoch}] AUC[{key}]={row['auc']:.3f} CI95=[{row['auc_lo']:.3f}, {row['auc_hi']:.3f}] "
+              f"| std logit={row['logit_std']:.3f} | aktivasi={row['act_uncalibrated']:.3f}\n")
+        late = hist[hist.epoch > after_epoch].sort_values("epoch").tail(patience)
+        if len(late) == patience and (late.auc_lo <= 0.5).all():
+            stop_training(trainer, f"ranking gate gagal: batas bawah CI AUC <= 0.5 pada epoch {late.epoch.tolist()} "
+                                   f"(AUC {late.auc.round(3).tolist()})")
+    return cb
+
+
 def make_criterion_cfg_applier(criterion_cfg, dump_path=None):
     """
     on_pretrain_routine_end (SETELAH router cfg): buat criterion sekarang dan set atribut yang dibaca
