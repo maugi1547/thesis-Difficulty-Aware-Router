@@ -24,6 +24,7 @@ Folder ini memuat seluruh kode eksperimen yang menghasilkan angka di tesis. Kode
 | 3c | `tahap3c1.ipynb`, `tahap3m0s.ipynb`, `tahap3c23.ipynb` | `C1_…zip`, `archive_M0s_…zip`, `archive_C2/C3_…zip` | C1, M0-sempit, C2, C3 |
 | 3d | `tahap3d2.ipynb`, `tahap3d4.ipynb` | `tahap3d2*.zip`, `tahap3d4_kitti_s42.zip` | D2/D2b kurva label, D4 fitur kesulitan |
 | 4 | `tahap4_final.ipynb`, `tahap4_final.py` | `tahap4.zip`, `tahap4_ringkasan.zip` | Evaluasi final terkunci (H1–H7) |
+| 4B | `tahap4b_sensitivitas.ipynb`, `tahap4b.py` (dibangkitkan `buat_tahap4b.py`), uji `test_tahap4b_e2e.py` | `tahap4b_ringkasan_{best,last}.zip` | Sensitivitas pasca-hasil: latensi ujung-ke-ujung B2 + A3, baseline `last.pt` |
 | Baseline | `verifikasi_baseline.ipynb` | — | Verifikasi loss baseline dan identitas dataset |
 | Versi pertama | `versi_pertama/uji-akurasi-latensi-model-dualbranch*.ipynb` | — | Evaluasi router versi pertama (log mentah tidak lengkap) |
 
