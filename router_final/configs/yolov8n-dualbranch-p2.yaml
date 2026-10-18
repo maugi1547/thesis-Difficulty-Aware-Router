@@ -1,0 +1,66 @@
+# Arsitektur final: detektor dual-branch YOLOv8n-P2 (router_final).
+#
+# Hanya modul STOK Ultralytics 8.3.240 (Conv, C2f, SPPF, Concat, nn.Upsample, Detect) — tidak ada modul router,
+# gate terlatih, cabang proxy, atau kalibrasi. Keputusan routing dibuat oleh gate post-hoc di luar graf ini
+# (rfinal/gate.py), dari fitur yang sudah dihasilkan trunk (layer 0–15 + P2 backbone).
+#
+# Layer 16–18 = "expert P2" (upsample P3_neck, concat P2 backbone, C2f) — identik secara numerik dengan
+# UltraLightWeightDifficultyAwareRouter.compute_expert versi lama (C2f(96 -> 32, n=1, shortcut=False)), sehingga
+# bobot M0 bisa dipetakan ke graf ini (tools/m0_reference.py, tests/test_m0_equivalence.py).
+#
+# Branch A (WithP2): 19–27 + Detect_A (P2, P3, P4, P5) = layer 34.
+# Branch B (NoP2)  : 28–33 + Detect_B (P3, P4, P5)     = layer 35 (layer terakhir).
+# Trunk bersama    : 0–15 (backbone + neck top-down). Stage 1 deployment = 0–15.
+
+nc: 2
+scales:
+  # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]    # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]   # 1-P2/4
+  - [-1, 3, C2f, [128, True]]    # 2  P2_backbone (fitur gate & input expert)
+  - [-1, 1, Conv, [256, 3, 2]]   # 3-P3/8
+  - [-1, 6, C2f, [256, True]]    # 4
+  - [-1, 1, Conv, [512, 3, 2]]   # 5-P4/16
+  - [-1, 6, C2f, [512, True]]    # 6
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 3, C2f, [1024, True]]   # 8
+  - [-1, 1, SPPF, [1024, 5]]     # 9  P5_sppf
+
+head:
+  # --- neck top-down (bersama) ---
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 10
+  - [[-1, 6], 1, Concat, [1]]                   # 11
+  - [-1, 3, C2f, [512]]                         # 12 P4_neck
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 13
+  - [[-1, 4], 1, Concat, [1]]                   # 14
+  - [-1, 3, C2f, [256]]                         # 15 P3_neck  (= skala P3 Branch B)
+
+  # --- expert P2 (hanya dijalankan bila routing memilih Branch A) ---
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 16
+  - [[-1, 2], 1, Concat, [1]]                   # 17
+  - [-1, 3, C2f, [128]]                         # 18 P2_out
+
+  # --- Branch A: WithP2 (bottom-up dari P2) ---
+  - [-1, 1, Conv, [256, 3, 2]]                  # 19
+  - [[-1, 15], 1, Concat, [1]]                  # 20
+  - [-1, 3, C2f, [256]]                         # 21 P3_A
+  - [-1, 1, Conv, [512, 3, 2]]                  # 22
+  - [[-1, 12], 1, Concat, [1]]                  # 23
+  - [-1, 3, C2f, [512]]                         # 24 P4_A
+  - [-1, 1, Conv, [1024, 3, 2]]                 # 25
+  - [[-1, 9], 1, Concat, [1]]                   # 26
+  - [-1, 3, C2f, [1024]]                        # 27 P5_A
+
+  # --- Branch B: NoP2 (pola YOLOv8 vanilla, P3 = layer 15) ---
+  - [15, 1, Conv, [256, 3, 2]]                  # 28
+  - [[-1, 12], 1, Concat, [1]]                  # 29
+  - [-1, 3, C2f, [512]]                         # 30 P4_B
+  - [-1, 1, Conv, [512, 3, 2]]                  # 31
+  - [[-1, 9], 1, Concat, [1]]                   # 32
+  - [-1, 3, C2f, [1024]]                        # 33 P5_B
+
+  - [[18, 21, 24, 27], 1, Detect, [nc]]         # 34 Detect_A (stride 4, 8, 16, 32)
+  - [[15, 30, 33], 1, Detect, [nc]]             # 35 Detect_B (stride 8, 16, 32)

@@ -1,0 +1,53 @@
+# Konfigurasi VisDrone 2 kelas (person, vehicle) — turunan kitti.yaml. Nilai bertanda TODO wajib dicek terhadap
+# run VisDrone M0 (Colab A100) sebelum dipakai.
+# Semua skrip membaca file ini; sha256-nya tercatat di provenance.json setiap run.
+
+name: visdrone
+model: yolov8n-dualbranch-p2.yaml          # relatif terhadap folder configs/
+data: ISI_PATH/visdrone_2class.yaml   # TODO: path dataset VisDrone 2 kelas
+expected_counts: {}       # TODO: jumlah gambar val/test VisDrone
+
+# --- Tahap 1: training detektor (argumen Ultralytics; sama dengan M0 kecuali komponen router yang dibuang) ---
+train:
+  epochs: 100
+  batch: 16                 # TODO: samakan dengan run VisDrone M0
+  imgsz: 640
+  optimizer: AdamW
+  lr0: 0.002
+  cos_lr: true
+  weight_decay: 0.0005
+  amp: true
+  workers: 4                # ikut menentukan aliran augmentasi -> bagian dari resep
+  deterministic: true
+  save_period: 10
+  project: /kaggle/working/runs_final
+  # argumen Ultralytics lain = default 8.3.240 (dicatat lengkap di args.yaml setiap run)
+seeds: [42]
+loss:
+  branch_b_weight: 0.7      # L = L_A + 0.7 · L_B
+monitor:
+  branch_b_val_every: 10    # mAP Branch B di val tiap N epoch (pemantauan saja; 0 = mati)
+checkpoint: last.pt         # checkpoint yang dipakai tahap berikutnya (bukan best.pt: best dipilih dari mAP Branch A)
+
+# --- Tahap 2: gate post-hoc (detektor beku) ---
+gate:
+  fit_split: train          # target & fit di train; val hanya untuk threshold awal B2
+  target: soft_small        # y = 1[Δ soft-recall objek kecil (A − B) > 0], IoU 0.5, area COCO < 32² px asli
+  C: 0.001                  # StandardScaler + LogisticRegression(C, lbfgs, max_iter 5000), dilipat jadi 1 Gemm
+  max_iter: 5000
+  nms: {conf: 0.001, iou: 0.7, max_det: 300}
+
+# --- Tahap 3: kendali anggaran B2 ---
+budget:
+  rho: 0.5                  # target aktivasi Branch A
+  window: 200               # threshold = kuantil (1 − ρ) dari 200 skor sebelumnya
+  min_hist: 20              # < 20 riwayat -> threshold awal = kuantil (1 − ρ) skor val
+
+# --- Evaluasi (pycocotools, koordinat asli) ---
+eval:
+  coco_max_dets: [1, 10, 500]   # VisDrone ±59 objek/gambar (sebagian > 100)
+
+# --- Tahap 4: deployment A3 (satu engine TensorRT, ONNX If) ---
+deploy:
+  opset: 17
+  precision: fp16           # trunk & Stage 2 FP16 (I/O FP32); pooling + Gemm gate FP32
