@@ -87,11 +87,14 @@ python -m pytest -q tests                                                    # t
 
 python scripts/check_reproducibility.py --config configs/kitti.yaml --seed 42 --override epochs=2
 python scripts/train.py     --config configs/kitti.yaml --seed 42                       # -> RUN = runs_final/kitti_seed42
+python scripts/check_checkpoint.py --config configs/kitti.yaml --run RUN --out RUN/cek_checkpoint   # last vs best, A & B (val)
 python scripts/fit_gate.py  --config configs/kitti.yaml --weights RUN/weights/last.pt --out RUN/gate
 python scripts/export.py    --config configs/kitti.yaml --weights RUN/weights/last.pt --gate RUN/gate/gate.json --out RUN/deploy --trt
 python scripts/evaluate.py  --config configs/kitti.yaml --weights RUN/weights/last.pt --gate RUN/gate/gate.json \
                             --out RUN/eval_test --backend trt --engine RUN/deploy/a3_fp16.engine
 ```
+
+Semua tahap memakai `last.pt`. `best.pt` Ultralytics dipilih dari fitness Branch A saja, sehingga epoch-nya belum tentu terbaik untuk Branch B dan bisa membesarkan jarak A − B. `check_checkpoint.py` hanya melaporkan selisih last − best (A, B, jarak A − B) dengan bootstrap berpasangan di val; pilihan checkpoint tidak berubah.
 
 Untuk Kaggle, gunakan `notebooks/kaggle_router_final.ipynb`. Notebook ini memuat urutan yang sama, ditambah cek commit yang dipin.
 

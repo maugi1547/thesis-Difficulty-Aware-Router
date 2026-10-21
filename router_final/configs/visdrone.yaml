@@ -28,7 +28,7 @@ loss:
   branch_b_weight: 0.7      # L = L_A + 0.7 · L_B
 monitor:
   branch_b_val_every: 10    # mAP Branch B di val tiap N epoch (pemantauan saja; 0 = mati)
-checkpoint: last.pt         # checkpoint yang dipakai tahap berikutnya (bukan best.pt: best dipilih dari mAP Branch A)
+checkpoint: last.pt         # checkpoint yang dipakai tahap berikutnya (bukan best.pt: best dipilih dari mAP Branch A; selisih dilaporkan oleh scripts/check_checkpoint.py)
 
 # --- Tahap 2: gate post-hoc (detektor beku) ---
 gate:
