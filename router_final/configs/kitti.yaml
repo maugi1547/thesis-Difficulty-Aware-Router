@@ -15,6 +15,7 @@ train:
   lr0: 0.002
   cos_lr: true
   weight_decay: 0.0005
+  device: 0
   amp: true
   workers: 4                # ikut menentukan aliran augmentasi -> bagian dari resep
   deterministic: true
