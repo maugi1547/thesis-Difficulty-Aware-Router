@@ -24,6 +24,8 @@ deployment A3: satu engine TensorRT (ONNX If); thr = input engine, skor = output
 | 3. Anggaran B2 | `rfinal/budget.py` | Threshold kuantil bergulir; threshold awal = kuantil skor val. |
 | 4. Deployment A3 | `rfinal/export.py`, `rfinal/trt.py` | ONNX If FP16 (gate FP32) lalu TensorRT. |
 | Evaluasi | `rfinal/evaluate.py`, `rfinal/data.py` | pycocotools resolusi asli: A paksa, B paksa, router, acak dengan aktivasi sama. |
+| Evaluasi final terkunci | `rfinal/suite.py`, `rfinal/cocomix.py`, `rfinal/baselines.py`, `scripts/suite.py` | Port Tahap 4/4B: Vanilla/P2-Static, H1–H7, bootstrap berpasangan, campuran nyata, heuristik tanpa label, kaskade, latensi per komponen dan **ujung-ke-ujung**, bootstrap klaster (VisDrone), gabungan + pooling 3 seed. |
+| Ablasi pasca-training | `rfinal/ablation.py`, `scripts/ablate.py` | G1 target, G3 fitur, G4 classifier, G5 biaya label, B anggaran (dinilai di val). |
 
 ### Komponen versi lama yang dibuang
 
@@ -106,6 +108,36 @@ python tools/convert_m0.py --sd m0_sd.pt --out m0_final.pt
 RFINAL_M0_REF=m0_ref.pt python -m pytest -q tests/test_m0_equivalence.py
 ```
 
+## Evaluasi final, latensi ujung-ke-ujung, dan ablasi (tanpa fork lama)
+
+Semua analisis tesis kini berjalan di lingkungan stok yang sama dengan training:
+
+```bash
+python scripts/suite.py run --config configs/kitti.yaml --seed 42 --weights RUN/weights/last.pt --gate RUN/gate/gate.json \
+    --vanilla VAN/weights/last.pt --p2static P2S/weights/last.pt --out /kaggle/working/suite --zip /kaggle/working
+python scripts/ablate.py   --config configs/kitti.yaml --weights RUN/weights/last.pt --out RUN/ablasi
+python scripts/suite.py merge --out /kaggle/working/suite_gabung --glob "/kaggle/input/**/suite_*" \
+    --models kitti_seed42 kitti_seed7 kitti_seed2026 visdrone_seed42
+```
+
+Protokol = Tahap 4/4B (konstanta di blok `analysis:` config), dengan satu tambahan yang dikunci sebelum run ulang:
+**H6 utama** = router (B2 efisien) − campuran acak Vanilla/P2-Static dengan fraksi campuran dari latensi
+ujung-ke-ujung. B2 efisien (`rfinal/budget.py`, jendela terurut) memberi threshold **bit-identik** dengan
+`np.quantile` (`tests/test_budget.py`); H6 Tahap 4 (komposit, B2 `np.quantile`) tetap dilaporkan.
+`suite.py` memakai `gate.json` dari `fit_gate.py` dan mem-fit ulang gate dari cache train hanya sebagai cek silang.
+
+**Bukti kesetaraan port** (bukan klaim):
+
+1. `tests/test_cocomix.py`: CocoMix, UnionBoot, FastUnionBoot == COCOeval langsung (data sintetis).
+2. `tests/test_suite_replay.py` (`RFINAL_SUITE_REF=<intermediate Tahap 4>`): `analyze` mereproduksi estimasi titik,
+   sampel bootstrap per resample, keputusan B2, H3 dan B2 per urutan Tahap 4 VisDrone s42 secara eksak.
+3. Pipeline penuh pada bobot M0 seed 42 (`tools/convert_m0.py`), data mini, backend ONNX Runtime:
+   `tools/compare_suite_runs.py OLD NEW` -> cache train/val/test, deteksi Vanilla/P2-Static/A/B, skor gate &
+   heuristik, gate kaskade, keputusan job, GFLOPs, dan semua uji bootstrap yang tidak bergantung latensi **identik**
+   dengan `eksperimen/tahap4b.py` di fork lama.
+4. Bagian TensorRT (build, latensi, pass ujung-ke-ujung) adalah salinan kode Tahap 4B yang sudah berjalan di T4,
+   tetapi baru teruji di lingkungan stok pada run Kaggle pertama (sesi 0: `--override n_boot=50` cukup).
+
 ## Yang tetap di `eksperimen/`
 
-Analisis statistik tesis tetap di `eksperimen/`, yaitu bootstrap berpasangan, H1–H7, kurva Pareto, baseline Vanilla/P2-Static, latensi per komponen, dan heuristik kepadatan. Kode di sana memakai fork lama dan menjadi arsip yang menghasilkan angka versi M0.
+`eksperimen/` adalah arsip yang menghasilkan angka versi M0 (fork lama). Sistem final tidak membutuhkannya lagi; kodenya hanya dipakai sebagai acuan uji kesetaraan di atas.

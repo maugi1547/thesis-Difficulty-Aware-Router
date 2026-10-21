@@ -51,3 +51,29 @@ eval:
 deploy:
   opset: 17
   precision: fp16           # trunk & Stage 2 FP16 (I/O FP32); pooling + Gemm gate FP32
+
+# --- Evaluasi final terkunci + latensi ujung-ke-ujung (rfinal/suite.py; = protokol Tahap 4/4B) ---
+analysis:
+  max_det: 300                # NMS max_det per gambar (KITTI 300, VisDrone 500)
+  conf: 0.001
+  iou: 0.7
+  gate_C: 0.001             # fit ulang gate dari cache train = pemeriksaan silang gate.json
+  b2_orders: 5              # B2 pada 5 urutan acak test (ketahanan aktivasi)
+  h5_ms: 0.15               # H5: rute A − P2-Static dan rute B − Vanilla ≤ 0,15 ms
+  h7_dev: 0.05              # H7: |aktivasi test − ρ| ≤ 0,05
+  n_boot: 1000
+  n_draws: 5                # undian acak per pembanding utama
+  n_draws_sekunder: 3
+  boot_seed: 20261016       # SAMA untuk semua model -> pooling 3 seed KITTI per resample
+  boot_jobs: 4
+  cascade: true             # pembanding kaskade bergate Vanilla -> P2-Static
+  fp32_check: true          # pemeriksaan silang PyTorch FP32
+  precision: fp16
+  backend: trt              # trt (Kaggle T4) | ort (uji lokal CPU)
+  n_builds: 2               # build engine per model (variasi latensi antar-build)
+  n_prof_images: 300        # latensi per komponen
+  n_warmup: 30
+  n_reps: 3                 # juga dipakai pass ujung-ke-ujung (seluruh test, urutan aliran)
+  n_onnx_check: 4
+  trt_timeout_s: 10800
+  job_workers: 2

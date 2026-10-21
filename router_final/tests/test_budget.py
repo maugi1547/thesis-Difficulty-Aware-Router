@@ -23,3 +23,18 @@ def test_b2_matches_reference_and_streaming():
     st = [ctl.decide(x) for x in s]
     assert np.array_equal(np.array([u for u, _ in st]), d) and np.array_equal(np.array([t for _, t in st]), thr)
     assert abs(d[200:].mean() - 0.5) < 0.05
+
+
+def test_b2_efficient_bit_identical_to_np_quantile():
+    """Jendela terurut (deployment) == np.quantile atas deque (Tahap 4): threshold & keputusan bit-identik."""
+    rng = np.random.default_rng(1)
+    for rho in (0.5, 0.3, 0.7, 0.25):
+        s = np.concatenate([rng.normal(0, 1, 2000), rng.normal(0.8, 1.5, 3000)])
+        s[::97] = s[3]                                            # seri skor
+        thr0 = 0.123
+        eff, ref = B2Controller(rho, 200, 20, thr0, efficient=True), B2Controller(rho, 200, 20, thr0, efficient=False)
+        de, dr = [eff.decide(x) for x in s], [ref.decide(x) for x in s]
+        assert [t for _, t in de] == [t for _, t in dr], rho
+        assert [u for u, _ in de] == [u for u, _ in dr]
+        d, thr = b2_decide(s, rho, 200, 20, thr0)
+        assert np.array_equal(np.array([t for _, t in de], np.float32), thr)

@@ -6,7 +6,7 @@ Evaluasi sistem final pada satu split (default test): Branch A/B paksa, router (
     python scripts/evaluate.py ... --backend pytorch          # acuan FP32 (tanpa engine)
 
 Keluaran: metrik.csv (pycocotools, koordinat asli), keputusan_per_gambar.csv, provenance.json.
-Analisis statistik lengkap tesis (bootstrap berpasangan, H1–H7, latensi) tetap di eksperimen/tahap4_final.py.
+Analisis statistik lengkap tesis (bootstrap berpasangan, H1–H7, latensi ujung-ke-ujung): scripts/suite.py.
 """
 import argparse
 from pathlib import Path
