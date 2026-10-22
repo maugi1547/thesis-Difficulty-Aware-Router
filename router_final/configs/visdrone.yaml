@@ -5,12 +5,12 @@
 name: visdrone
 model: yolov8n-dualbranch-p2.yaml          # relatif terhadap folder configs/
 data: /kaggle/working/visdrone.yaml   # TODO: path dataset VisDrone 2 kelas
-expected_counts: {}       # TODO: jumlah gambar val/test VisDrone
+expected_counts: {val: 548, test: 1610}       # TODO: jumlah gambar val/test VisDrone
 
 # --- Tahap 1: training detektor (argumen Ultralytics; sama dengan M0 kecuali komponen router yang dibuang) ---
 train:
   epochs: 100
-  batch: 16                 # TODO: samakan dengan run VisDrone M0
+  batch: 8                 # TODO: samakan dengan run VisDrone M0
   imgsz: 640
   optimizer: AdamW
   lr0: 0.002
