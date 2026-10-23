@@ -9,6 +9,12 @@ Semua di atas detektor BEKU; pilihan dinilai di VAL (gain vs routing acak pada a
   G5  biaya label   : n gambar train berlabel ∈ {50 … semua}, 5 subset acak per n
   B   anggaran      : threshold val tetap vs B2 (window 50 / 200 / 500) pada aliran test: aktivasi & gain vs acak
 Ukuran gain = metrik(routing) − rata-rata metrik(20 routing acak, aktivasi sama), CocoMix (= COCOeval eksak).
+
+Uji berpasangan (boot_ablation): bootstrap per gambar (indeks resample sama untuk semua routing di satu split) atas
+selisih gain dua varian, gain = metrik − rata-rata n_random_boot routing acak pada aktivasi yang sama (set acak
+dipakai bersama bila aktivasinya sama, sehingga untuk pasangan top-ρ selisih gain = selisih metrik persis).
+p dua sisi + Holm di seluruh keluarga pasangan. Pasangan dipilih setelah titik ablasi seed 42 terlihat (pasca-hasil):
+dilaporkan sebagai konfirmasi ketidakpastian, bukan seleksi desain (desain tetap terkunci).
 """
 from __future__ import annotations
 
@@ -19,7 +25,7 @@ import pandas as pd
 import torch
 
 from .budget import b2_decide, thr0_from_val
-from .cocomix import METRICS, Router, random_masks, top_rho
+from .cocomix import METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, holm, random_masks, top_rho
 from .data import build_coco_gt, coco_eval, jdict
 from .gate import cache_split, fit_gate, score_np
 
@@ -98,9 +104,13 @@ def _two_class(t):
 
 def run_ablation(tr: Split, va: Split, te: Split | None, losses_tr, rho=0.5, C=0.001, n_random=20, seed=0,
                  b2=(200, 20), log=print):
-    rows = []
-    add = lambda grp, varian, split, sp, use, **kw: rows.append(
-        dict(seri=grp, varian=varian, split=split, aktivasi=float(np.mean(use)), **sp.gain(use, n_random, seed + 3), **kw))
+    rows, masks = [], {}
+
+    def add(grp, varian, split, sp, use, **kw):
+        use = np.asarray(use, bool)
+        masks.setdefault((split, varian), use)                     # G5: hanya ulangan pertama per n
+        rows.append(dict(seri=grp, varian=varian, split=split, aktivasi=float(np.mean(use)),
+                         **sp.gain(use, n_random, seed + 3), **kw))
 
     # ---- G1 target
     targets = {"soft_small (final)": tr.T["soft_small"], "soft_all": tr.T["soft_all"], "net25_all": tr.T["net25_all"]}
@@ -117,7 +127,7 @@ def run_ablation(tr: Split, va: Split, te: Split | None, losses_tr, rho=0.5, C=0
 
     if not _two_class(tr.T["soft_small"]):
         log("⚠ target soft_small train hanya satu kelas: G3–G5 dan B dilewati")
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows), masks
 
     # ---- G3 subset fitur
     for nm, cols in feature_columns().items():
@@ -152,4 +162,83 @@ def run_ablation(tr: Split, va: Split, te: Split | None, losses_tr, rho=0.5, C=0
             d_, _ = b2_decide(s_te, rho, win, b2[1], thr0)
             add("B anggaran", f"B2 window {win}" + (" (final)" if win == b2[0] else ""), "test", te, d_)
         add("B anggaran", "top-ρ test (oracle anggaran, transduktif)", "test", te, top_rho(s_te, rho))
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), masks
+
+
+# =============================================================================
+# Uji berpasangan
+# =============================================================================
+F_SS, F_LOSS, F_LOSSM = "soft_small (final)", "selisih loss (loss_A < loss_B)", "selisih loss − median (offset ala DynamicDet)"
+F_FEAT, F_C = "final: 4 peta, GAP+GMP", "LogReg C=0.001 (final)"
+B_FINAL = "B2 window 200 (final)"
+
+# (label, split, varian_a, varian_b): selisih gain a − b. varian_b = None -> a − acak (gain itu sendiri).
+PAIRS = [
+    ("G1 soft_small − acak", "val", F_SS, None),
+    ("G1 soft_small − selisih loss", "val", F_SS, F_LOSS),
+    ("G1 soft_small − selisih loss − median", "val", F_SS, F_LOSSM),
+    ("G1 soft_small − soft_all", "val", F_SS, "soft_all"),
+    ("G1 soft_small − net25_all", "val", F_SS, "net25_all"),
+    ("G1 selisih loss − acak", "val", F_LOSS, None),
+    ("G1 plafon jumlah GT kecil − oracle Δsoft_small", "val", "plafon: jumlah GT kecil (GT val)",
+     "plafon: oracle Δsoft_small (GT val)"),
+    ("G3 final − tanpa p2_backbone", "val", F_FEAT, "tanpa p2_backbone"),
+    ("G3 final − hanya p3_neck", "val", F_FEAT, "hanya p3_neck"),
+    ("G4 LogReg C=0.001 − HistGradientBoosting", "val", F_C, "HistGradientBoosting"),
+    ("G4 LogReg C=0.001 − C=0.01", "val", F_C, "LogReg C=0.01"),
+    ("G5 semua label − n = 500", "val", "n = {n_all}", "n = 500"),
+    ("B B2 window 200 − threshold val tetap", "test", B_FINAL, "threshold val tetap"),
+    ("B B2 window 200 − window 500", "test", B_FINAL, "B2 window 500"),
+    ("B B2 window 200 − acak", "test", B_FINAL, None),
+]
+
+
+def boot_ablation(splits, masks, n_boot=1000, seed=20261016, n_random=5, rand_seed=11, n_jobs=1, log=print):
+    """
+    splits: {'val': Split, 'test': Split|None}; masks: {(split, varian): use_a (urutan cache)} dari run_ablation.
+    Returns DataFrame: uji, metric, diff, ci_lo, ci_hi, p_two_sided, p_holm (per metrik), n_boot, aktivasi_a/b.
+    """
+    n_all = max((int(v.split("= ")[1]) for (sp, v) in masks if v.startswith("n = ")), default=None)
+    pairs = []
+    for lab, sp, a, b in PAIRS:
+        a = a.format(n_all=n_all); b = b.format(n_all=n_all) if b else None
+        if splits.get(sp) is not None and (sp, a) in masks and (b is None or (sp, b) in masks):
+            pairs.append((lab, sp, a, b))
+        else:
+            log(f"  lewati uji '{lab}' (varian tidak ada)")
+    rows = []
+    for sp in ("val", "test"):
+        P = [p for p in pairs if p[1] == sp]
+        if not P:
+            continue
+        S = splits[sp]
+        U = FastUnionBoot(UnionBoot(S.R.bA, S.R.bB))
+        names = sorted({v for _, _, a, b in P for v in (a, b) if v})
+        mixes, rand_of = {}, {}
+        for v in names:
+            use = masks[(sp, v)]
+            mixes[v] = (U, S.R.sorted_mask(use))
+            k = int(use.sum())
+            if k not in rand_of:                                       # set acak dipakai bersama per aktivasi
+                rand_of[k] = [f"acak_k{k}_{j}" for j in range(n_random)]
+                for j, r in enumerate(random_masks(S.n, k / S.n, n_random, rand_seed + k)):
+                    mixes[rand_of[k][j]] = (U, S.R.sorted_mask(r))
+        log(f"  bootstrap {sp}: {len(mixes)} routing × {n_boot} resample ...")
+        point, smp = boot_engine(mixes, n_boot, seed, n_jobs)
+        gain = lambda d, v: d[v][m] - np.mean([d[r][m] for r in rand_of[int(masks[(sp, v)].sum())]], 0)
+        for lab, _, a, b in P:
+            for m in METRICS:
+                pt = gain(point, a) - (gain(point, b) if b else 0.0)
+                sm = gain(smp, a) - (gain(smp, b) if b else 0.0)
+                sm = sm[np.isfinite(sm)]
+                lo, hi = np.percentile(sm, [2.5, 97.5])
+                rows.append(dict(uji=lab, split=sp, metric=m, diff=pt, ci_lo=lo, ci_hi=hi, p_two_sided=_pval(sm),
+                                 n_boot=len(sm), aktivasi_a=float(masks[(sp, a)].mean()),
+                                 aktivasi_b=float(masks[(sp, b)].mean()) if b else np.nan))
+    T = pd.DataFrame(rows)
+    if len(T):
+        T["p_holm"] = np.nan
+        for m in METRICS:
+            sel = T.metric == m
+            T.loc[sel, "p_holm"] = holm(T.loc[sel, "p_two_sided"].values)
+    return T
