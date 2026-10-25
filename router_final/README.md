@@ -87,6 +87,8 @@ python -m pytest -q tests                                                    # t
 
 python scripts/check_reproducibility.py --config configs/kitti.yaml --seed 42 --override epochs=2
 python scripts/train.py     --config configs/kitti.yaml --seed 42                       # -> RUN = runs_final/kitti_seed42
+python scripts/train.py     --config configs/visdrone.yaml --seed 42 --model vanilla    # baseline stok, resep & GPU sama
+python scripts/train.py     --config configs/visdrone.yaml --seed 42 --model p2static
 python scripts/check_checkpoint.py --config configs/kitti.yaml --run RUN --out RUN/cek_checkpoint   # last vs best, A & B (val)
 python scripts/fit_gate.py  --config configs/kitti.yaml --weights RUN/weights/last.pt --out RUN/gate
 python scripts/export.py    --config configs/kitti.yaml --weights RUN/weights/last.pt --gate RUN/gate/gate.json --out RUN/deploy --trt

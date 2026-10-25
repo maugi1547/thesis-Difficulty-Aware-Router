@@ -82,7 +82,8 @@ def _cb_provenance(cfg_files):
                                "Ultralytics gagal/offline -> resep berubah. Perbaiki lingkungan, jangan lanjut.")
         write_json(Path(trainer.save_dir) / "provenance.json",
                    provenance(files=[*cfg_files, trainer.args.data],
-                              extra=dict(amp_effective=bool(trainer.amp), branch_b_weight=trainer.branch_b_weight,
+                              extra=dict(amp_effective=bool(trainer.amp), model_kind=getattr(trainer, "model_kind", "dualbranch"),
+                                         branch_b_weight=getattr(trainer, "branch_b_weight", None),
                                          seed=trainer.args.seed, deterministic=trainer.args.deterministic,
                                          torch_deterministic_algorithms=torch.are_deterministic_algorithms_enabled())))
     return f
@@ -113,6 +114,30 @@ def build_trainer(cfg, seed, name=None, overrides=None, strict_determinism=False
     trainer.branch_b_val_every = int(cfg.get("monitor", {}).get("branch_b_val_every", 0))
     trainer.add_callback("on_pretrain_routine_end", _cb_provenance([cfg["_config_path"], cfg["model"]]))
     trainer.add_callback("on_fit_epoch_end", _cb_branch_b)
+    trainer.add_callback("on_train_end", _cb_final_hash)
+    if strict_determinism:
+        def _strict(_):
+            torch.use_deterministic_algorithms(True, warn_only=False)
+        trainer.add_callback("on_pretrain_routine_start", _strict)
+    return trainer
+
+
+# ---------------------------------------------------------------------------- baseline (Vanilla / P2-Static)
+# Model STOK Ultralytics 8.3.240, dilatih dari nol dengan resep yang SAMA dengan detektor dual-branch (blok `train`
+# konfigurasi: epoch, batch, optimizer, lr, augmentasi bawaan, seed, AMP, worker), di GPU yang sama. Run lama
+# (VisDrone, Colab A100) juga memakai yolov8n.yaml / yolov8n-p2.yaml dari nol dengan argumen yang sama.
+BASELINE_YAMLS = {"vanilla": "yolov8n.yaml", "p2static": "yolov8n-p2.yaml"}
+
+
+def build_baseline_trainer(cfg, seed, which, name=None, overrides=None, strict_determinism=False):
+    """which: 'vanilla' | 'p2static'. Keluaran sama dengan build_trainer (provenance, state_hash) tanpa Branch B."""
+    require_stock_ultralytics()
+    assert which in BASELINE_YAMLS, which
+    args = dict(cfg["train"], model=BASELINE_YAMLS[which], data=cfg["data"], seed=int(seed),
+                name=name or f"{cfg['name']}_{which}_seed{seed}", exist_ok=False, **(overrides or {}))
+    trainer = DetectionTrainer(overrides=args)
+    trainer.model_kind = which
+    trainer.add_callback("on_pretrain_routine_end", _cb_provenance([cfg["_config_path"]]))
     trainer.add_callback("on_train_end", _cb_final_hash)
     if strict_determinism:
         def _strict(_):

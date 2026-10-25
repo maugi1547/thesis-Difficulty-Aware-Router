@@ -1,5 +1,6 @@
-# Konfigurasi VisDrone 2 kelas (person, vehicle) — turunan kitti.yaml. Nilai bertanda TODO wajib dicek terhadap
-# run VisDrone M0 (Colab A100) sebelum dipakai.
+# Konfigurasi VisDrone 2 kelas (person, vehicle) — turunan kitti.yaml.
+# Keputusan Okt 2026: SEMUA model VisDrone (dual-branch, Vanilla, P2-Static) dilatih ulang di Kaggle Tesla T4 dengan
+# blok `train` di bawah (scripts/train.py --model dualbranch|vanilla|p2static). Run A100 (Colab) tidak dipakai.
 # Semua skrip membaca file ini; sha256-nya tercatat di provenance.json setiap run.
 
 name: visdrone
@@ -10,7 +11,7 @@ expected_counts: {val: 548, test: 1610}       # TODO: jumlah gambar val/test Vis
 # --- Tahap 1: training detektor (argumen Ultralytics; sama dengan M0 kecuali komponen router yang dibuang) ---
 train:
   epochs: 100
-  batch: 8                 # TODO: samakan dengan run VisDrone M0
+  batch: 8                  # sama untuk ketiga model; = batch run baseline lama. Uji 1 epoch T4: 8,35 GB, ±4,3 menit/epoch
   imgsz: 640
   optimizer: AdamW
   lr0: 0.002

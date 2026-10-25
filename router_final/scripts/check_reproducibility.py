@@ -47,6 +47,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--model", default="dualbranch", choices=("dualbranch", "vanilla", "p2static"))
     ap.add_argument("--override", nargs="*", default=["epochs=2"])
     ap.add_argument("--strict-determinism", action="store_true")
     ap.add_argument("--compare", nargs=2, metavar="RUN_DIR")
@@ -58,7 +59,7 @@ def main():
     dirs = []
     for r in (1, 2):
         name = f"repro_{tag}_run{r}"
-        cmd = [sys.executable, str(HERE / "train.py"), "--config", a.config, "--seed", str(a.seed), "--name", name,
+        cmd = [sys.executable, str(HERE / "train.py"), "--config", a.config, "--seed", str(a.seed), "--name", name, "--model", a.model,
                "--override", *a.override] + (["--strict-determinism"] if a.strict_determinism else [])
         print("▶", " ".join(cmd), flush=True)
         out = subprocess.run(cmd, check=True, capture_output=True, text=True)
