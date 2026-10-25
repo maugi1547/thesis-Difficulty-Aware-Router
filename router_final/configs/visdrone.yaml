@@ -24,7 +24,7 @@ train:
   save_period: 10
   project: /kaggle/working/runs_final
   # argumen Ultralytics lain = default 8.3.240 (dicatat lengkap di args.yaml setiap run)
-seeds: [42,7,2026]
+seeds: [42]
 loss:
   branch_b_weight: 0.7      # L = L_A + 0.7 · L_B
 monitor:
