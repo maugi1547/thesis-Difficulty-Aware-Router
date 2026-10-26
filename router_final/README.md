@@ -100,6 +100,11 @@ Semua tahap memakai `last.pt`. `best.pt` Ultralytics dipilih dari fitness Branch
 
 Untuk Kaggle, gunakan `notebooks/kaggle_router_final.ipynb`. Notebook ini memuat urutan yang sama, ditambah cek commit yang dipin.
 
+Dua hal di notebook yang perlu diketahui:
+
+- **Dua sesi untuk VisDrone.** Satu seed VisDrone di T4 ±10–13 jam (training ±7,2–7,6 jam), melebihi batas sesi 12 jam. `SESSION = 1` menjalankan uji reproduksi, training, cek checkpoint, gate, ekspor, evaluasi, dan arsip; `SESSION = 2` (dengan `RESUME_FROM` = arsip sesi 1) menjalankan suite, sensitivitas, dan ablasi. `SESSION = "baselines"` hanya melatih Vanilla + P2-Static. `SESSION = None` = kendali manual lewat `STEPS`.
+- **Log training ke file.** Progress bar Ultralytics tidak lagi masuk ke output notebook (membuat tahap simpan versi Kaggle sangat lama). Stdout/stderr masuk ke `/kaggle/working/logs/<nama>.log.gz`; notebook mencetak epoch dan mAP50 dari `results.csv` tiap 10 menit serta 25 baris terakhir log. Perintah training yang gagal menghentikan notebook. Hanya uji reproduksi yang tidak fatal (hasil BERBEDA dicetak sebagai peringatan).
+
 ### Memvalidasi kode pada bobot M0 (opsional)
 
 Kalau `fit_gate` dan `evaluate` dijalankan pada bobot M0, hasilnya harus mereproduksi angka PyTorch FP32 Tahap 4.
