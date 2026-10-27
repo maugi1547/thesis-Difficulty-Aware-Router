@@ -26,7 +26,7 @@ from rfinal.env import ROOT, load_config, provenance, require_stock_ultralytics,
 def suite_cfg(cfg, overrides):
     c = dict(cfg["analysis"], imgsz=int(cfg["train"]["imgsz"]), rho=float(cfg["budget"]["rho"]),
              b2_window=int(cfg["budget"]["window"]), b2_min_hist=int(cfg["budget"]["min_hist"]),
-             opset=int(cfg["deploy"]["opset"]), workers=2)
+             opset=int(cfg["deploy"]["opset"]), workers=2, gate_max_det=int(cfg["gate"]["nms"]["max_det"]))
     assert c["precision"] == cfg["deploy"]["precision"], "analysis.precision != deploy.precision"
     c.update(overrides)
     return c

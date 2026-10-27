@@ -37,7 +37,10 @@ gate:
   target: soft_small        # y = 1[Δ soft-recall objek kecil (A − B) > 0], IoU 0.5, area COCO < 32² px asli
   C: 0.001                  # StandardScaler + LogisticRegression(C, lbfgs, max_iter 5000), dilipat jadi 1 Gemm
   max_iter: 5000
-  nms: {conf: 0.001, iou: 0.7, max_det: 300}
+  nms: {conf: 0.001, iou: 0.7, max_det: 300, fast_nms_k: 5000}
+  # fast_nms_k: NMS pada 5000 kandidat teratas, dipakai hanya bila terbukti identik dengan NMS penuh (rfinal/data.py
+  # nms_one; selain itu NMS penuh). Hanya mempercepat. Ditambahkan SETELAH sesi 1 seed 42 (gate.json & eval_test_trt
+  # dihitung dengan NMS penuh); kesamaannya diverifikasi scripts/check_fast_nms.py (sel 6b) sebelum suite.
 
 # --- Tahap 3: kendali anggaran B2 ---
 budget:
@@ -57,6 +60,7 @@ deploy:
 # --- Evaluasi final terkunci + latensi ujung-ke-ujung (rfinal/suite.py; = protokol Tahap 4/4B) ---
 analysis:
   max_det: 500                # NMS max_det per gambar (KITTI 300, VisDrone 500)
+  fast_nms_k: 5000            # lihat gate.nms; suite memakai max_det 500, fit ulang gate memakai 300 teratas (= gate.nms)
   conf: 0.001
   iou: 0.7
   gate_C: 0.001             # fit ulang gate dari cache train = pemeriksaan silang gate.json

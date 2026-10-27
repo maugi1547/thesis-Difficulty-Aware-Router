@@ -5,7 +5,7 @@ Yang berbeda dari DetectionTrainer bawaan hanya:
   - model = DualBranchDetector, loss = DualBranchLoss (6 item: box/cls/dfl × A/B);
   - validasi per epoch (dan best.pt) = Branch A (perilaku bawaan, jalur _predict_once);
   - opsional: mAP Branch B di val tiap N epoch -> branch_b_metrics.csv (pemantauan, tidak mengubah training);
-  - provenance.json, resep efektif (resolved_recipe.json) dan sha256 bobot akhir (weights_sha256.json);
+  - provenance.json dan sha256 bobot akhir (weights_sha256.json); resep efektif lengkap ada di args.yaml Ultralytics;
   - penjaga: AMP efektif harus sama dengan yang diminta (check_amp Ultralytics bisa diam-diam mematikannya
     bila uji AMP gagal/offline — resep berubah tanpa terlihat).
 """

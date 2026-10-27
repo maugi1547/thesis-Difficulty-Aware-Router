@@ -42,7 +42,8 @@ from .baselines import HEUR_CONF, S1Heur, StaticOut, density_head, load_static, 
 from .budget import SortedWindowQuantile, b2_decide, b2_host_overhead
 from .cocomix import (METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, boot_tests, cluster_index, holm,
                       partial_spearman_p, random_masks, top_rho)
-from .data import SMALL_PX, build_coco_gt, coco_eval, image_id_of, jdict, load_data, make_loader, small_area_of, to_dets
+from .data import (NMS_STATS, SMALL_PX, build_coco_gt, coco_eval, image_id_of, jdict, load_data, make_loader,
+                   small_area_of, to_dets)
 from .export import IOCast, Stage1, build_if, cpu_copy, export_onnx, half_copy
 from .gate import fit_gate as _fit_gate, load_gate
 from .model import FEATS_A, FEATS_B, BranchA, BranchB, Trunk, load_detector, pool4
@@ -89,7 +90,7 @@ def gflops(module, args):
 # =============================================================================
 @torch.no_grad()
 def cache_split(model, loader, device, conf, iou, max_det, dets=True, heur=True, statics=None, max_images=None,
-                log_every=1000, log=print):
+                log_every=1000, log=print, fast_nms_k=None):
     """Satu forward per gambar (letterbox persegi, batch 1, urutan loader). Returns dict list/array per gambar."""
     s2a, s2b = BranchA(model).eval(), BranchB(model).eval()
     dens = density_head(model).eval() if heur else None
@@ -107,8 +108,8 @@ def cache_split(model, loader, device, conf, iou, max_det, dets=True, heur=True,
         p3, p2, p4, p5 = model.trunk(im)
         out["feat"].append(pool4(p3, p2, p4, p5)[0].cpu().numpy())
         if dets:
-            out["detA"].append(to_dets(s2a(p3, p2, p4, p5), rp, osh, conf, iou, max_det))
-            out["detB"].append(to_dets(s2b(p3, p4, p5), rp, osh, conf, iou, max_det))
+            out["detA"].append(to_dets(s2a(p3, p2, p4, p5), rp, osh, conf, iou, max_det, fast_nms_k))
+            out["detB"].append(to_dets(s2b(p3, p4, p5), rp, osh, conf, iou, max_det, fast_nms_k))
         if dens is not None:
             na, ns = dens.counts(p3, torch.tensor([sa], device=device))
             out["heur"].append(float(dens.combine(na, ns)[0])); out["heur_n_all"].append(float(na[0]))
@@ -117,9 +118,9 @@ def cache_split(model, loader, device, conf, iou, max_det, dets=True, heur=True,
         if van is not None:
             yV, fV = static_with_feats(van, im)
             out["featV"].append(pool4(*fV)[0].cpu().numpy())
-            out["detV"].append(to_dets(yV, rp, osh, conf, iou, max_det))
+            out["detV"].append(to_dets(yV, rp, osh, conf, iou, max_det, fast_nms_k))
             yP = p2s(im)
-            out["detP"].append(to_dets(yP[0] if isinstance(yP, (tuple, list)) else yP, rp, osh, conf, iou, max_det))
+            out["detP"].append(to_dets(yP[0] if isinstance(yP, (tuple, list)) else yP, rp, osh, conf, iou, max_det, fast_nms_k))
         out["file"].append(Path(b["im_file"][0]).name)
         out["image_id"].append(image_id_of(b["im_file"][0]))
         if log_every and (i + 1) % log_every == 0:
@@ -290,12 +291,16 @@ def stage_a(spec, cfg, out, device, log=print):
     van = load_static(spec["vanilla_ckpt"], device, DATA["nc"])
     p2s = load_static(spec["p2static_ckpt"], device, DATA["nc"])
     statics = (van, p2s)
-    kw = dict(conf=cfg["conf"], iou=cfg["iou"], max_det=spec["max_det"], log=log)
+    kw = dict(conf=cfg["conf"], iou=cfg["iou"], max_det=spec["max_det"], log=log, fast_nms_k=cfg.get("fast_nms_k"))
     log(f"train: cache detektor{' + Vanilla + P2-Static' if cfg['cascade'] else ''} ({N['train']} gambar) ...")
     Ctr = cache_split(model, L["train"], device, dets=True, heur=False, statics=statics if cfg["cascade"] else None,
                       max_images=N["train"], **kw)
     gt_tr = subset_coco_gt(L["train"].dataset, NAMES, out / "gt_train.json", N["train"])
-    R_tr, _, _ = router_of(gt_tr, Ctr["detA"], Ctr["detB"], Ctr["image_id"])
+    # Fit ulang gate = pemeriksaan silang gate.json -> target dari deteksi dengan max_det GATE (gate.nms), bukan
+    # max_det analisis: NMS mengembalikan kotak terurut skor, jadi d[:gate_max_det] = keluaran NMS ber-max_det itu.
+    gmd = int(cfg.get("gate_max_det") or spec["max_det"])
+    assert gmd <= spec["max_det"], f"gate_max_det {gmd} > analysis.max_det {spec['max_det']}"
+    R_tr, _, _ = router_of(gt_tr, [d[:gmd] for d in Ctr["detA"]], [d[:gmd] for d in Ctr["detB"]], Ctr["image_id"])
     TG_tr = R_tr.targets(); del R_tr; gc.collect()
 
     gj = load_gate(spec["gate"])
@@ -315,6 +320,7 @@ def stage_a(spec, cfg, out, device, log=print):
         casc = fit_gate(Ctr["featV"], TG_c["soft_small"], cfg["gate_C"])
         log(f"gate kaskade (fitur trunk Vanilla, target Δ P2-Static − Vanilla): {casc['info']}")
     del Ctr, gt_tr; gc.collect()
+    log(f"NMS (cache train): {dict(NMS_STATS)}")
 
     log(f"val: skor gate & heuristik ({N['val']} gambar, tanpa NMS) ...")
     Cva = cache_split(model, L["val"], device, dets=False, heur=True, statics=None, **kw)
@@ -566,7 +572,7 @@ def job_main(job_path):
         with ctx():
             op()
 
-    nms = lambda y, rp, osh: to_dets(y, rp, osh, job["conf"], job["iou"], job["max_det"])
+    nms = lambda y, rp, osh: to_dets(y, rp, osh, job["conf"], job["iou"], job["max_det"], job.get("fast_nms_k"))
 
     def acc_pass(eng, ops, H):
         D = {k: [] for k in ("V", "P2S", "A", "B")}
@@ -647,7 +653,7 @@ def job_main(job_path):
             with open(job["dets_out"], "wb") as f:
                 pickle.dump({"dets": D, "rec": rec}, f)
             Path(job["out_json"]).write_text(json.dumps(res, default=float, indent=1))
-            log("akurasi selesai | paritas", par)
+            log("akurasi selesai | paritas", par, "| NMS", dict(NMS_STATS))
         lat_pass(ops, H, imgs, bi)
         Path(job["out_json"]).write_text(json.dumps(res, default=float, indent=1))
         log(f"latensi build {bi} selesai")
@@ -1024,7 +1030,8 @@ def run_model(spec, cfg, out_root, repo, log=print):
         O = A["onnx"][prec]
         job = dict(backend=cfg["backend"], precision=prec, onnx={k: O[k] for k in ("vanilla", "p2static", "a3g", "a3h", "s1g")},
                    data_yaml=spec["data_yaml"], split="test", imgsz=cfg["imgsz"], conf=cfg["conf"], iou=cfg["iou"],
-                   max_det=spec["max_det"], coco_max_dets=spec["coco_max_dets"], rho=cfg["rho"], b2_window=cfg["b2_window"],
+                   max_det=spec["max_det"], fast_nms_k=cfg.get("fast_nms_k"), coco_max_dets=spec["coco_max_dets"],
+                   rho=cfg["rho"], b2_window=cfg["b2_window"],
                    b2_min_hist=cfg["b2_min_hist"], thr_val_gate=A["thr_val_gate"], thr_val_heur=A["thr_val_heur"],
                    n_prof_images=cfg["n_prof_images"], n_warmup=cfg["n_warmup"], n_reps=cfg["n_reps"],
                    n_builds=spec.get("n_builds", cfg["n_builds"]), engine_dir=str(out / "engines"), workers=cfg.get("job_workers", 2),

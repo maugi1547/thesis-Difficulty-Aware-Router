@@ -63,10 +63,47 @@ def _scale_xyxy(b, ratio_pad, ori_shape):
     return b
 
 
-def to_dets(y, ratio_pad, ori_shape, conf=0.001, iou=0.7, max_det=300):
-    """y (1, 4+nc, N) -> array (n, 6): x, y, w, h (COCO, piksel asli), skor, category_id (= cls + 1)."""
+NMS_STATS = {"panggilan": 0, "penuh_langsung": 0, "cepat": 0, "fallback": 0}
+
+
+def nms_one(y, conf=0.001, iou=0.7, max_det=300, fast_nms_k=None):
+    """
+    NMS Ultralytics stok untuk satu gambar (multi-label, class-aware, max_nms 30000) -> tensor (n, 6) xyxy, skor, cls.
+
+    fast_nms_k = K (opsional; None = perilaku lama persis): NMS dijalankan dulu hanya pada K kandidat berskor tertinggi
+    (`max_nms=K`), dan hasilnya DIPAKAI hanya bila terbukti identik dengan NMS penuh:
+      NMS greedy hanya menekan sebuah kotak dengan kotak yang berskor lebih tinggi, sehingga kotak yang selamat di
+      antara K teratas sama persis dengan versi penuh. Bila ada >= max_det kotak selamat dan skor kotak ke-max_det
+      LEBIH BESAR (ketat) dari skor kandidat ke-K, semua kandidat yang dibuang berskor lebih rendah daripada seluruh
+      keluaran: tidak bisa menekan kotak keluaran dan tidak bisa masuk max_det teratas -> keluaran identik.
+    Bila syarat itu tidak terpenuhi -> NMS penuh (protokol asli). Satu-satunya celah: skor yang PERSIS sama (tie)
+    di antara kandidat yang bertumpuk bisa diproses dalam urutan berbeda; frekuensinya diukur scripts/check_fast_nms.py.
+    """
     from ultralytics.utils.nms import non_max_suppression
-    x = non_max_suppression(y.clone(), conf, iou, nc=0, multi_label=True, agnostic=False, max_det=max_det)[0]
+    NMS_STATS["panggilan"] += 1
+    full = lambda: non_max_suppression(y.clone(), conf, iou, nc=0, multi_label=True, agnostic=False,
+                                       max_det=max_det)[0]
+    if not fast_nms_k:
+        return full()
+    k = int(fast_nms_k)
+    sc = y[0, 4:]                                    # (nc, N); kandidat multi-label Ultralytics = skor kelas > conf
+    cand = sc[sc > conf]
+    if cand.numel() <= k:                            # tidak ada yang dibuang -> sama dengan penuh
+        NMS_STATS["penuh_langsung"] += 1
+        return full()
+    kth = torch.topk(cand, k).values[-1]
+    x = non_max_suppression(y.clone(), conf, iou, nc=0, multi_label=True, agnostic=False, max_det=max_det,
+                            max_nms=k)[0]
+    if len(x) == max_det and bool(x[max_det - 1, 4] > kth):
+        NMS_STATS["cepat"] += 1
+        return x
+    NMS_STATS["fallback"] += 1
+    return full()
+
+
+def to_dets(y, ratio_pad, ori_shape, conf=0.001, iou=0.7, max_det=300, fast_nms_k=None):
+    """y (1, 4+nc, N) -> array (n, 6): x, y, w, h (COCO, piksel asli), skor, category_id (= cls + 1)."""
+    x = nms_one(y, conf, iou, max_det, fast_nms_k)
     if not len(x):
         return np.zeros((0, 6), np.float32)
     b = _scale_xyxy(x[:, :4], ratio_pad, ori_shape)
