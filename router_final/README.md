@@ -26,6 +26,7 @@ deployment A3: satu engine TensorRT (ONNX If); thr = input engine, skor = output
 | Evaluasi | `rfinal/evaluate.py`, `rfinal/data.py` | pycocotools resolusi asli: A paksa, B paksa, router, acak dengan aktivasi sama. |
 | Evaluasi final terkunci | `rfinal/suite.py`, `rfinal/cocomix.py`, `rfinal/baselines.py`, `scripts/suite.py` | Port Tahap 4/4B: Vanilla/P2-Static, H1–H7, bootstrap berpasangan, campuran nyata, heuristik tanpa label, kaskade, latensi per komponen dan **ujung-ke-ujung**, bootstrap klaster (VisDrone), gabungan + pooling 3 seed. |
 | Profil latensi per segmen (diagnostik) | `rfinal/profile.py`, `scripts/profile_latency.py` | Salin citra / engine / salin keluaran / host untuk Vanilla, P2-Static, A3 rute A/B, rantai dua engine tanpa If, rute B salin 8.400; clock GPU dicatat (notebook sel 7c). |
+| Latensi L2 + H6 pada f_L2 (sensitivitas pasca-hasil) | `rfinal/latency_l2.py`, `scripts/profile_latency.py`, `scripts/h6_latency.py` | Citra uint8 asli → letterbox GPU → engine → NMS GPU → kotak di host (conf 0,25 satu label; 0,001 multi-label), kesepakatan keputusan L2 vs L1, lalu H6 offline dari intermediate suite dengan f dari L2 (paritas L1 vs suite dicek). |
 | Ablasi pasca-training | `rfinal/ablation.py`, `scripts/ablate.py` | G1 target, G3 fitur, G4 classifier, G5 biaya label, B anggaran (dinilai di val) + uji berpasangan bootstrap dengan Holm (`ablasi_uji.csv`); cache `cache_ablasi.pkl` untuk analisis ulang tanpa GPU (`--reuse-cache`). |
 
 ### Komponen versi lama yang dibuang
@@ -150,6 +151,25 @@ ujung-ke-ujung. B2 efisien (`rfinal/budget.py`, jendela terurut) memberi thresho
    dengan `eksperimen/tahap4b.py` di fork lama.
 4. Bagian TensorRT (build, latensi, pass ujung-ke-ujung) adalah salinan kode Tahap 4B yang sudah berjalan di T4,
    tetapi baru teruji di lingkungan stok pada run Kaggle pertama (sesi 0: `--override n_boot=50` cukup).
+
+### Latensi L2 (sensitivitas pasca-hasil, di luar kriteria terkunci)
+
+H6 utama memakai latensi **L1** (salin citra FP32 640×640 → engine → salin keluaran mentah). L2 mengukur batas sistem
+yang lebih lebar dengan engine yang sama: citra uint8 ukuran asli → letterbox GPU (meniru jalur val Ultralytics 8.3.240,
+≤ 1 level piksel, `tests/test_latency_l2.py`) → engine → keputusan router → NMS GPU (torchvision) → kotak di host.
+
+```bash
+python scripts/profile_latency.py --config configs/kitti.yaml --weights RUN/weights/last.pt --gate RUN/gate/gate.json \
+    --vanilla VAN.pt --p2static P2S.pt --out PROF                    # segmen L1 + L2 (latensi_l2.csv, l2.json)
+python scripts/h6_latency.py --config configs/kitti.yaml --suite-dir SUITE_INTER/kitti_seed42 --l2-json PROF/l2.json \
+    --out PROF/h6_l2 --ref SUITE/kitti_seed42/bootstrap_test.csv      # CPU, tanpa GPU
+```
+
+Aturan baca (ditetapkan sebelum angka L2 ada): (1) H6 utama tetap L1; L2 = sensitivitas. (2) Akurasi tidak diukur ulang:
+deteksi dan keputusan router dari pass akurasi suite, hanya fraksi campuran f yang berubah; karena itu kesepakatan
+keputusan L2 vs L1 wajib dilaporkan (< 0,99 -> keputusan L2 tidak setara, H6 L2 tidak dilaporkan sebagai uji).
+(3) conf 0,25 = deployment (dasar f_L2 yang dilaporkan); conf 0,001 = batas atas biaya NMS. (4) `h6_latency.py`
+harus mereproduksi H6 utama suite (paritas, selisih 0) sebelum baris L2 dibaca.
 
 ## Yang tetap di `eksperimen/`
 

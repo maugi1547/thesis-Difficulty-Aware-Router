@@ -8,6 +8,12 @@ Mengekspor ONNX FP16 dengan export_suite (sama dengan suite.py), membangun engin
 s1g, s2a, s2b) sebanyak --n-builds kali, lalu mengukur tiap varian dalam segmen h2d / exec / d2h / host (rfinal/profile.py).
 Keluaran: segmen.csv, selisih.csv, paritas_rantai.csv, ringkasan.txt, clock_sebelum.txt, clock_sesudah.txt,
 provenance.json. Tanpa GPU: backend ONNX Runtime FP32 di CPU (uji alur saja, angka tidak bermakna).
+
+Latensi L2 (rfinal/latency_l2.py; default aktif, --no-l2 untuk mematikan) memakai engine yang sama di sesi yang sama:
+seluruh aliran test, citra uint8 asli -> letterbox GPU -> engine -> NMS GPU -> kotak di host, untuk conf --l2-conf
+(0,25 = deployment, satu label; 0,001 = protokol evaluasi, multi-label). Keluaran tambahan: latensi_l2.csv, l2.json (T per varian, f_L2,
+aktivasi, kesepakatan keputusan L2 vs L1), keputusan_l2.csv (keputusan router per gambar). H6 pada f_L2 dihitung
+offline: scripts/h6_latency.py (membandingkan keputusan_l2.csv dengan keputusan pass akurasi suite).
 """
 import argparse
 import gc
@@ -24,6 +30,7 @@ from rfinal.data import load_data, make_loader
 from rfinal.env import load_config, provenance, require_stock_ultralytics, write_json
 from rfinal.gate import load_gate
 from rfinal.model import load_detector
+from rfinal.latency_l2 import GpuLetterbox, l1_decisions, l2_pass, make_l2_ops
 from rfinal.profile import SEGMENTS, Timer, TrtEng, derive, gpu_clock_snapshot, make_ops, profile_pass, summarize
 from rfinal.suite import _OrtEng, export_suite
 
@@ -66,6 +73,10 @@ def main():
     ap.add_argument("--n-reps", type=int, default=3)
     ap.add_argument("--n-builds", type=int, default=2)
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--no-l2", action="store_true", help="lewati latensi L2")
+    ap.add_argument("--l2-conf", type=float, nargs="+", default=[0.25, 0.001])
+    ap.add_argument("--l2-n-images", type=int, default=0, help="0 = seluruh test")
+    ap.add_argument("--l2-reps", type=int, default=3)
     a = ap.parse_args()
     require_stock_ultralytics()
     cfg = load_config(a.config)
@@ -88,13 +99,22 @@ def main():
     x0 = imgs[0].float() / 255.0
     paths, mods = export_suite(model, van, p2s, gate, x0, out / "onnx", dev, ("fp16",) if cuda else ())
     prec = "fp16" if "fp16" in paths else "fp32"
-    P, n_b = paths[prec], int(mods["n_b"])
+    P, n_a, n_b = paths[prec], int(mods["n_a"]), int(mods["n_b"])
     del model, van, p2s, mods; gc.collect()
 
     s = torch.cuda.Stream() if cuda else None
     pin = (lambda t: torch.zeros(t.shape, dtype=t.dtype).pin_memory()) if cuda else (lambda t: torch.zeros(t.shape, dtype=t.dtype))
     clock_before = gpu_clock_snapshot()
     recs, build_s, parity = {}, {}, None
+    recs_l2, l2_meta = {}, {}
+    an = cfg.get("analysis", {})
+    b2_args = dict(rho=float(cfg["budget"]["rho"]), window=int(cfg["budget"]["window"]),
+                   min_hist=int(cfg["budget"]["min_hist"]), thr0=float(load_gate(a.gate)["thr0"]))
+    nms_kw = dict(iou=float(an.get("iou", 0.7)), max_det=int(an.get("max_det", 300)))
+    files = list(loader.dataset.im_files)
+    if a.l2_n_images:
+        files = files[:a.l2_n_images]
+    dec = {"file": [Path(f).name for f in files]}                  # keputusan per gambar (dibandingkan dgn suite di h6)
     for bi in range(a.n_builds):
         print(f"[2/4] build {bi}: engine {', '.join(ENGINES)} ({prec}) ...", flush=True)
         eng = {}
@@ -113,6 +133,36 @@ def main():
             print(parity.to_string(index=False), flush=True)
         print(f"[3/4] build {bi}: profil {len(ops)} varian × {len(imgs)} gambar × {a.n_reps} ulangan ...", flush=True)
         recs[f"b{bi}"] = profile_pass(ops, H, imgs, Timer(cuda, s), a.n_warmup, a.n_reps)
+        if not a.no_l2:
+            if bi == 0:
+                print(f"[L2] keputusan acuan L1 (letterbox CPU, B2 efisien) pada {len(files)} gambar ...", flush=True)
+                ld_full = make_loader(data, "test", 1, int(cfg["train"]["imgsz"]), a.workers)
+                use_l1, files_l1 = l1_decisions(eng["a3g"], ld_full, b2_args, s, pin)
+                assert [str(x) for x in files_l1[:len(files)]] == [str(x) for x in files], "urutan berkas L1 != L2"
+                use_l1 = use_l1[:len(files)]
+                dec["L1_b0"] = use_l1
+                import cv2                                       # letterbox GPU vs letterbox Ultralytics (CPU), 16 gambar
+                chk, dd = GpuLetterbox(int(cfg["train"]["imgsz"]), dev, pin=cuda), []
+                for j, bb in enumerate(make_loader(data, "test", 1, int(cfg["train"]["imgsz"]), a.workers)):
+                    if j >= 16:
+                        break
+                    chk.stage(cv2.imread(str(files[j]))); tmp = torch.zeros_like(eng["a3g"].buf["image"]); chk.run(tmp)
+                    d = (tmp.float().cpu() - bb["img"].float() / 255.0).abs()
+                    dd.append((d.max().item() * 255, d.mean().item() * 255, (d > 1.5 / 255).float().mean().item()))
+                lb_chk = dict(maks_abs_level=max(x[0] for x in dd), rata_abs_level=float(np.mean([x[1] for x in dd])),
+                              frac_piksel_beda_lebih_1_level=float(np.mean([x[2] for x in dd])))
+                print("[L2] letterbox GPU vs CPU (skala 0–255):", lb_chk, flush=True)
+            pre = GpuLetterbox(int(cfg["train"]["imgsz"]), dev, pin=cuda)
+            for conf in a.l2_conf:
+                print(f"[L2] build {bi}, conf {conf}: {len(files)} gambar × {a.l2_reps} ulangan ...", flush=True)
+                l2ops, st, reset = make_l2_ops(eng, pre, n_a, n_b, dev, b2_args,
+                                               dict(nms_kw, conf=conf, multi_label=conf < 0.01))   # 0,001: multi-label (val)
+                rec2, use0 = l2_pass(l2ops, st, reset, pre, files, Timer(cuda, s), a.n_warmup, a.l2_reps)
+                recs_l2[f"b{bi}|{conf}"] = rec2
+                dec[f"L2_b{bi}_c{conf}"] = use0
+                l2_meta[f"b{bi}|{conf}"] = dict(aktivasi_L2=float(np.mean(use0)), aktivasi_L1=float(np.mean(use_l1)),
+                                                 kesepakatan_L2_L1=float(np.mean(np.asarray(use0) == np.asarray(use_l1))))
+                print("   ", l2_meta[f"b{bi}|{conf}"], flush=True)
         del eng, ops, H; gc.collect()
         if cuda:
             torch.cuda.empty_cache()
@@ -127,6 +177,37 @@ def main():
     parity.to_csv(out / "paritas_rantai.csv", index=False, float_format="%.3g")
     (out / "clock_sebelum.txt").write_text(clock_before); (out / "clock_sesudah.txt").write_text(clock_after)
     tab = seg.groupby(["varian", "segmen"], sort=False)["mean"].mean().unstack()[list(SEGMENTS)]
+    l2_txt = ""
+    if recs_l2:
+        rows = []
+        for key, rec2 in recs_l2.items():
+            bi, conf = key.split("|")
+            for k, d in rec2.items():
+                for sg, v in d.items():
+                    v = np.asarray(v)
+                    rows.append(dict(build=bi, conf=float(conf), varian=k, segmen=sg, mean=v.mean(), std=v.std(),
+                                     p50=np.percentile(v, 50), p95=np.percentile(v, 95), n=int(v.size)))
+        L2 = pd.DataFrame(rows)
+        L2.to_csv(out / "latensi_l2.csv", index=False, float_format="%.5f")
+        pd.DataFrame(dec).to_csv(out / "keputusan_l2.csv", index=False)
+        summ = {}
+        for conf, g in L2[L2.segmen == "wall"].groupby("conf"):
+            T = g.groupby("varian")["mean"].mean().to_dict()
+            TV, TP, TR = T["Vanilla"], T["P2-Static"], T["Router B2 efisien (L2)"]
+            meta = [v for k, v in l2_meta.items() if k.endswith(f"|{conf}")]
+            summ[str(conf)] = dict(T=T, f_L2=float(np.clip((TR - TV) / (TP - TV), 0, 1)),
+                                   hemat_vs_P2S_persen=100 * (1 - TR / TP), tambah_vs_V_persen=100 * (TR / TV - 1),
+                                   rute_B_minus_V=T["A3 rute B (potong 8.400)"] - TV, rute_A_minus_P2S=T["A3 rute A"] - TP,
+                                   potong_minus_tanpa=T["A3 rute B (potong 8.400)"] - T["A3 rute B (tanpa potong)"],
+                                   **{k: float(np.mean([m[k] for m in meta])) for k in meta[0]})
+        write_json(out / "l2.json", dict(per_conf=summ, n_images=len(files), n_reps=a.l2_reps, n_builds=a.n_builds,
+                                         nms=dict(nms_kw, multi_label="conf < 0,01"), b2=b2_args,
+                                         letterbox_vs_cpu=lb_chk))
+        tl2 = L2.groupby(["conf", "varian", "segmen"], sort=False)["mean"].mean().unstack()
+        l2_txt = "\n".join(["", "Latensi L2 (ms per gambar, rata-rata build; pre = salin uint8 + letterbox GPU, "
+                             "post = keputusan + NMS GPU + salin kotak):", tl2[["pre", "exec", "post", "host", "wall"]].round(4).to_string(), "",
+                             "Ringkasan L2 per conf:"] + [f"  conf {c}: " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else "" for k, v in d.items() if k != "T")
+                                                         for c, d in summ.items()])
     txt = "\n".join([
         f"Profil latensi per segmen ({prec}, {'TensorRT ' + str(torch.cuda.get_device_name(0)) if cuda else 'ONNX Runtime CPU'}), "
         f"{a.n_builds} build × {len(imgs)} gambar × {a.n_reps} ulangan; ms per gambar (rata-rata build):",
@@ -134,7 +215,7 @@ def main():
         "Selisih (ms; positif = varian pertama lebih lambat):", diff.round(4).to_string(index=False), "",
         f"B2 host: np.quantile {t_np:.4f} ms | jendela terurut {t_eff:.4f} ms per gambar", "",
         "Paritas rantai vs A3 (engine FP16 berbeda; selisih kecil wajar):", parity.to_string(index=False), "",
-        "Clock sebelum:", clock_before, "Clock sesudah:", clock_after])
+        "Clock sebelum:", clock_before, "Clock sesudah:", clock_after]) + l2_txt
     print(txt)
     (out / "ringkasan.txt").write_text(txt + "\n")
     write_json(out / "provenance.json", provenance(files=[cfg["_config_path"], a.weights, a.gate, a.vanilla, a.p2static],
