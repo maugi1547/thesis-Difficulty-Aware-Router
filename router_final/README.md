@@ -25,6 +25,7 @@ deployment A3: satu engine TensorRT (ONNX If); thr = input engine, skor = output
 | 4. Deployment A3 | `rfinal/export.py`, `rfinal/trt.py` | ONNX If FP16 (gate FP32) lalu TensorRT. |
 | Evaluasi | `rfinal/evaluate.py`, `rfinal/data.py` | pycocotools resolusi asli: A paksa, B paksa, router, acak dengan aktivasi sama. |
 | Evaluasi final terkunci | `rfinal/suite.py`, `rfinal/cocomix.py`, `rfinal/baselines.py`, `scripts/suite.py` | Port Tahap 4/4B: Vanilla/P2-Static, H1–H7, bootstrap berpasangan, campuran nyata, heuristik tanpa label, kaskade, latensi per komponen dan **ujung-ke-ujung**, bootstrap klaster (VisDrone), gabungan + pooling 3 seed. |
+| Profil latensi per segmen (diagnostik) | `rfinal/profile.py`, `scripts/profile_latency.py` | Salin citra / engine / salin keluaran / host untuk Vanilla, P2-Static, A3 rute A/B, rantai dua engine tanpa If, rute B salin 8.400; clock GPU dicatat (notebook sel 7c). |
 | Ablasi pasca-training | `rfinal/ablation.py`, `scripts/ablate.py` | G1 target, G3 fitur, G4 classifier, G5 biaya label, B anggaran (dinilai di val) + uji berpasangan bootstrap dengan Holm (`ablasi_uji.csv`); cache `cache_ablasi.pkl` untuk analisis ulang tanpa GPU (`--reuse-cache`). |
 
 ### Komponen versi lama yang dibuang
