@@ -6,7 +6,7 @@ Ablasi pasca-training (G1 target, G3 fitur, G4 classifier, G5 biaya label, B ang
 Pilihan desain dinilai di VAL (gain mAP_small vs acak, ρ = 0,5); seri B dilaporkan pada aliran TEST (ketahanan
 aktivasi, bukan seleksi). Keluaran: ablasi.csv + ringkasan per seri di stdout + provenance.json.
 Uji berpasangan (bootstrap per gambar, B = analysis.n_boot, seed = analysis.boot_seed, Holm per metrik):
-ablasi_uji.csv. Cache (fitur, deteksi, loss per gambar) disimpan di cache_ablasi.pkl; --reuse-cache melewati GPU:
+ablasi_uji.csv (+ ablasi_uji_klaster.csv bila analysis.cluster_by = video_prefix, mis. VisDrone). Cache (fitur, deteksi, loss per gambar) disimpan di cache_ablasi.pkl; --reuse-cache melewati GPU:
 
     python scripts/ablate.py --config configs/kitti.yaml --weights RUN/weights/last.pt --out RUN/ablasi --reuse-cache
 Ablasi deployment (A3 vs rute paksa, B2 terkunci vs efisien, FP16 vs FP32), routing acak, heuristik tanpa label,
@@ -84,6 +84,12 @@ def main():
                           seed=int(an.get("boot_seed", 20261016)), n_random=a.n_random_boot,
                           n_jobs=int(an.get("boot_jobs", 1)))
         U.to_csv(out / "ablasi_uji.csv", index=False, float_format="%.6g")
+        if an.get("cluster_by") == "video_prefix":                 # VisDrone: gambar dari video yang sama tidak independen
+            print("[uji] bootstrap klaster per video ...")
+            UK = boot_ablation({"val": va, "test": te}, masks, n_boot=int(an.get("n_boot", 1000)),
+                               seed=None, n_random=a.n_random_boot, n_jobs=int(an.get("boot_jobs", 1)),
+                               cluster_seed=int(an.get("cluster_seed", 20261017)))
+            UK.to_csv(out / "ablasi_uji_klaster.csv", index=False, float_format="%.6g")
         U["ci"] = U.apply(lambda r: f"{r['diff']:+.4f} [{r.ci_lo:+.4f}, {r.ci_hi:+.4f}] p={r.p_two_sided:.3f} "
                                     f"Holm={r.p_holm:.3f}", axis=1)
         print(U.pivot_table(index="uji", columns="metric", values="ci", aggfunc="first", sort=False).to_string())

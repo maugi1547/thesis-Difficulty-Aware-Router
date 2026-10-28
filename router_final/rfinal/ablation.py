@@ -25,7 +25,8 @@ import pandas as pd
 import torch
 
 from .budget import b2_decide, thr0_from_val
-from .cocomix import METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, holm, random_masks, top_rho
+from .cocomix import (METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, cluster_index, holm,
+                      random_masks, top_rho)
 from .data import build_coco_gt, coco_eval, jdict
 from .gate import cache_split, fit_gate, score_np
 
@@ -193,9 +194,20 @@ PAIRS = [
 ]
 
 
-def boot_ablation(splits, masks, n_boot=1000, seed=20261016, n_random=5, rand_seed=11, n_jobs=1, log=print):
+def video_groups(sp):
+    """Klaster per video sumber (token pertama nama file, sama dengan suite.py) -> posisi imgIds terurut (UnionBoot)."""
+    g = {}
+    for j, f in enumerate(sp.C["file"]):
+        g.setdefault(f.split("_")[0], []).append(int(sp.R.perm[j]))
+    return [np.asarray(v) for v in g.values()]
+
+
+def boot_ablation(splits, masks, n_boot=1000, seed=20261016, n_random=5, rand_seed=11, n_jobs=1, log=print,
+                  cluster_seed=None):
     """
     splits: {'val': Split, 'test': Split|None}; masks: {(split, varian): use_a (urutan cache)} dari run_ablation.
+    cluster_seed: None = bootstrap per gambar; angka = bootstrap KLASTER per video (video_groups, cluster_index),
+    estimasi titik identik, hanya indeks resample yang berbeda.
     Returns DataFrame: uji, metric, diff, ci_lo, ci_hi, p_two_sided, p_holm (per metrik), n_boot, aktivasi_a/b.
     """
     n_all = max((int(v.split("= ")[1]) for (sp, v) in masks if v.startswith("n = ")), default=None)
@@ -223,8 +235,14 @@ def boot_ablation(splits, masks, n_boot=1000, seed=20261016, n_random=5, rand_se
                 rand_of[k] = [f"acak_k{k}_{j}" for j in range(n_random)]
                 for j, r in enumerate(random_masks(S.n, k / S.n, n_random, rand_seed + k)):
                     mixes[rand_of[k][j]] = (U, S.R.sorted_mask(r))
-        log(f"  bootstrap {sp}: {len(mixes)} routing × {n_boot} resample ...")
-        point, smp = boot_engine(mixes, n_boot, seed, n_jobs)
+        if cluster_seed is None:
+            log(f"  bootstrap {sp}: {len(mixes)} routing × {n_boot} resample ...")
+            point, smp = boot_engine(mixes, n_boot, seed, n_jobs)
+        else:
+            G = video_groups(S)
+            log(f"  bootstrap klaster {sp}: {len(G)} video (terbesar {max(map(len, G))}/{S.n}), "
+                f"{len(mixes)} routing × {n_boot} resample ...")
+            point, smp = boot_engine(mixes, None, None, n_jobs, idx=cluster_index(G, n_boot, cluster_seed))
         gain = lambda d, v: d[v][m] - np.mean([d[r][m] for r in rand_of[int(masks[(sp, v)].sum())]], 0)
         for lab, _, a, b in P:
             for m in METRICS:

@@ -35,3 +35,18 @@ def test_boot_ablation_point_exact(tmp_path):
     d = T[(T.uji == "G1 soft_small − selisih loss") & (T.metric == "mAP_small")]["diff"].iloc[0]
     assert abs(d - (R.metrics(m1)["mAP_small"] - R.metrics(m2)["mAP_small"])) < 1e-12
     assert T.p_holm.between(0, 1).all() and (T.p_holm >= T.p_two_sided - 1e-15).all()
+
+
+def test_boot_ablation_cluster_same_point(tmp_path):
+    """Bootstrap klaster: estimasi titik identik dengan per gambar; video = token pertama nama file."""
+    gt, dA, dB, ids = _synthetic(tmp_path, n_img=60)
+    _, EA = coco_eval(gt, jdict(dA, ids)); _, EB = coco_eval(gt, jdict(dB, ids))
+    R = Router(EA, EB, ids); n = R.n
+    sp = SimpleNamespace(R=R, n=n, C={"file": [f"v{i % 7}_{i:05d}.jpg" for i in range(n)]})
+    rng = np.random.default_rng(2)
+    masks = {("val", F_SS): top_rho(rng.random(n), 0.5), ("val", F_LOSS): top_rho(rng.random(n), 0.5)}
+    kw = dict(n_boot=40, n_random=3, rand_seed=11, log=lambda *a: None)
+    T1 = boot_ablation({"val": sp}, masks, seed=0, **kw)
+    T2 = boot_ablation({"val": sp}, masks, seed=None, cluster_seed=5, **kw)
+    assert np.allclose(T1["diff"].values, T2["diff"].values, atol=1e-15)
+    assert not np.allclose(T1["ci_lo"].values, T2["ci_lo"].values)
