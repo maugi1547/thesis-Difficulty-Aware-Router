@@ -74,10 +74,13 @@ def main():
     ap.add_argument("--n-builds", type=int, default=2)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--no-l2", action="store_true", help="lewati latensi L2")
+    ap.add_argument("--l2-only", action="store_true",
+                    help="hanya L2: bangun engine vanilla, p2static, a3g saja, lewati profil per segmen L1")
     ap.add_argument("--l2-conf", type=float, nargs="+", default=[0.25, 0.001])
     ap.add_argument("--l2-n-images", type=int, default=0, help="0 = seluruh test")
     ap.add_argument("--l2-reps", type=int, default=3)
     a = ap.parse_args()
+    assert not (a.l2_only and a.no_l2), "--l2-only dan --no-l2 saling meniadakan"
     require_stock_ultralytics()
     cfg = load_config(a.config)
     out = Path(a.out); (out / "onnx").mkdir(parents=True, exist_ok=True); (out / "engines").mkdir(exist_ok=True)
@@ -116,9 +119,10 @@ def main():
         files = files[:a.l2_n_images]
     dec = {"file": [Path(f).name for f in files]}                  # keputusan per gambar (dibandingkan dgn suite di h6)
     for bi in range(a.n_builds):
-        print(f"[2/4] build {bi}: engine {', '.join(ENGINES)} ({prec}) ...", flush=True)
+        eng_names = ENGINES[:3] if a.l2_only else ENGINES
+        print(f"[2/4] build {bi}: engine {', '.join(eng_names)} ({prec}) ...", flush=True)
         eng = {}
-        for k in ENGINES:
+        for k in eng_names:
             if cuda:
                 from rfinal.trt import build_engine
                 info = build_engine(P[k], out / "engines" / f"{k}_b{bi}.engine")
@@ -126,13 +130,15 @@ def main():
                 eng[k] = TrtEng(info["engine"], dev)
             else:
                 eng[k] = _OrtEng(P[k])
-        ops, H = make_ops(eng, n_b, dev, pin)
-        H["thr"].fill_(0.0)
-        if bi == 0:
-            parity = chain_parity(eng, ops, H, imgs[:8], n_b, s)
-            print(parity.to_string(index=False), flush=True)
-        print(f"[3/4] build {bi}: profil {len(ops)} varian × {len(imgs)} gambar × {a.n_reps} ulangan ...", flush=True)
-        recs[f"b{bi}"] = profile_pass(ops, H, imgs, Timer(cuda, s), a.n_warmup, a.n_reps)
+        ops = H = None
+        if not a.l2_only:
+            ops, H = make_ops(eng, n_b, dev, pin)
+            H["thr"].fill_(0.0)
+            if bi == 0:
+                parity = chain_parity(eng, ops, H, imgs[:8], n_b, s)
+                print(parity.to_string(index=False), flush=True)
+            print(f"[3/4] build {bi}: profil {len(ops)} varian × {len(imgs)} gambar × {a.n_reps} ulangan ...", flush=True)
+            recs[f"b{bi}"] = profile_pass(ops, H, imgs, Timer(cuda, s), a.n_warmup, a.n_reps)
         if not a.no_l2:
             if bi == 0:
                 print(f"[L2] keputusan acuan L1 (letterbox CPU, B2 efisien) pada {len(files)} gambar ...", flush=True)
@@ -169,14 +175,21 @@ def main():
     clock_after = gpu_clock_snapshot()
 
     print("[4/4] ringkasan ...", flush=True)
-    seg = summarize(recs)
-    diff = derive(seg)
     t_np, t_eff = b2_host_overhead(int(cfg["budget"]["window"]), float(cfg["budget"]["rho"]))
-    seg.to_csv(out / "segmen.csv", index=False, float_format="%.5f")
-    diff.to_csv(out / "selisih.csv", index=False, float_format="%.5f")
-    parity.to_csv(out / "paritas_rantai.csv", index=False, float_format="%.3g")
     (out / "clock_sebelum.txt").write_text(clock_before); (out / "clock_sesudah.txt").write_text(clock_after)
-    tab = seg.groupby(["varian", "segmen"], sort=False)["mean"].mean().unstack()[list(SEGMENTS)]
+    l1_txt = []
+    if recs:
+        seg = summarize(recs)
+        diff = derive(seg)
+        seg.to_csv(out / "segmen.csv", index=False, float_format="%.5f")
+        diff.to_csv(out / "selisih.csv", index=False, float_format="%.5f")
+        parity.to_csv(out / "paritas_rantai.csv", index=False, float_format="%.3g")
+        tab = seg.groupby(["varian", "segmen"], sort=False)["mean"].mean().unstack()[list(SEGMENTS)]
+        l1_txt = [f"Profil latensi per segmen ({prec}, {'TensorRT ' + str(torch.cuda.get_device_name(0)) if cuda else 'ONNX Runtime CPU'}), "
+                  f"{a.n_builds} build × {len(imgs)} gambar × {a.n_reps} ulangan; ms per gambar (rata-rata build):",
+                  tab.round(4).to_string(), "",
+                  "Selisih (ms; positif = varian pertama lebih lambat):", diff.round(4).to_string(index=False), "",
+                  "Paritas rantai vs A3 (engine FP16 berbeda; selisih kecil wajar):", parity.to_string(index=False), ""]
     l2_txt = ""
     if recs_l2:
         rows = []
@@ -212,18 +225,14 @@ def main():
                              "post = keputusan + NMS GPU + salin kotak):", tl2[["pre", "exec", "post", "host", "wall"]].round(4).to_string(), "",
                              "Ringkasan L2 per conf:"] + [f"  conf {c}: " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else "" for k, v in d.items() if k != "T")
                                                          for c, d in summ.items()])
-    txt = "\n".join([
-        f"Profil latensi per segmen ({prec}, {'TensorRT ' + str(torch.cuda.get_device_name(0)) if cuda else 'ONNX Runtime CPU'}), "
-        f"{a.n_builds} build × {len(imgs)} gambar × {a.n_reps} ulangan; ms per gambar (rata-rata build):",
-        tab.round(4).to_string(), "",
-        "Selisih (ms; positif = varian pertama lebih lambat):", diff.round(4).to_string(index=False), "",
+    txt = "\n".join(l1_txt + [
+        f"Perangkat: {'TensorRT ' + str(torch.cuda.get_device_name(0)) if cuda else 'ONNX Runtime CPU'} ({prec})",
         f"B2 host: np.quantile {t_np:.4f} ms | jendela terurut {t_eff:.4f} ms per gambar", "",
-        "Paritas rantai vs A3 (engine FP16 berbeda; selisih kecil wajar):", parity.to_string(index=False), "",
         "Clock sebelum:", clock_before, "Clock sesudah:", clock_after]) + l2_txt
     print(txt)
     (out / "ringkasan.txt").write_text(txt + "\n")
     write_json(out / "provenance.json", provenance(files=[cfg["_config_path"], a.weights, a.gate, a.vanilla, a.p2static],
-                                                   extra=dict(n_images=len(imgs), n_warmup=a.n_warmup, n_reps=a.n_reps,
+                                                   extra=dict(n_images=len(imgs), n_warmup=a.n_warmup, n_reps=a.n_reps, l2_only=a.l2_only,
                                                               n_builds=a.n_builds, precision=prec, build_s=build_s,
                                                               b2_host_ms=dict(np_quantile=t_np, efisien=t_eff))))
     print("✅", out)

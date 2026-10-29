@@ -21,7 +21,7 @@ import _path  # noqa: F401
 import numpy as np
 import pandas as pd
 
-from rfinal.cocomix import FastUnionBoot, UnionBoot, boot_engine, boot_tests, cluster_index, random_masks
+from rfinal.cocomix import METRICS, FastUnionBoot, UnionBoot, boot_engine, boot_tests, cluster_index, random_masks
 from rfinal.env import load_config, provenance, write_json
 from rfinal.suite import _STATE, H6_UTAMA, router_of, spec_seed
 from suite import suite_cfg
@@ -92,6 +92,12 @@ def main():
         tests.append((lab, "router", grp))
     point, samples = boot_engine(mixes, cfg["n_boot"], cfg["boot_seed"], cfg["boot_jobs"])
     BS = boot_tests(point, samples, tests)
+    npz = {}                                                    # sampel selisih per resample -> pooling antar-seed
+    for lab, a_, bs in tests:
+        for m in METRICS:
+            npz[f"{lab}|{m}"] = (samples[a_][m] - np.nanmean(np.stack([samples[b][m] for b in bs]), 0)).astype(np.float32)
+            npz[f"titik|{lab}|{m}"] = np.float64(point[a_][m] - np.nanmean([point[b][m] for b in bs]))
+    np.savez_compressed(out / "h6_boot.npz", **npz)
     BS["f"] = BS.uji.map(fs)
     BS["bootstrap"] = "per gambar"
     tabs = [BS]
