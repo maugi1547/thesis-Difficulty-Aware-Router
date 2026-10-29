@@ -23,7 +23,7 @@ import pandas as pd
 
 from rfinal.cocomix import FastUnionBoot, UnionBoot, boot_engine, boot_tests, cluster_index, random_masks
 from rfinal.env import load_config, provenance, write_json
-from rfinal.suite import H6_UTAMA, router_of, spec_seed
+from rfinal.suite import _STATE, H6_UTAMA, router_of, spec_seed
 from suite import suite_cfg
 
 L1_LABEL = "H6 utama (L1, ulang)"
@@ -57,6 +57,7 @@ def main():
     te, rec, D = A["test"], J["rec"], J["dets"]
     assert rec["file"] == te["file"], "urutan gambar job != cache test"
     ids, n, seed = te["image_id"], len(te["image_id"]), int(spec_seed(A))
+    _STATE["max_dets"] = tuple(A["spec"]["coco_max_dets"])          # = analyze suite (VisDrone: 500)
     from pycocotools.coco import COCO
     with contextlib.redirect_stdout(io.StringIO()):
         gt = COCO(str(D_ / "gt_test.json"))

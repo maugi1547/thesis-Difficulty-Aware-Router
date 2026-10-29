@@ -39,7 +39,7 @@ from rfinal.cocomix import (METRICS, FastUnionBoot, UnionBoot, _pval, boot_engin
                             random_masks, top_rho)
 from rfinal.env import load_config, provenance, write_json
 from rfinal.gate import score_np
-from rfinal.suite import H6_UTAMA, router_of, spec_seed
+from rfinal.suite import _STATE, H6_UTAMA, router_of, spec_seed
 from suite import suite_cfg
 
 GRID = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -101,6 +101,7 @@ def cmd_run(a):
     assert par_dec == 1.0, f"keputusan B2 ulang != suite ({par_dec:.4f})"
 
     L, T, f = lat_model(res)
+    _STATE["max_dets"] = tuple(A["spec"]["coco_max_dets"])          # = analyze suite (VisDrone: 500)
     from pycocotools.coco import COCO
     with contextlib.redirect_stdout(io.StringIO()):
         gt = COCO(str(D_ / "gt_test.json"))
@@ -129,18 +130,18 @@ def cmd_run(a):
         info.append(dict(rho=rho, aktivasi_test=act, thr0_val=float(thr0), T_router_model_ms=T(a_lat), f=fr,
                          hemat_vs_P2S_persen=100 * (1 - T(a_lat) / L["TP"]),
                          tambah_vs_V_persen=100 * (T(a_lat) / L["TV"] - 1)))
-    print(f"bootstrap: {len(mixes)} routing × {cfg['n_boot']} resample ...", flush=True)
-    point, samples = boot_engine(mixes, cfg["n_boot"], cfg["boot_seed"], cfg["boot_jobs"])
+    fast_ = {}
+    fmix = {}
+    for k_, (U_, u_) in mixes.items():
+        fast_.setdefault(id(U_), FastUnionBoot(U_)); fmix[k_] = (fast_[id(U_)], u_)
+    print(f"bootstrap: {len(mixes)} routing × {cfg['n_boot']} resample ({'cepat' if a.fast else 'UnionBoot'}) ...", flush=True)
+    point, samples = boot_engine(fmix if a.fast else mixes, cfg["n_boot"], cfg["boot_seed"], cfg["boot_jobs"])
     boots = {"per gambar": (point, samples)}
     if cfg.get("cluster_by") == "video_prefix":
         pos_ = {iid: j for j, iid in enumerate(sorted(ids))}
         grp_ = {}
         for f_, iid in zip(te["file"], ids):
             grp_.setdefault(f_.split("_")[0], []).append(pos_[iid])
-        fast_ = {}
-        fmix = {}
-        for k_, (U_, u_) in mixes.items():
-            fast_.setdefault(id(U_), FastUnionBoot(U_)); fmix[k_] = (fast_[id(U_)], u_)
         _, S_cl = boot_engine(fmix, None, None, cfg["boot_jobs"],
                               idx=cluster_index([np.asarray(v) for v in grp_.values()], cfg["n_boot"], cfg["cluster_seed"]))
         boots["klaster video"] = (point, S_cl)
@@ -226,6 +227,7 @@ def main():
     r.add_argument("--ref", default=None, help="bootstrap_test.csv suite (paritas baris ρ terkunci)")
     r.add_argument("--grid", type=float, nargs="+", default=GRID)
     r.add_argument("--n-boot", type=int, default=None)
+    r.add_argument("--fast", action="store_true", help="FastUnionBoot juga untuk bootstrap per gambar (VisDrone)")
     p = sub.add_parser("pool")
     p.add_argument("--dirs", nargs="+", required=True); p.add_argument("--out", required=True)
     a = ap.parse_args()
