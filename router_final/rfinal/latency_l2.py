@@ -124,8 +124,11 @@ def make_l2_ops(eng, pre, n_a, n_b, dev, b2_args, nms_kw):
     ops["A3 rute B (potong 8.400)"] = forced(0.0, n_b)
     ops["A3 rute B (tanpa potong)"] = forced(0.0, n_a)
 
-    def router(mark, s):
-        b2 = state["b2"]
+    PRIMARY, SYNC = "Router B2 efisien (L2)", "Router B2 (L2, sync keputusan)"
+
+    def router_sync(mark, s):
+        """Varian naif: host menunggu keputusan (sync) lalu memilih jumlah anchor NMS (n_a / n_b)."""
+        b2 = state["b2"][SYNC]
         hthr.fill_(float(b2.threshold()))                          # ambang B2 di host (di dalam timer dinding)
         e.bind("mode", modes[-1.0])
         mark(); pre.run(e.buf["image"]); e.buf["thr"].copy_(hthr, non_blocking=True)
@@ -136,14 +139,31 @@ def make_l2_ops(eng, pre, n_a, n_b, dev, b2_args, nms_kw):
             s.synchronize()                                        # keputusan & skor dibutuhkan host
         use = bool(float(hu[0]) > 0.5)
         b2.push(float(hs[0]))
-        state["use"].append(use)
+        state["use"][SYNC].append(use)
         nms_gpu(e.buf["y"], n_a if use else n_b, pre.meta, **nms_kw).cpu()
         mark()
-    ops["Router B2 efisien (L2)"] = router
+
+    def router(mark, s):
+        """Deployment: tanpa sync di tengah. NMS selalu atas n_a anchor (rute B: anchor > n_b = padding nol, skor 0 <
+        conf -> kotak identik dengan NMS atas n_b; tests/test_latency_l2.py), keputusan & skor ikut salinan kotak."""
+        b2 = state["b2"][PRIMARY]
+        hthr.fill_(float(b2.threshold()))
+        e.bind("mode", modes[-1.0])
+        mark(); pre.run(e.buf["image"]); e.buf["thr"].copy_(hthr, non_blocking=True)
+        mark(); e.run(s)
+        mark()
+        det = nms_gpu(e.buf["y"], n_a, pre.meta, **nms_kw)
+        hu.copy_(e.buf["use_a"], non_blocking=True); hs.copy_(e.buf["score"], non_blocking=True)
+        det.cpu()                                                  # satu sinkronisasi, sama dengan varian statis
+        mark()
+        state["use"][PRIMARY].append(bool(float(hu[0]) > 0.5))
+        b2.push(float(hs[0]))
+    ops[PRIMARY] = router
+    ops[SYNC] = router_sync
 
     def reset():
-        state["b2"] = B2Controller(**b2_args, efficient=True)
-        state["use"] = []
+        state["b2"] = {k: B2Controller(**b2_args, efficient=True) for k in (PRIMARY, SYNC)}
+        state["use"] = {k: [] for k in (PRIMARY, SYNC)}
     return ops, state, reset
 
 
@@ -168,7 +188,8 @@ def l2_pass(ops, state, reset, pre, files, timer, n_warmup=30, n_reps=3, log=pri
                 for sgm, v in r.items():
                     rec[k][sgm].append(v)
         if rep == 0:
-            use0 = list(state["use"])
+            use0 = list(state["use"]["Router B2 efisien (L2)"])
+            assert use0 == state["use"]["Router B2 (L2, sync keputusan)"], "keputusan dua varian router berbeda"
         log(f"  L2 ulangan {rep + 1}/{n_reps} selesai ({time.perf_counter() - t0:.0f} s)")
     # segmen Timer: h2d = pre (salin uint8 + letterbox GPU), d2h = post (keputusan + NMS + salin kotak)
     for k in rec:

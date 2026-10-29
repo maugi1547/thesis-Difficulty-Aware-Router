@@ -199,6 +199,10 @@ def main():
                                    hemat_vs_P2S_persen=100 * (1 - TR / TP), tambah_vs_V_persen=100 * (TR / TV - 1),
                                    rute_B_minus_V=T["A3 rute B (potong 8.400)"] - TV, rute_A_minus_P2S=T["A3 rute A"] - TP,
                                    potong_minus_tanpa=T["A3 rute B (potong 8.400)"] - T["A3 rute B (tanpa potong)"],
+                                   router_sync_minus_router=T.get("Router B2 (L2, sync keputusan)", np.nan) - TR,
+                                   router_minus_komposit=TR - (float(np.mean([m["aktivasi_L2"] for m in meta])) * T["A3 rute A"]
+                                                               + (1 - float(np.mean([m["aktivasi_L2"] for m in meta])))
+                                                               * T["A3 rute B (tanpa potong)"]),
                                    **{k: float(np.mean([m[k] for m in meta])) for k in meta[0]})
         write_json(out / "l2.json", dict(per_conf=summ, n_images=len(files), n_reps=a.l2_reps, n_builds=a.n_builds,
                                          nms=dict(nms_kw, multi_label="conf < 0,01"), b2=b2_args,
