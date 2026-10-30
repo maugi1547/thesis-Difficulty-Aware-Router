@@ -20,7 +20,8 @@ def main():
     ap.add_argument("--dirs", nargs="+", required=True); ap.add_argument("--out", required=True)
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    Z = {Path(d).name: np.load(Path(d) / "h6_boot.npz") for d in a.dirs}
+    Z = {str(Path(d)): np.load(Path(d) / "h6_boot.npz") for d in a.dirs}      # kunci = path penuh (nama folder bisa sama)
+    assert len(Z) == len(a.dirs), "folder ganda di --dirs"
     keys = sorted(set.intersection(*[{k for k in z.files if not k.startswith("titik|")} for z in Z.values()]))
     assert len({len(z[keys[0]]) for z in Z.values()}) == 1, "jumlah resample berbeda"
     rows = []
