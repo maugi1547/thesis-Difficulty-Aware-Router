@@ -78,7 +78,7 @@ def main():
         agree_suite = {c: float(np.mean(K[c].astype(bool).to_numpy() == ref_dec)) for c in K.columns if c != "file"}
     fs, agree = {L1_LABEL: f1}, {L1_LABEL: 1.0}
     for conf, d in L2["per_conf"].items():
-        lab = f"H6 L2 (NMS conf {conf})"
+        lab = d.get("label") or f"H6 L2 (NMS conf {conf})"           # A12: label dari a12.json
         fs[lab] = float(d["f_L2"])
         cols = [c for c in agree_suite if c.startswith("L2_") and c.endswith(f"_c{conf}")]
         agree[lab] = (min(agree_suite[c] for c in cols) if cols else float(d.get("kesepakatan_L2_L1", float("nan"))))
