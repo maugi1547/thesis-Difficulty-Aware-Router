@@ -7,8 +7,8 @@ import copy
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
@@ -90,7 +90,7 @@ class Detect(nn.Module):
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
-        
+
         # 🚨 TESIS: Simpan referensi arsitektur keluaran konvolusi untuk Bypass
         self.c2_out_channels = 4 * self.reg_max
         self.c3_out_channels = self.nc
@@ -121,7 +121,7 @@ class Detect(nn.Module):
         if self.end2end:
             return self.forward_end2end(x)
 
-        shape = x[0].shape  # BCHW (Batch, Channels, Height, Width)
+        x[0].shape  # BCHW (Batch, Channels, Height, Width)
 
         for i in range(self.nl):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
