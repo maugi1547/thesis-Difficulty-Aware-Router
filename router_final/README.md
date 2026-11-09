@@ -3,6 +3,10 @@
 Kode bersih untuk sistem final tesis. Folder ini berdiri sendiri dan berjalan di atas **Ultralytics stok 8.3.240
 (PyPI)**. Folder ini **tidak** memakai fork `ultralytics/` di root repo, karena fork itu masih memuat router lama.
 
+## Dokumentasi
+
+Penjelasan lengkap cara kerja kode — peta folder, alur pipeline, tiap modul, rumus, keputusan desain, dan pengujian — ada di [`docs/Penjelasan_Kode_Program_router_final.pdf`](docs/Penjelasan_Kode_Program_router_final.pdf) (versi 2 November 2026).
+
 ## Sistem
 
 ```
