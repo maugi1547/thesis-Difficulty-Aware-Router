@@ -1,0 +1,90 @@
+{
+ "pemilihan_val": {
+  "seed": 20261112,
+  "n_draws": 20000,
+  "n_diterima": 13017,
+  "undian_terpilih": 17353,
+  "skor": 0.014182489550914987,
+  "target": 742,
+  "tol": 0.03,
+  "min_rek": 20,
+  "p_kecil_val": 0.5188679245283019,
+  "p_kecil_latih": 0.5235690235690236,
+  "m_kecil_val": 0.8962264150943396,
+  "m_kecil_latih": 0.8976430976430977,
+  "m_obj_val": 5.183288409703504,
+  "m_obj_latih": 5.224579124579124
+ },
+ "ringkasan": {
+  "train": {
+   "citra": 2970,
+   "rekaman": 73,
+   "kish": 18.55,
+   "terbesar": "2011_09_26_drive_0061_sync",
+   "citra_terbesar": 275,
+   "per_tanggal": {
+    "2011_09_26": 2595,
+    "2011_09_28": 272,
+    "2011_09_29": 103
+   },
+   "dari_split_asal": {
+    "test": 389,
+    "train": 2069,
+    "val": 512
+   },
+   "obj_per_citra": 5.2246,
+   "kecil_per_citra": 0.8976,
+   "p_citra_berobjek_kecil": 0.5236
+  },
+  "val": {
+   "citra": 742,
+   "rekaman": 23,
+   "kish": 7.51,
+   "terbesar": "2011_09_26_drive_0117_sync",
+   "citra_terbesar": 198,
+   "per_tanggal": {
+    "2011_09_26": 569,
+    "2011_09_28": 173
+   },
+   "dari_split_asal": {
+    "test": 98,
+    "train": 511,
+    "val": 133
+   },
+   "obj_per_citra": 5.1833,
+   "kecil_per_citra": 0.8962,
+   "p_citra_berobjek_kecil": 0.5189
+  },
+  "test": {
+   "citra": 3769,
+   "rekaman": 45,
+   "kish": 13.95,
+   "terbesar": "2011_09_26_drive_0101_sync",
+   "citra_terbesar": 577,
+   "per_tanggal": {
+    "2011_09_26": 2893,
+    "2011_09_28": 325,
+    "2011_09_29": 255,
+    "2011_10_03": 296
+   },
+   "dari_split_asal": {
+    "test": 513,
+    "train": 2604,
+    "val": 652
+   },
+   "obj_per_citra": 5.3685,
+   "kecil_per_citra": 0.9193,
+   "p_citra_berobjek_kecil": 0.5813
+  },
+  "irisan_rekaman": {
+   "train&val": 0,
+   "train&test": 0,
+   "val&test": 0
+  }
+ },
+ "sha256": {
+  "chen_train.txt": "b6417a1d9b18c8fdb085128e633d28ff321b7674a6d1b3841b8f43d865b281cb",
+  "chen_val.txt": "657ac4bcc1e156e5b106a4ca18e1f88e012787ea1d2b5d0adeea97fee903fa86",
+  "kitti_peta_rekaman.csv": "52007b6b47bdc80e74745ff4c2be5590e9fbb2cc5b36b589902465f9ca920665"
+ }
+}

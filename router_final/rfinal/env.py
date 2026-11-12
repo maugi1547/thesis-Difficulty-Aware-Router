@@ -128,5 +128,9 @@ def load_config(path):
     cfg = yaml.safe_load(path.read_text())
     m = Path(cfg["model"])
     cfg["model"] = str(m if m.is_absolute() else (path.parent / m).resolve())
+    an = cfg.get("analysis") or {}
+    if an.get("cluster_map"):                       # peta klaster (A6: rekaman KITTI) relatif terhadap configs/
+        c = Path(an["cluster_map"])
+        an["cluster_map"] = str(c if c.is_absolute() else (path.parent / c).resolve())
     cfg["_config_path"] = str(path.resolve())
     return cfg

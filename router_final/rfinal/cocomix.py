@@ -410,6 +410,33 @@ def pooled_tests(dirs, tests_wanted):
     return pd.DataFrame(rows)
 
 
+CLUSTER_BY = ("video_prefix", "map_csv")
+_MAP_CACHE = {}
+
+
+def cluster_labels(files, cluster_by, cluster_map=None, key_col="image_id", cluster_col="rekaman"):
+    """
+    Label klaster per gambar (urutan `files` = nama berkas):
+      video_prefix: token pertama nama berkas sebelum '_' (VisDrone: ID video sumber);
+      map_csv:      kolom `cluster_col` CSV `cluster_map` untuk stem berkas (KITTI: rekaman mentah dari pemetaan devkit,
+                    configs/a6/kitti_peta_rekaman.csv). Gambar yang tidak ada di peta -> galat (tidak diam-diam jadi klaster sendiri).
+    """
+    names = [Path(f).name for f in files]
+    if cluster_by == "video_prefix":
+        return [n.split("_")[0] for n in names]
+    assert cluster_by == "map_csv" and cluster_map, f"cluster_by tidak dikenal / cluster_map kosong: {cluster_by}"
+    key = (str(cluster_map), key_col, cluster_col)
+    if key not in _MAP_CACHE:
+        import pandas as pd
+        M = pd.read_csv(cluster_map, dtype=str)
+        _MAP_CACHE[key] = dict(zip(M[key_col], M[cluster_col]))
+    mp = _MAP_CACHE[key]
+    stems = [Path(n).stem for n in names]
+    miss = [s for s in stems if s not in mp]
+    assert not miss, f"{len(miss)} gambar tidak ada di {cluster_map}: {miss[:5]}"
+    return [mp[s] for s in stems]
+
+
 def cluster_index(groups, n_boot, seed):
     """Indeks resample bootstrap KLASTER: groups = list array posisi imgIds per klaster (mis. per video VisDrone)."""
     rng = np.random.default_rng(seed)

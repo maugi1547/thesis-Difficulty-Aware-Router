@@ -84,11 +84,12 @@ def main():
                           seed=int(an.get("boot_seed", 20261016)), n_random=a.n_random_boot,
                           n_jobs=int(an.get("boot_jobs", 1)))
         U.to_csv(out / "ablasi_uji.csv", index=False, float_format="%.6g")
-        if an.get("cluster_by") == "video_prefix":                 # VisDrone: gambar dari video yang sama tidak independen
-            print("[uji] bootstrap klaster per video ...")
+        if an.get("cluster_by") in ("video_prefix", "map_csv"):   # VisDrone (video) / KITTI A6 (rekaman): gambar tidak independen
+            print(f"[uji] bootstrap klaster ({an['cluster_by']}) ...")
             UK = boot_ablation({"val": va, "test": te}, masks, n_boot=int(an.get("n_boot", 1000)),
                                seed=None, n_random=a.n_random_boot, n_jobs=int(an.get("boot_jobs", 1)),
-                               cluster_seed=int(an.get("cluster_seed", 20261017)))
+                               cluster_seed=int(an.get("cluster_seed", 20261017)),
+                               cluster_by=an["cluster_by"], cluster_map=an.get("cluster_map"))
             UK.to_csv(out / "ablasi_uji_klaster.csv", index=False, float_format="%.6g")
         U["ci"] = U.apply(lambda r: f"{r['diff']:+.4f} [{r.ci_lo:+.4f}, {r.ci_hi:+.4f}] p={r.p_two_sided:.3f} "
                                     f"Holm={r.p_holm:.3f}", axis=1)

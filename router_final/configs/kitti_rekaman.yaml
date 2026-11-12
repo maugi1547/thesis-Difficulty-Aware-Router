@@ -1,0 +1,86 @@
+# A6 (pasca-hasil, 12 Nov 2026): KITTI 2 kelas pada split PER REKAMAN (Chen/3DOP + val' per rekaman).
+# IDENTIK dengan configs/kitti.yaml kecuali: name, data, expected_counts, dan bootstrap klaster per rekaman (analysis).
+# Split dibuat oleh tools/a6_split_rekaman.py build (berkas terkunci configs/a6/kitti_split_rekaman.csv).
+# Semua hiperparameter (resep training, bobot 0,7, gate C, ρ, window, min_hist, ambang H) TIDAK diubah dan TIDAK dipilih ulang.
+# Semua skrip membaca file ini; sha256-nya tercatat di provenance.json setiap run.
+
+name: kitti_rekaman
+model: yolov8n-dualbranch-p2.yaml          # relatif terhadap folder configs/
+data: /kaggle/working/kitti_rekaman/kitti_rekaman_2class.yaml   # dibuat tools/a6_split_rekaman.py build
+expected_counts: {train: 2970, val: 742, test: 3769}   # Chen-train − val' / val' (23 rekaman) / Chen-val (45 rekaman)
+
+# --- Tahap 1: training detektor (argumen Ultralytics; sama dengan M0 kecuali komponen router yang dibuang) ---
+train:
+  epochs: 100
+  batch: 16
+  imgsz: 640
+  optimizer: AdamW
+  lr0: 0.002
+  cos_lr: true
+  weight_decay: 0.0005
+  device: 0
+  amp: true
+  workers: 4                # ikut menentukan aliran augmentasi -> bagian dari resep
+  deterministic: true
+  save_period: 10
+  project: /kaggle/working/runs_final
+  # argumen Ultralytics lain = default 8.3.240 (dicatat lengkap di args.yaml setiap run)
+seeds: [42, 7, 2026]
+loss:
+  branch_b_weight: 0.7      # L = L_A + 0.7 · L_B
+monitor:
+  branch_b_val_every: 10    # mAP Branch B di val tiap N epoch (pemantauan saja; 0 = mati)
+checkpoint: last.pt         # checkpoint yang dipakai tahap berikutnya (bukan best.pt: best dipilih dari mAP Branch A; selisih dilaporkan oleh scripts/check_checkpoint.py)
+
+# --- Tahap 2: gate post-hoc (detektor beku) ---
+gate:
+  fit_split: train          # target & fit di train; val hanya untuk threshold awal B2
+  target: soft_small        # y = 1[Δ soft-recall objek kecil (A − B) > 0], IoU 0.5, area COCO < 32² px asli
+  C: 0.001                  # StandardScaler + LogisticRegression(C, lbfgs, max_iter 5000), dilipat jadi 1 Gemm
+  max_iter: 5000
+  nms: {conf: 0.001, iou: 0.7, max_det: 300}
+
+# --- Tahap 3: kendali anggaran B2 ---
+budget:
+  rho: 0.5                  # target aktivasi Branch A
+  window: 200               # threshold = kuantil (1 − ρ) dari 200 skor sebelumnya
+  min_hist: 20              # < 20 riwayat -> threshold awal = kuantil (1 − ρ) skor val
+
+# --- Evaluasi (pycocotools, koordinat asli) ---
+eval:
+  coco_max_dets: [1, 10, 100]   # KITTI ±5 objek/gambar; dataset padat (VisDrone) butuh mis. [1, 10, 500]
+
+# --- Tahap 4: deployment A3 (satu engine TensorRT, ONNX If) ---
+deploy:
+  opset: 17
+  precision: fp16           # trunk & Stage 2 FP16 (I/O FP32); pooling + Gemm gate FP32
+
+# --- Evaluasi final terkunci + latensi ujung-ke-ujung (rfinal/suite.py; = protokol Tahap 4/4B) ---
+analysis:
+  max_det: 300                # NMS max_det per gambar (KITTI 300, VisDrone 500)
+  conf: 0.001
+  iou: 0.7
+  gate_C: 0.001             # fit ulang gate dari cache train = pemeriksaan silang gate.json
+  b2_orders: 5              # B2 pada 5 urutan acak test (ketahanan aktivasi)
+  h5_ms: 0.15               # H5: rute A − P2-Static dan rute B − Vanilla ≤ 0,15 ms
+  h7_dev: 0.05              # H7: |aktivasi test − ρ| ≤ 0,05
+  n_boot: 1000
+  n_draws: 5                # undian acak per pembanding utama
+  n_draws_sekunder: 3
+  boot_seed: 20261016       # SAMA untuk semua model -> pooling 3 seed KITTI per resample
+  boot_jobs: 4
+  cascade: true             # pembanding kaskade bergate Vanilla -> P2-Static
+  fp32_check: true          # pemeriksaan silang PyTorch FP32
+  precision: fp16
+  backend: trt              # trt (Kaggle T4) | ort (uji lokal CPU)
+  n_builds: 2               # build engine per model (variasi latensi antar-build)
+  n_prof_images: 300        # latensi per komponen
+  n_warmup: 30
+  n_reps: 3                 # juga dipakai pass ujung-ke-ujung (seluruh test, urutan aliran)
+  n_onnx_check: 4
+  trt_timeout_s: 10800
+  job_workers: 2
+  # A6: bootstrap KLASTER per rekaman mentah (45 rekaman uji, Kish ≈ 14) di samping per gambar; seed = VisDrone/A2
+  cluster_by: map_csv
+  cluster_map: a6/kitti_peta_rekaman.csv   # relatif terhadap configs/
+  cluster_seed: 20261017

@@ -194,16 +194,18 @@ PAIRS = [
 ]
 
 
-def video_groups(sp):
-    """Klaster per video sumber (token pertama nama file, sama dengan suite.py) -> posisi imgIds terurut (UnionBoot)."""
+def video_groups(sp, cluster_by="video_prefix", cluster_map=None):
+    """Klaster per video sumber / rekaman (cocomix.cluster_labels, sama dengan suite.py) -> posisi imgIds terurut (UnionBoot)."""
+    from .cocomix import cluster_labels
     g = {}
-    for j, f in enumerate(sp.C["file"]):
-        g.setdefault(f.split("_")[0], []).append(int(sp.R.perm[j]))
-    return [np.asarray(v) for v in g.values()]
+    for j, c in enumerate(cluster_labels(sp.C["file"], cluster_by, cluster_map)):
+        g.setdefault(c, []).append(int(sp.R.perm[j]))
+    keys = sorted(g) if cluster_by == "map_csv" else list(g)      # map_csv: nama terurut (= suite.py); video_prefix: tetap
+    return [np.asarray(g[k]) for k in keys]
 
 
 def boot_ablation(splits, masks, n_boot=1000, seed=20261016, n_random=5, rand_seed=11, n_jobs=1, log=print,
-                  cluster_seed=None):
+                  cluster_seed=None, cluster_by="video_prefix", cluster_map=None):
     """
     splits: {'val': Split, 'test': Split|None}; masks: {(split, varian): use_a (urutan cache)} dari run_ablation.
     cluster_seed: None = bootstrap per gambar; angka = bootstrap KLASTER per video (video_groups, cluster_index),
@@ -239,7 +241,7 @@ def boot_ablation(splits, masks, n_boot=1000, seed=20261016, n_random=5, rand_se
             log(f"  bootstrap {sp}: {len(mixes)} routing × {n_boot} resample ...")
             point, smp = boot_engine(mixes, n_boot, seed, n_jobs)
         else:
-            G = video_groups(S)
+            G = video_groups(S, cluster_by, cluster_map)
             log(f"  bootstrap klaster {sp}: {len(G)} video (terbesar {max(map(len, G))}/{S.n}), "
                 f"{len(mixes)} routing × {n_boot} resample ...")
             point, smp = boot_engine(mixes, None, None, n_jobs, idx=cluster_index(G, n_boot, cluster_seed))

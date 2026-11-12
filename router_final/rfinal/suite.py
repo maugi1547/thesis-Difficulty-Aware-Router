@@ -40,7 +40,8 @@ import torch
 
 from .baselines import HEUR_CONF, S1Heur, StaticOut, density_head, load_static, static_with_feats
 from .budget import SortedWindowQuantile, b2_decide, b2_host_overhead
-from .cocomix import (METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, boot_tests, cluster_index, holm,
+from .cocomix import (CLUSTER_BY, METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, boot_tests, cluster_index,
+                      cluster_labels, holm,
                       partial_spearman_p, random_masks, top_rho)
 from .data import (NMS_STATS, SMALL_PX, build_coco_gt, coco_eval, image_id_of, jdict, load_data, make_loader,
                    small_area_of, to_dets)
@@ -831,13 +832,15 @@ def analyze(A, res, J, cfg, out, log=print):
     (out / "boot_point.json").write_text(json.dumps(point, indent=1, default=float))
     (out / "boot_tests.json").write_text(json.dumps(tests, indent=1))
 
-    # ---- bootstrap KLASTER (VisDrone: ID video sumber = token pertama nama file; dikunci sebelum run ulang)
-    if cfg.get("cluster_by") == "video_prefix":
+    # ---- bootstrap KLASTER (VisDrone: ID video sumber = token pertama nama file; KITTI A6: rekaman mentah dari peta devkit)
+    if cfg.get("cluster_by") in CLUSTER_BY:
         tk = time.perf_counter()
         pos_ = {iid: j for j, iid in enumerate(sorted(ids))}
         grp_ = {}
-        for f_, iid in zip(te["file"], ids):
-            grp_.setdefault(f_.split("_")[0], []).append(pos_[iid])
+        for c_, iid in zip(cluster_labels(te["file"], cfg["cluster_by"], cfg.get("cluster_map")), ids):
+            grp_.setdefault(c_, []).append(pos_[iid])
+        if cfg["cluster_by"] == "map_csv":           # urutan klaster = nama terurut (= scripts/cluster_boot.py groups_of -> indeks
+            grp_ = {k_: grp_[k_] for k_ in sorted(grp_)}  # resample identik; video_prefix tetap urutan kemunculan, = run VisDrone)
         G_ = [np.asarray(v) for v in grp_.values()]; sizes = np.array([len(g) for g in G_])
         fast_, fmix = {}, {}
         for k_, (U_, u_) in mixes.items():
