@@ -84,3 +84,15 @@ def test_build_symlink_dataset_sintetis(tmp_path, monkeypatch):
     assert link.is_symlink() and link.resolve() == (src / "images" / some.split_asal / f"{some.image_id}.png").resolve()
     y = (out / "kitti_rekaman_2class.yaml").read_text()
     assert f"path: {out.resolve()}" in y and "test: images/test" in y and "1: Vehicle" in y
+
+
+def test_cluster_groups_urutan():
+    """map_csv: klaster terurut nama (= cluster_boot.py); video_prefix: urutan kemunculan (= run VisDrone asli)."""
+    from rfinal.cocomix import cluster_groups
+    cfg = load_config(ROOT / "configs" / "kitti_rekaman.yaml")["analysis"]
+    files = ["000001.png", "000000.png", "000002.png"]          # drive_0101, drive_0106, drive_0086
+    ids = [1, 0, 2]
+    G = cluster_groups(files, ids, cfg)
+    assert [g.tolist() for g in G] == [[2], [1], [0]]             # 0086 < 0101 < 0106; posisi = urutan imgIds terurut
+    G2 = cluster_groups(["b_1.jpg", "a_1.jpg", "b_2.jpg"], [10, 11, 12], {"cluster_by": "video_prefix"})
+    assert [g.tolist() for g in G2] == [[0, 2], [1]]

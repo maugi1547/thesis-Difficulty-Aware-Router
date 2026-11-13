@@ -21,7 +21,7 @@ import _path  # noqa: F401
 import numpy as np
 import pandas as pd
 
-from rfinal.cocomix import METRICS, FastUnionBoot, UnionBoot, boot_engine, boot_tests, cluster_index, random_masks
+from rfinal.cocomix import METRICS, FastUnionBoot, UnionBoot, boot_engine, boot_tests, CLUSTER_BY, cluster_groups, cluster_index, random_masks
 from rfinal.env import load_config, provenance, write_json
 from rfinal.suite import _STATE, H6_UTAMA, router_of, spec_seed
 from suite import suite_cfg
@@ -101,20 +101,21 @@ def main():
     BS["f"] = BS.uji.map(fs)
     BS["bootstrap"] = "per gambar"
     tabs = [BS]
-    if cfg.get("cluster_by") == "video_prefix":
-        pos_ = {iid: j for j, iid in enumerate(sorted(ids))}
-        grp_ = {}
-        for f_, iid in zip(te["file"], ids):
-            grp_.setdefault(f_.split("_")[0], []).append(pos_[iid])
-        G_ = [np.asarray(v) for v in grp_.values()]
+    if cfg.get("cluster_by") in CLUSTER_BY:            # VisDrone: video; KITTI A6: rekaman (map_csv)
+        G_ = cluster_groups(te["file"], ids, cfg)
         fast_ = {}
         fmix = {}
         for k_, (U_, u_) in mixes.items():
             fast_.setdefault(id(U_), FastUnionBoot(U_)); fmix[k_] = (fast_[id(U_)], u_)
         _, S_cl = boot_engine(fmix, None, None, cfg["boot_jobs"], idx=cluster_index(G_, cfg["n_boot"], cfg["cluster_seed"]))
         BK = boot_tests(point, S_cl, tests)
-        BK["f"] = BK.uji.map(fs); BK["bootstrap"] = "klaster video"
+        BK["f"] = BK.uji.map(fs); BK["bootstrap"] = ("klaster video" if cfg["cluster_by"] == "video_prefix" else "klaster rekaman")
         tabs.append(BK)
+        zk = dict(np.load(out / "h6_boot.npz"))             # + sampel klaster untuk pooling antar-seed (h6_latency_pool.py)
+        for lab, a_, bs in tests:
+            for m in METRICS:
+                zk[f"klaster|{lab}|{m}"] = (S_cl[a_][m] - np.nanmean(np.stack([S_cl[b][m] for b in bs]), 0)).astype(np.float32)
+        np.savez_compressed(out / "h6_boot.npz", **zk)
     T = pd.concat(tabs, ignore_index=True)
     T["kesepakatan_keputusan"] = T.uji.map(agree)
     T["setara_L1"] = T["kesepakatan_keputusan"] >= MIN_AGREE          # aturan baca: < 0,99 -> bukan uji, hanya deskriptif

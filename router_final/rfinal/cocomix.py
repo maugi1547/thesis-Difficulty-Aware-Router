@@ -437,6 +437,19 @@ def cluster_labels(files, cluster_by, cluster_map=None, key_col="image_id", clus
     return [mp[s] for s in stems]
 
 
+def cluster_groups(files, ids, cfg):
+    """
+    Grup klaster -> posisi imgIds terurut (indeks UnionBoot), satu sumber untuk suite / sweep_rho / h6_latency.
+    video_prefix: urutan kemunculan (= run VisDrone asli); map_csv: nama klaster terurut (= scripts/cluster_boot.py).
+    """
+    pos = {iid: j for j, iid in enumerate(sorted(ids))}
+    g = {}
+    for c, iid in zip(cluster_labels(files, cfg["cluster_by"], cfg.get("cluster_map")), ids):
+        g.setdefault(c, []).append(pos[iid])
+    keys = sorted(g) if cfg["cluster_by"] == "map_csv" else list(g)
+    return [np.asarray(g[k]) for k in keys]
+
+
 def cluster_index(groups, n_boot, seed):
     """Indeks resample bootstrap KLASTER: groups = list array posisi imgIds per klaster (mis. per video VisDrone)."""
     rng = np.random.default_rng(seed)

@@ -26,10 +26,12 @@ def main():
     assert len({len(z[keys[0]]) for z in Z.values()}) == 1, "jumlah resample berbeda"
     rows = []
     for k in keys:
-        uji, m = k.rsplit("|", 1)
+        bname, kk = ("klaster", k[len("klaster|"):]) if k.startswith("klaster|") else ("per gambar", k)
+        uji, m = kk.rsplit("|", 1)
         sm = np.mean(np.stack([z[k] for z in Z.values()]), 0); sm = sm[np.isfinite(sm)]
         lo, hi = np.percentile(sm, [2.5, 97.5])
-        rows.append(dict(uji=uji, metric=m, diff_rata2=float(np.mean([float(z[f"titik|{k}"]) for z in Z.values()])),
+        rows.append(dict(bootstrap=bname, uji=uji, metric=m,
+                         diff_rata2=float(np.mean([float(z[f"titik|{kk}"]) for z in Z.values()])),
                          ci_lo=lo, ci_hi=hi, p_two_sided=_pval(sm), n_model=len(Z)))
     P = pd.DataFrame(rows)
     P.to_csv(out / "h6_pool.csv", index=False, float_format="%.6g")

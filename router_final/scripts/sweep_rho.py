@@ -21,7 +21,8 @@ Untuk tiap ρ di grid:
       (biaya B2 = kuantil jendela 200, tidak bergantung ρ). Di ρ = 0,5 model ini mereproduksi f H6 utama persis, sehingga
       baris ρ = 0,5 harus identik dengan suite (paritas, --ref; di ρ terkunci f terukur dipakai langsung, karena aktivasi
       pass ujung-ke-ujung dan pass akurasi bisa berbeda ±0,005). Titik ρ lain = perkiraan, bukan latensi terukur.
-VisDrone (analysis.cluster_by = video_prefix): bootstrap klaster per video juga dihitung.
+VisDrone (analysis.cluster_by = video_prefix) / KITTI A6 (map_csv): bootstrap klaster per video / rekaman juga dihitung
+(dan ikut di-pool bila ada di semua model).
 """
 import argparse
 import contextlib
@@ -35,7 +36,7 @@ import numpy as np
 import pandas as pd
 
 from rfinal.budget import B2Controller, thr0_from_val
-from rfinal.cocomix import (METRICS, FastUnionBoot, UnionBoot, _pval, boot_engine, boot_tests, cluster_index,
+from rfinal.cocomix import (METRICS, FastUnionBoot, UnionBoot, _pval, boot_engine, boot_tests, CLUSTER_BY, cluster_groups, cluster_index,
                             random_masks, top_rho)
 from rfinal.env import load_config, provenance, write_json
 from rfinal.gate import score_np
@@ -137,14 +138,10 @@ def cmd_run(a):
     print(f"bootstrap: {len(mixes)} routing × {cfg['n_boot']} resample ({'cepat' if a.fast else 'UnionBoot'}) ...", flush=True)
     point, samples = boot_engine(fmix if a.fast else mixes, cfg["n_boot"], cfg["boot_seed"], cfg["boot_jobs"])
     boots = {"per gambar": (point, samples)}
-    if cfg.get("cluster_by") == "video_prefix":
-        pos_ = {iid: j for j, iid in enumerate(sorted(ids))}
-        grp_ = {}
-        for f_, iid in zip(te["file"], ids):
-            grp_.setdefault(f_.split("_")[0], []).append(pos_[iid])
+    if cfg.get("cluster_by") in CLUSTER_BY:            # VisDrone: video; KITTI A6: rekaman (map_csv)
         _, S_cl = boot_engine(fmix, None, None, cfg["boot_jobs"],
-                              idx=cluster_index([np.asarray(v) for v in grp_.values()], cfg["n_boot"], cfg["cluster_seed"]))
-        boots["klaster video"] = (point, S_cl)
+                              idx=cluster_index(cluster_groups(te["file"], ids, cfg), cfg["n_boot"], cfg["cluster_seed"]))
+        boots[("klaster video" if cfg["cluster_by"] == "video_prefix" else "klaster rekaman")] = (point, S_cl)
     tabs, npz = [], {}
     for bname, (pt, sm) in boots.items():
         BS = boot_tests(pt, sm, tests)
@@ -165,7 +162,7 @@ def cmd_run(a):
     for bname in boots:
         sub = TT[(TT.bootstrap == bname) & TT.metric.isin(SHOW)]
         piv = sub.assign(sel=lambda x: x["diff"].map("{:+.4f}".format) + " [" + x.ci_lo.map("{:+.4f}".format) + ", "
-                         + x.ci_hi.map("{:+.4f}".format) + "]").pivot_table(index=["uji", "metric"], columns="rho",
+                         + x.ci_hi.map("{:+.4f}".format) + "]").pivot_table(index=["bootstrap", "uji", "metric"], columns="rho",
                                                                               values="sel", aggfunc="first")
         lines += [f"TEST, bootstrap {bname} (selisih [CI 95%]):", piv.to_string(), ""]
     par = None
@@ -195,23 +192,24 @@ def cmd_run(a):
 def cmd_pool(a):
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     Z = {Path(d).name: np.load(Path(d) / "sweep_boot.npz") for d in a.dirs}
-    keys = set.intersection(*[{k for k in z.files if k.startswith("per gambar|")} for z in Z.values()])
+    # per gambar selalu; klaster (rekaman KITTI A6 / video) bila ada di SEMUA model (indeks resample sama per test yang sama)
+    keys = set.intersection(*[{k for k in z.files if not k.startswith("titik|")} for z in Z.values()])
     n = {len(z[next(iter(keys))]) for z in Z.values()}
     assert len(n) == 1, "jumlah resample berbeda"
     rows = []
     for k in sorted(keys):
-        _, uji, rho, m = k.split("|")
+        bname, uji, rho, m = k.split("|")
         lab = f"{uji}|{rho}"
         sm = np.mean(np.stack([z[k] for z in Z.values()]), 0); sm = sm[np.isfinite(sm)]
         pt = float(np.mean([float(z[f"titik|{lab}|{m}"]) for z in Z.values()]))
         lo, hi = np.percentile(sm, [2.5, 97.5])
-        rows.append(dict(uji=uji, rho=float(rho), metric=m, diff_rata2=pt, ci_lo=lo, ci_hi=hi, p_two_sided=_pval(sm),
-                         n_model=len(Z)))
+        rows.append(dict(bootstrap=bname, uji=uji, rho=float(rho), metric=m, diff_rata2=pt, ci_lo=lo, ci_hi=hi,
+                         p_two_sided=_pval(sm), n_model=len(Z)))
     P = pd.DataFrame(rows)
     P.to_csv(out / "sweep_pool.csv", index=False, float_format="%.6g")
     sub = P[P.metric.isin(SHOW)]
     piv = sub.assign(sel=lambda x: x.diff_rata2.map("{:+.4f}".format) + " [" + x.ci_lo.map("{:+.4f}".format) + ", "
-                     + x.ci_hi.map("{:+.4f}".format) + "]").pivot_table(index=["uji", "metric"], columns="rho",
+                     + x.ci_hi.map("{:+.4f}".format) + "]").pivot_table(index=["bootstrap", "uji", "metric"], columns="rho",
                                                                           values="sel", aggfunc="first")
     txt = f"pooling {list(Z)} (rata-rata selisih per resample)\n" + piv.to_string()
     print(txt)

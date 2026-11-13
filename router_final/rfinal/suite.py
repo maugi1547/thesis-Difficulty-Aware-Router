@@ -41,7 +41,7 @@ import torch
 from .baselines import HEUR_CONF, S1Heur, StaticOut, density_head, load_static, static_with_feats
 from .budget import SortedWindowQuantile, b2_decide, b2_host_overhead
 from .cocomix import (CLUSTER_BY, METRICS, FastUnionBoot, Router, UnionBoot, _pval, boot_engine, boot_tests, cluster_index,
-                      cluster_labels, holm,
+                      cluster_groups, cluster_labels, holm,
                       partial_spearman_p, random_masks, top_rho)
 from .data import (NMS_STATS, SMALL_PX, build_coco_gt, coco_eval, image_id_of, jdict, load_data, make_loader,
                    small_area_of, to_dets)
@@ -835,13 +835,7 @@ def analyze(A, res, J, cfg, out, log=print):
     # ---- bootstrap KLASTER (VisDrone: ID video sumber = token pertama nama file; KITTI A6: rekaman mentah dari peta devkit)
     if cfg.get("cluster_by") in CLUSTER_BY:
         tk = time.perf_counter()
-        pos_ = {iid: j for j, iid in enumerate(sorted(ids))}
-        grp_ = {}
-        for c_, iid in zip(cluster_labels(te["file"], cfg["cluster_by"], cfg.get("cluster_map")), ids):
-            grp_.setdefault(c_, []).append(pos_[iid])
-        if cfg["cluster_by"] == "map_csv":           # urutan klaster = nama terurut (= scripts/cluster_boot.py groups_of -> indeks
-            grp_ = {k_: grp_[k_] for k_ in sorted(grp_)}  # resample identik; video_prefix tetap urutan kemunculan, = run VisDrone)
-        G_ = [np.asarray(v) for v in grp_.values()]; sizes = np.array([len(g) for g in G_])
+        G_ = cluster_groups(te["file"], ids, cfg); sizes = np.array([len(g) for g in G_])   # cocomix.cluster_groups
         fast_, fmix = {}, {}
         for k_, (U_, u_) in mixes.items():
             fast_.setdefault(id(U_), FastUnionBoot(U_)); fmix[k_] = (fast_[id(U_)], u_)
