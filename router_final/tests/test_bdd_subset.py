@@ -110,3 +110,18 @@ def test_config_bdd_hanya_berbeda_di_kunci_data():
     assert beda <= {"name", "data", "expected_counts", "_config_path"}, beda
     assert b["expected_counts"] == {s: n for s, (_, n) in B.SPLITS.items()}
     assert b["name"] == "bdd100k" and b["data"].endswith("/bdd100k_2class/bdd100k_2class.yaml")
+
+
+def test_subset_terkunci_konsisten():
+    """CSV subset BDD100K yang di-commit: sha256, jumlah per split, alokasi strata = isi CSV."""
+    if not B.LOCK_CSV.exists():
+        pytest.skip("configs/bdd100k/bdd_subset.csv belum di-commit")
+    T = pd.read_csv(B.LOCK_CSV, dtype=str)
+    meta = json.loads(B.LOCK_CSV.with_suffix(".json").read_text())
+    assert meta["csv_sha256"] == B.sha256(B.LOCK_CSV) and meta["seed"] == B.SEED
+    assert meta["class_map"] == B.CLASS_MAP
+    assert T.name.is_unique and (T.split == T.split_resmi).all()
+    assert T.groupby("split").size().to_dict() == {s: n for s, (_, n) in B.SPLITS.items()}
+    for s, inf in meta["info"].items():
+        d = T[T.split == s]
+        assert (d.timeofday + "|" + d.scene).value_counts().to_dict() == {k: v for k, v in inf["alokasi"].items() if v}
