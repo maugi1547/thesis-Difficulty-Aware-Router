@@ -46,7 +46,8 @@ TESTS = [("H2 | router − acak (aktivasi sama)", H2_SUITE),
          ("router − Branch A", "router (B2) − Branch A (P2 selalu)"),
          ("router − Branch B", "router (B2) − Branch B (P2 tidak pernah)"),
          ("Branch A − P2-Static", "Branch A − P2-Static"),
-         ("Branch B − Vanilla", "Branch B − Vanilla")]
+         ("Branch B − Vanilla", "Branch B − Vanilla"),
+         ("P2-Static − Vanilla", "P2-Static − Vanilla")]          # ruang manfaat P2 (tidak ada di suite -> tanpa paritas)
 KEY = ("H2 | router − acak (aktivasi sama)", "H5 | router − campuran V/P2S (latensi ujung-ke-ujung)")
 
 
@@ -86,17 +87,42 @@ def cmd_run(a):
     J = pickle.loads((D_ / "job_dets.pkl").read_bytes())
     te, rec, D = A["test"], J["rec"], J["dets"]
     assert rec["file"] == te["file"], "urutan gambar job != cache test"
-    ids, n, seed, nd = te["image_id"], len(te["image_id"]), int(spec_seed(A)), cfg["n_draws"]
     _STATE["max_dets"] = tuple(A["spec"]["coco_max_dets"])
     from pycocotools.coco import COCO
+    gt_path = D_ / "gt_test.json"
+    sub = None
+    if a.exclude_rekaman:                                     # subset uji: buang rekaman tertentu (peta --map-csv)
+        assert a.map_csv, "--exclude-rekaman butuh --map-csv"
+        M_ = pd.read_csv(a.map_csv, dtype=str); mp_ = dict(zip(M_[a.key_col], M_[a.cluster_col]))
+        ex = set(a.exclude_rekaman)
+        lab_ = [mp_[Path(f).stem] for f in te["file"]]
+        assert ex <= set(lab_), f"rekaman tidak ada di data uji: {sorted(ex - set(lab_))}"
+        keep = np.array([l_ not in ex for l_ in lab_])
+        n0 = len(keep)
+        te = {k: ([v[i] for i in np.flatnonzero(keep)] if isinstance(v, list) else np.asarray(v)[keep])
+              if hasattr(v, "__len__") and len(v) == n0 else v for k, v in te.items()}
+        rec = {k: ([v[i] for i in np.flatnonzero(keep)] if isinstance(v, list) else np.asarray(v)[keep])
+               if hasattr(v, "__len__") and len(v) == n0 else v for k, v in rec.items()}
+        D = {k: [v[i] for i in np.flatnonzero(keep)] for k, v in D.items()}
+        G_ = json.loads(gt_path.read_text()); kid = set(te["image_id"])
+        G_["images"] = [im for im in G_["images"] if im["id"] in kid]
+        G_["annotations"] = [an for an in G_["annotations"] if an["image_id"] in kid]
+        gt_path = out / "gt_test_subset.json"; gt_path.write_text(json.dumps(G_))
+        sub = dict(rekaman_dibuang=sorted(ex), n_awal=int(n0), n_subset=int(keep.sum()))
+    ids, n, seed, nd = te["image_id"], len(te["image_id"]), int(spec_seed(A)), cfg["n_draws"]
     with contextlib.redirect_stdout(io.StringIO()):
-        gt = COCO(str(D_ / "gt_test.json"))
+        gt = COCO(str(gt_path))
     R_AB, _, _ = router_of(gt, D["A"], D["B"], ids)
     R_VP, _, _ = router_of(gt, D["P2S"], D["V"], ids)
     U_AB, U_VP = UnionBoot(R_AB.bA, R_AB.bB), UnionBoot(R_VP.bA, R_VP.bB)
     F_AB, F_VP = FastUnionBoot(U_AB), FastUnionBoot(U_VP)
     d_dep = np.asarray(rec["use_g"], bool)
     f_mix = f_e2e_efisien(res)
+    if sub is not None:                                       # f pada aktivasi router di subset (model latensi sweep_rho)
+        from sweep_rho import lat_model
+        _, _, f_at = lat_model(res)
+        sub.update(f_penuh=f_mix, aktivasi_subset=float(d_dep.mean()), f_subset=f_at(float(d_dep.mean())))
+        f_mix = sub["f_subset"]
     masks = {"A": ("AB", np.ones(n, bool)), "B": ("AB", np.zeros(n, bool)), "V": ("VP", np.zeros(n, bool)),
              "P2S": ("VP", np.ones(n, bool)), "router": ("AB", d_dep)}
     for j, m_ in enumerate(random_masks(n, int(d_dep.sum()) / n, nd, seed + 11)):
@@ -108,7 +134,8 @@ def cmd_run(a):
     comp = {"H2 | router − acak (aktivasi sama)": ("router", grp("acak_router_")),
             "H5 | router − campuran V/P2S (latensi ujung-ke-ujung)": ("router", grp("campuran_utama_")),
             "router − Branch A": ("router", ["A"]), "router − Branch B": ("router", ["B"]),
-            "Branch A − P2-Static": ("A", ["P2S"]), "Branch B − Vanilla": ("B", ["V"])}
+            "Branch A − P2-Static": ("A", ["P2S"]), "Branch B − Vanilla": ("B", ["V"]),
+            "P2-Static − Vanilla": ("P2S", ["V"])}
     tests = [(lab, *comp[lab]) for lab, _ in TESTS]
     slow = {k: ({"AB": U_AB, "VP": U_VP}[u], R[u].sorted_mask(m_)) for k, (u, m_) in masks.items()}
     quick = {k: ({"AB": F_AB, "VP": F_VP}[u], R[u].sorted_mask(m_)) for k, (u, m_) in masks.items()}
@@ -151,7 +178,7 @@ def cmd_run(a):
     info = dict(n_gambar=n, n_klaster=len(G), terbesar=dict(klaster=names[big], n=int(sizes[big])),
                 median=float(np.median(sizes)), n_efektif_kish=kish, cara_klaster=a.cluster, cluster_seed=a.cluster_seed,
                 n_boot=cfg["n_boot"], boot_seed=cfg["boot_seed"], n_draws=nd, f_campuran=f_mix,
-                aktivasi=float(d_dep.mean()), sha_klaster=hashlib_ids(names, sizes))
+                aktivasi=float(d_dep.mean()), sha_klaster=hashlib_ids(names, sizes), subset=sub)
 
     lines = [json.dumps(info, ensure_ascii=False)]
     par = {}
@@ -195,6 +222,8 @@ def cmd_pool(a):
         "klaster / seed klaster berbeda antar-model -> indeks resample tidak sama, pooling tidak sah"
     rows = []
     for lb, ls in TESTS:
+        if not all(f"titik|{lb}|{METRICS[0]}" in z.files for z in Z.values()):
+            continue                                          # uji baru (mis. P2-Static − Vanilla) tidak ada di run lama
         for m in METRICS:
             row = dict(uji=lb, metric=m, label_suite=ls,
                        diff_rata2=float(np.mean([float(z[f"titik|{lb}|{m}"]) for z in Z.values()])),
@@ -249,6 +278,8 @@ def main():
     r.add_argument("--ref-cluster", default=None, help="bootstrap_klaster.csv suite (paritas klaster, VisDrone)")
     r.add_argument("--n-boot", type=int, default=None)
     r.add_argument("--slow", action="store_true", help="UnionBoot (bukan FastUnionBoot) untuk bootstrap per citra")
+    r.add_argument("--exclude-rekaman", nargs="*", default=None,
+                   help="subset uji: buang citra dari rekaman ini (A6+); f campuran dihitung ulang pada aktivasi subset")
     p = sub.add_parser("pool")
     p.add_argument("--dirs", nargs="+", required=True); p.add_argument("--out", required=True)
     p.add_argument("--ref-pool", default=None, help="ringkasan_pool.csv suite gabungan (paritas per citra)")
