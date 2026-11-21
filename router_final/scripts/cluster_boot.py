@@ -47,7 +47,12 @@ TESTS = [("H2 | router − acak (aktivasi sama)", H2_SUITE),
          ("router − Branch B", "router (B2) − Branch B (P2 tidak pernah)"),
          ("Branch A − P2-Static", "Branch A − P2-Static"),
          ("Branch B − Vanilla", "Branch B − Vanilla"),
-         ("P2-Static − Vanilla", "P2-Static − Vanilla")]          # ruang manfaat P2 (tidak ada di suite -> tanpa paritas)
+         ("P2-Static − Vanilla", "P2-Static − Vanilla"),          # ruang manfaat P2 (tidak ada di suite -> tanpa paritas)
+         (None, None)]                                             # diisi H5_LIN di bawah (tanpa paritas suite)
+H5_LIN = "H5 lin | router − interpolasi linear V + f·(P2S − V)"
+TESTS[-1] = (H5_LIN, None)
+# H5 lin (pasca-hasil, 17–21 Nov; hasil-derau-undian-H5.md): pembanding campuran tanpa undian. Rata-rata campuran acak ≈
+# interpolasi linear (selisih ≤ 0,0011 mAP_small di semua dataset), jadi uji ini bebas derau undian campuran.
 KEY = ("H2 | router − acak (aktivasi sama)", "H5 | router − campuran V/P2S (latensi ujung-ke-ujung)")
 
 
@@ -136,7 +141,7 @@ def cmd_run(a):
             "router − Branch A": ("router", ["A"]), "router − Branch B": ("router", ["B"]),
             "Branch A − P2-Static": ("A", ["P2S"]), "Branch B − Vanilla": ("B", ["V"]),
             "P2-Static − Vanilla": ("P2S", ["V"])}
-    tests = [(lab, *comp[lab]) for lab, _ in TESTS]
+    tests = [(lab, *comp[lab]) for lab, _ in TESTS if lab != H5_LIN]
     slow = {k: ({"AB": U_AB, "VP": U_VP}[u], R[u].sorted_mask(m_)) for k, (u, m_) in masks.items()}
     quick = {k: ({"AB": F_AB, "VP": F_VP}[u], R[u].sorted_mask(m_)) for k, (u, m_) in masks.items()}
 
@@ -150,10 +155,18 @@ def cmd_run(a):
           f"bootstrap klaster seed {a.cluster_seed} ...", flush=True)
     _, S_cl = boot_engine(quick, None, None, cfg["boot_jobs"], idx=cluster_index(G, cfg["n_boot"], a.cluster_seed))
     BI, BK = boot_tests(point, S_img, tests), boot_tests(point, S_cl, tests)
+    lin = lambda X, m: X["router"][m] - (X["V"][m] + f_mix * (X["P2S"][m] - X["V"][m]))
+    BI = pd.concat([BI, pd.DataFrame([dict(uji=H5_LIN, metric=m, diff=float(lin(point, m)),
+                                            **dict(zip(("ci_lo", "ci_hi", "p_two_sided"), _ci(lin(S_img, m)))))
+                                       for m in METRICS])], ignore_index=True)
+    BK = pd.concat([BK, pd.DataFrame([dict(uji=H5_LIN, metric=m, diff=float(lin(point, m)),
+                                            **dict(zip(("ci_lo", "ci_hi", "p_two_sided"), _ci(lin(S_cl, m)))))
+                                       for m in METRICS])], ignore_index=True)
     big = int(np.argmax(sizes)); keep = np.concatenate([g for j_, g in enumerate(G) if j_ != big])
     pt_nb = {k: U.metrics(u, keep) for k, (U, u) in quick.items()}
     jk = [dict(uji=lb, metric=m, diff_tanpa_klaster_terbesar=pt_nb[x][m] - np.nanmean([pt_nb[b][m] for b in bs]))
           for lb, x, bs in tests for m in METRICS]
+    jk += [dict(uji=H5_LIN, metric=m, diff_tanpa_klaster_terbesar=float(lin(pt_nb, m))) for m in METRICS]
     T = BI[["uji", "metric", "diff", "ci_lo", "ci_hi", "p_two_sided"]].rename(
         columns={"ci_lo": "lo_gambar", "ci_hi": "hi_gambar", "p_two_sided": "p_gambar"}).merge(
         BK[["uji", "metric", "ci_lo", "ci_hi", "p_two_sided"]].rename(
@@ -172,6 +185,11 @@ def cmd_run(a):
                 npz[f"{nm}|{lb}|{m}"] = (S[x][m] - np.nanmean(np.stack([S[b][m] for b in bs]), 0)).astype(np.float64)
             npz[f"titik|{lb}|{m}"] = np.float64(point[x][m] - np.nanmean([point[b][m] for b in bs]))
             npz[f"titik_tanpa_terbesar|{lb}|{m}"] = np.float64(pt_nb[x][m] - np.nanmean([pt_nb[b][m] for b in bs]))
+    for m in METRICS:
+        for nm, S in (("gambar", S_img), ("klaster", S_cl)):
+            npz[f"{nm}|{H5_LIN}|{m}"] = np.asarray(lin(S, m), np.float64)
+        npz[f"titik|{H5_LIN}|{m}"] = np.float64(lin(point, m))
+        npz[f"titik_tanpa_terbesar|{H5_LIN}|{m}"] = np.float64(lin(pt_nb, m))
     np.savez_compressed(out / "a2_boot.npz", **npz)
     pd.DataFrame(dict(klaster=names, n_gambar=sizes)).sort_values("n_gambar", ascending=False).to_csv(
         out / "klaster_ukuran.csv", index=False)
@@ -208,6 +226,12 @@ def cmd_run(a):
     write_json(out / "provenance.json", provenance(files=files, extra=dict(info=info, paritas=par, paritas_klaster=par_cl)))
 
 
+def _ci(x):
+    x = np.asarray(x, float); x = x[np.isfinite(x)]
+    lo, hi = np.percentile(x, [2.5, 97.5])
+    return lo, hi, _pval(x)
+
+
 def hashlib_ids(names, sizes):
     import hashlib
     return hashlib.sha256(json.dumps([[str(k), int(s)] for k, s in zip(names, sizes)]).encode()).hexdigest()[:16]
@@ -241,6 +265,11 @@ def cmd_pool(a):
              f"{infos[0]['n_efektif_kish']:.1f}), seed klaster {infos[0]['cluster_seed']}"]
     if a.ref_pool:
         Rp = pd.read_csv(a.ref_pool)
+        if "grup" in Rp:                                      # ringkasan_pool.csv multi-grup (merge >= 23 Nov)
+            import re
+            g_ = {re.sub(r"_seed\d+", "", Path(d).name) for d in a.dirs}
+            assert len(g_) == 1, f"--dirs dari grup berbeda: {g_}"
+            Rp = Rp[Rp.grup == g_.pop()]
         par = {}
         for lb, ls in TESTS:
             m_ = P[P.uji == lb].set_index("metric"); r_ = Rp[Rp.uji == ls].set_index("metric")

@@ -1099,6 +1099,18 @@ def pooled_tests(dirs, tests_wanted=MAIN_TESTS):
     return pd.DataFrame(rows)
 
 
+def pool_groups(out_root, done):
+    """Model ber-seed dengan data uji sama -> satu grup pooling: nama tanpa akhiran _seed<n> (mis. kitti, kitti_rekaman,
+    visdrone, bdd100k; *_baseline_best terpisah). Hanya grup >= 2 model. Pooling per citra; CI klaster gabungan
+    (VisDrone, A6) lewat scripts/cluster_boot.py pool."""
+    import re
+    G = {}
+    for s in done:
+        g = re.sub(r"_seed\d+", "", s["name"])
+        G.setdefault(g, []).append(Path(out_root) / s["name"])
+    return {g: v for g, v in G.items() if len(v) > 1}
+
+
 def merge(out_root, all_models, merge_glob=None, log=print):
     out_root = Path(out_root)
     if merge_glob:
@@ -1142,8 +1154,8 @@ def merge(out_root, all_models, merge_glob=None, log=print):
     h3m = H3.kunci == "gate | H3: ρ parsial(skor, proporsi GT kecil | jumlah GT)"
     H3.loc[h3m, "p_holm"] = holm(H3.loc[h3m, "p"].fillna(1.0).values)
     H3.loc[h3m, "H3_lolos"] = (H3.loc[h3m, "rho"] > 0) & (H3.loc[h3m, "p_holm"] < 0.05)
-    kitti = [out_root / s["name"] for s in done if s["name"].startswith("kitti")]
-    POOL = pooled_tests(kitti) if len(kitti) > 1 else pd.DataFrame()
+    POOL = pd.concat([pooled_tests(ds).assign(grup=g) for g, ds in pool_groups(out_root, done).items()],
+                     ignore_index=True) if pool_groups(out_root, done) else pd.DataFrame()
     LAT = pd.concat([pd.read_csv(out_root / s["name"] / "latensi_per_build.csv").assign(model=s["name"]) for s in done])
     LATP = LAT.groupby("varian")["mean"].agg(["mean", "std", "count"]).rename(columns={"count": "n_build_total"})
     return dict(R=R, TAB=TAB, BS=BS, FULL=FULL, H3=H3, POOL=POOL, LATP=LATP, done=[s["name"] for s in done])
